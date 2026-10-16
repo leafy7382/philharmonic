@@ -280,6 +280,20 @@ class TestOrchestratorGuard(unittest.TestCase):
         res_out = orchestrator_guard.handle_pre_tool(outside_cmd)
         self.assertEqual(res_out["decision"], "ask")
 
+        # Relative path traversal outside workspace falls back to ask
+        rel_outside_cmd = dict(
+            self.base_payload,
+            toolCall={
+                "name": "run_command",
+                "args": {
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                    "CommandLine": "cat ../outside.txt",
+                },
+            },
+        )
+        res_rel = orchestrator_guard.handle_pre_tool(rel_outside_cmd)
+        self.assertEqual(res_rel["decision"], "ask")
+
 
 if __name__ == "__main__":
     unittest.main()
