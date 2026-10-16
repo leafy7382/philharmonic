@@ -55,14 +55,17 @@ ln -s "$(pwd)/.agents/plugins/pro-orchestrator" ~/.gemini/config/plugins/pro-orc
 
 ---
 
-## Subagent Architecture
+## Subagent Architecture & Automatic Token Optimization
 
-Before dispatching custom workers in a new session, the orchestrator registers two custom subagent types alongside the built-in `research` agent:
+To minimize both Pro-tier context growth and subagent spawn overhead:
+- **Direct Execution Fast-Path**: Single-step commands and reads/edits of $\le 2$ known files execute directly in the orchestrator with zero subagent overhead.
+- **Lazy Subagent Registration**: Custom subagents (`scout` and `implementer`) are registered via `define_subagent` only immediately before first invoking them.
+- **Automatic Tier Downgrade**: The `pre-tool` hook automatically downgrades read-only subagent calls (`scout` / `research`) with $\le 3$ numbered rules and no mutation verbs to `Model: "flash_lite"`.
 
 | Subagent Type | Model Tier | Write Tools | Workspace Mode | Purpose |
 | :--- | :--- | :--- | :--- | :--- |
-| `scout` | `flash_lite` | Disabled | `inherit` | Single-hop lookups, file/symbol extraction, log slicing |
-| `research` | `flash` | Disabled | `inherit` | Multi-file analysis and documentation lookups |
+| `scout` | `flash_lite` | Disabled | `inherit` | Single-hop lookups, file/symbol extraction, log slicing ($\le 3$ rules) |
+| `research` | `flash` (auto `flash_lite` if $\le 3$ rules) | Disabled | `inherit` | Multi-file analysis and documentation lookups ($> 3$ rules) |
 | `implementer` | `flash` | Enabled | `branch` / `share` | Bounded code edits and test execution |
 
 ---
@@ -103,13 +106,14 @@ NOTES: <one sentence stating findings, or file:// log URI if BLOCKED/FAILED>
 
 Configured in [hooks.json](.agents/plugins/pro-orchestrator/hooks.json) and executed by [orchestrator_guard.py](.agents/plugins/pro-orchestrator/scripts/orchestrator_guard.py):
 
-1. **`pre-invocation`**: Injects the Pro Orchestrator rules and current session state before each turn.
+1. **`pre-invocation`**: Verifies the active session is pinned to a Pro-tier model and deduplicates warnings per invocation.
 2. **`pre-tool`**:
-   - Ensures `scout` and `implementer` are defined via `define_subagent` first.
-   - Blocks `Model: "inherit"` and `Model: "pro"` in `invoke_subagent`.
+   - Auto-allows workspace, worktree, and scratch artifact file/command operations.
+   - Blocks `Model: "pro"`, rewrites `Model: "inherit"`, and automatically downgrades simple read-only subagent tasks ($\le 3$ rules) to `Model: "flash_lite"`.
    - Runs the STE-100 linter gate on all `invoke_subagent` and `send_message` prompts.
-3. **`post-tool`**: Records defined subagent types, active worker IDs, model tiers, and `branch` workspaces in session state.
-4. **`stop`**: Warns if any `Workspace: "branch"` subagents remain unkilled at the end of a turn.
+   - Deduplicates `pending_spawns` tracking across multiple hook registrations.
+3. **`post-tool`**: Synchronizes spawned subagent conversation IDs, model tiers, and `branch` workspaces in session state, rolling back failed spawns.
+4. **`stop`**: Blocks premature completion if any `Workspace: "branch"` subagent worktrees remain unkilled when the session goes idle.
 
 ---
 

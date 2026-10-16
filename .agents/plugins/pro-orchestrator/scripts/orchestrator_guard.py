@@ -103,6 +103,7 @@ def _load_state(payload: Dict[str, Any]) -> Dict[str, Any]:
             pass
     return {
         "warned_invocations": [],
+        "recorded_spawn_calls": [],
         "pending_spawns": [],
         "subagents": {},
         "stop_reminded_executions": [],
@@ -161,7 +162,14 @@ def _allowed_roots(payload: Dict[str, Any]) -> List[Path]:
     artifact_dir = payload.get("artifactDirectoryPath")
     if artifact_dir:
         try:
-            roots.append(Path(artifact_dir).resolve())
+            resolved_artifact = Path(artifact_dir).resolve()
+            roots.append(resolved_artifact)
+            # Also allow sibling brain/<conversation-id>/scratch and worktrees/<conversation-id>
+            # so branched/shared subagents can write to their worktree and parent scratch logs.
+            if resolved_artifact.parent.name == "brain":
+                roots.append(resolved_artifact.parent)
+                worktrees_dir = resolved_artifact.parent.parent / "worktrees"
+                roots.append(worktrees_dir)
         except OSError:
             pass
     return roots
@@ -259,6 +267,15 @@ def _handle_define_subagent(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"decision": "allow"}
 
 
+def _is_simple_readonly_task(type_name: str, prompt_text: str) -> bool:
+    """Return True if a read-only subagent prompt has <= 3 rules and no mutation verbs."""
+    if type_name not in {"scout", "research", "researcher"}:
+        return False
+    rule_count = len(NUMBERED_RULE_RE.findall(prompt_text))
+    has_mutation = bool(MUTATION_VERBS_RE.search(prompt_text))
+    return not has_mutation and rule_count <= 3
+
+
 def _handle_invoke_subagent(
     payload: Dict[str, Any], args: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -285,14 +302,22 @@ def _handle_invoke_subagent(
                 ),
             }
 
-        if requested_model not in ALLOWED_SUBAGENT_MODELS:
-            entry_copy["Model"] = DEFAULT_MODEL_BY_TYPE.get(type_name, "flash")
-            rewritten = True
-
         prompt_text = entry_copy.get("Prompt", "")
         lint_error = _lint_inter_agent_text(prompt_text, f"Subagent[{role_label}].Prompt")
         if lint_error:
             return {"decision": "deny", "reason": lint_error}
+
+        target_model = requested_model
+        if target_model not in ALLOWED_SUBAGENT_MODELS:
+            target_model = DEFAULT_MODEL_BY_TYPE.get(type_name, "flash")
+
+        # Token optimization: automatically downgrade read-only subagents with <= 3 rules to flash_lite
+        if target_model == "flash" and _is_simple_readonly_task(type_name, prompt_text):
+            target_model = "flash_lite"
+
+        if entry_copy.get("Model") != target_model:
+            entry_copy["Model"] = target_model
+            rewritten = True
 
         workspace_mode = entry_copy.get("Workspace", "inherit")
         spawn_records.append(
@@ -307,8 +332,22 @@ def _handle_invoke_subagent(
         updated_subagents.append(entry_copy)
 
     state = _load_state(payload)
-    state.setdefault("pending_spawns", []).extend(spawn_records)
-    _save_state(payload, state)
+    tool_call = payload.get("toolCall", {})
+    call_sig = json.dumps(
+        [
+            payload.get("conversationId", ""),
+            payload.get("invocationNum", 0),
+            payload.get("executionNum", 0),
+            tool_call.get("id", ""),
+            [(r["type"], r["role"], r["workspace"]) for r in spawn_records],
+        ],
+        sort_keys=True,
+    )
+    recorded_calls: List[str] = state.setdefault("recorded_spawn_calls", [])
+    if call_sig not in recorded_calls:
+        recorded_calls.append(call_sig)
+        state.setdefault("pending_spawns", []).extend(spawn_records)
+        _save_state(payload, state)
 
     if rewritten:
         return {

@@ -390,6 +390,123 @@ class TestOrchestratorGuard(unittest.TestCase):
         self.assertEqual(len(state.get("pending_spawns", [])), 0)
         self.assertEqual(subagents[actual_subagent_cid]["model"], "flash_lite")
 
+    def test_auto_downgrade_simple_readonly_research_to_flash_lite(self) -> None:
+        simple_read_prompt = """TASK: Read `src/auth/parser.py` to check token constants.
+
+RULES:
+1. Open `src/auth/parser.py`.
+2. Read the constant definitions at the top of the file.
+3. Do not change any file.
+
+REPORT FORMAT:
+Return only these four lines:
+STATUS: COMPLETED | BLOCKED | FAILED
+FILES_CHANGED: NONE
+VERIFICATION: Read `src/auth/parser.py`.
+NOTES: <one sentence stating the constant values>
+"""
+        multi_step_read_prompt = """TASK: Audit authentication flow across four modules.
+
+RULES:
+1. Open `src/auth/parser.py`.
+2. Open `src/auth/session.py`.
+3. Open `src/auth/middleware.py`.
+4. Compare token expiration checks across all three modules.
+
+REPORT FORMAT:
+Return only these four lines:
+STATUS: COMPLETED | BLOCKED | FAILED
+FILES_CHANGED: NONE
+VERIFICATION: Inspected all three authentication modules.
+NOTES: <one sentence summarizing findings>
+"""
+        payload = dict(
+            self.base_payload,
+            toolCall={
+                "id": "call_downgrade_test",
+                "name": "invoke_subagent",
+                "args": {
+                    "Subagents": [
+                        {
+                            "TypeName": "research",
+                            "Role": "Quick Reader",
+                            "Model": "flash",
+                            "Prompt": simple_read_prompt,
+                        },
+                        {
+                            "TypeName": "research",
+                            "Role": "Deep Researcher",
+                            "Model": "flash",
+                            "Prompt": multi_step_read_prompt,
+                        },
+                    ]
+                },
+            },
+        )
+        res = orchestrator_guard.handle_pre_tool(payload)
+        self.assertEqual(res["decision"], "allow")
+        rewritten = res["overwrite"]["Subagents"]
+        self.assertEqual(rewritten[0]["Model"], "flash_lite")
+        self.assertEqual(rewritten[1]["Model"], "flash")
+
+    def test_pending_spawns_deduplicated_across_duplicate_pre_tool_hooks(self) -> None:
+        payload = dict(
+            self.base_payload,
+            toolCall={
+                "id": "call_dedup_1",
+                "name": "invoke_subagent",
+                "args": {
+                    "Subagents": [
+                        {
+                            "TypeName": "scout",
+                            "Role": "Dedup Scout",
+                            "Model": "flash_lite",
+                            "Prompt": VALID_PROMPT,
+                        }
+                    ]
+                },
+            },
+        )
+        orchestrator_guard.handle_pre_tool(payload)
+        orchestrator_guard.handle_pre_tool(payload)
+        orchestrator_guard.handle_pre_tool(payload)
+
+        state = orchestrator_guard._load_state(payload)
+        self.assertEqual(len(state.get("pending_spawns", [])), 1)
+
+    def test_worktree_and_sibling_brain_paths_auto_allowed(self) -> None:
+        app_data = Path(self.artifact_dir) / "appdata"
+        subagent_brain = app_data / "brain" / "subagent-uuid"
+        parent_scratch = app_data / "brain" / "parent-uuid" / "scratch" / "task.log"
+        worktree_file = app_data / "worktrees" / "parent-uuid" / "subagent-worktree" / "README.md"
+        subagent_brain.mkdir(parents=True, exist_ok=True)
+        parent_scratch.parent.mkdir(parents=True, exist_ok=True)
+        worktree_file.parent.mkdir(parents=True, exist_ok=True)
+
+        payload_scratch = dict(
+            self.base_payload,
+            artifactDirectoryPath=str(subagent_brain),
+            toolCall={
+                "name": "write_to_file",
+                "args": {"TargetFile": str(parent_scratch)},
+            },
+        )
+        self.assertEqual(
+            orchestrator_guard.handle_pre_tool(payload_scratch)["decision"], "allow"
+        )
+
+        payload_worktree = dict(
+            self.base_payload,
+            artifactDirectoryPath=str(subagent_brain),
+            toolCall={
+                "name": "write_to_file",
+                "args": {"TargetFile": str(worktree_file)},
+            },
+        )
+        self.assertEqual(
+            orchestrator_guard.handle_pre_tool(payload_worktree)["decision"], "allow"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
