@@ -294,6 +294,44 @@ class TestOrchestratorGuard(unittest.TestCase):
         res_rel = orchestrator_guard.handle_pre_tool(rel_outside_cmd)
         self.assertEqual(res_rel["decision"], "ask")
 
+    def test_post_tool_rolls_back_failed_branch_spawn(self) -> None:
+        spawn_payload = dict(
+            self.base_payload,
+            toolCall={
+                "name": "invoke_subagent",
+                "args": {
+                    "Subagents": [
+                        {
+                            "TypeName": "implementer",
+                            "Role": "Failed Branch Worker",
+                            "Model": "flash",
+                            "Workspace": "branch",
+                            "Prompt": VALID_PROMPT,
+                        }
+                    ]
+                },
+            },
+        )
+        res_pre = orchestrator_guard.handle_pre_tool(spawn_payload)
+        self.assertEqual(res_pre["decision"], "allow")
+
+        # Simulate runtime failure in PostToolUse
+        post_error_payload = dict(
+            spawn_payload,
+            error="failed to create git worktree",
+        )
+        orchestrator_guard.handle_post_tool(post_error_payload)
+
+        # Stop hook should now allow termination because the failed branch was rolled back
+        idle_payload = dict(
+            self.base_payload,
+            terminationReason="NO_TOOL_CALL",
+            fullyIdle=True,
+        )
+        self.assertEqual(
+            orchestrator_guard.handle_stop(idle_payload)["decision"], "allow"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

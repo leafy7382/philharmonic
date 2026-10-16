@@ -427,7 +427,17 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
     state = _load_state(payload)
-    _sync_subagents_from_transcript(payload, state)
+    tool_call = payload.get("toolCall", {})
+    tool_name = tool_call.get("name", "")
+    if tool_name == "invoke_subagent" and payload.get("error"):
+        subagents = (tool_call.get("args") or {}).get("Subagents") or []
+        pending = state.get("pending_spawns", [])
+        if subagents and len(pending) >= len(subagents):
+            del pending[-len(subagents) :]
+        else:
+            state["pending_spawns"] = []
+    else:
+        _sync_subagents_from_transcript(payload, state)
     _save_state(payload, state)
     return {}
 
