@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for orchestrator_guard.py and ste_lint.py."""
 
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -331,6 +332,63 @@ class TestOrchestratorGuard(unittest.TestCase):
         self.assertEqual(
             orchestrator_guard.handle_stop(idle_payload)["decision"], "allow"
         )
+
+    def test_transcript_sync_ignores_non_subagent_uuids(self) -> None:
+        transcript_file = Path(self.artifact_dir) / "transcript.jsonl"
+        payload = dict(
+            self.base_payload,
+            transcriptPath=str(transcript_file),
+            toolCall={
+                "name": "invoke_subagent",
+                "args": {
+                    "Subagents": [
+                        {
+                            "TypeName": "scout",
+                            "Role": "Symbol Scout",
+                            "Model": "flash_lite",
+                            "Prompt": VALID_PROMPT,
+                        }
+                    ]
+                },
+            },
+        )
+        orchestrator_guard.handle_pre_tool(payload)
+
+        # Write transcript lines with invoke_subagent and non-subagent UUIDs
+        non_subagent_step_uuid = "11111111-1111-1111-1111-111111111111"
+        non_subagent_task_uuid = "22222222-2222-2222-2222-222222222222"
+        actual_subagent_cid = "33333333-3333-3333-3333-333333333333"
+
+        # Line 1 has invoke_subagent and a step UUID but no conversationId key.
+        # Line 2 has stepId and callId UUIDs alongside the real conversationId key.
+        transcript_file.write_text(
+            json.dumps({
+                "stepId": non_subagent_step_uuid,
+                "message": "Invoked tool invoke_subagent",
+            })
+            + "\n"
+            + json.dumps({
+                "stepId": "44444444-4444-4444-4444-444444444444",
+                "toolCallId": non_subagent_task_uuid,
+                "name": "invoke_subagent",
+                "result": {
+                    "conversationId": actual_subagent_cid,
+                },
+            })
+            + "\n",
+            encoding="utf-8",
+        )
+
+        orchestrator_guard.handle_post_tool(payload)
+
+        state = orchestrator_guard._load_state(payload)
+        subagents = state.get("subagents", {})
+        self.assertIn(actual_subagent_cid, subagents)
+        self.assertNotIn(non_subagent_step_uuid, subagents)
+        self.assertNotIn(non_subagent_task_uuid, subagents)
+        self.assertNotIn("44444444-4444-4444-4444-444444444444", subagents)
+        self.assertEqual(len(state.get("pending_spawns", [])), 0)
+        self.assertEqual(subagents[actual_subagent_cid]["model"], "flash_lite")
 
 
 if __name__ == "__main__":
