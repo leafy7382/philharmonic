@@ -22,8 +22,8 @@ Do not call `define_subagent` upfront at session start. Register `scout` or `imp
 
 ## 2. Token-Optimal Dispatch and Model Selection Rules
 
-- **Direct Execution Fast-Path (0 Subagent Overhead)**: Execute single-step commands and reads or edits of $\le 2$ known files directly in the orchestrator (`view_file`, `write_to_file`, `replace_file_content`, `run_command`).
-- **Subagent Delegation Threshold**: Delegate to subagents only when a task spans $3+$ files, requires broad codebase/documentation search, or runs iterative test/build loops whose output would bloat the Pro context window.
+- **Direct Execution Fast-Path**: Execute single-step commands and reads or edits of $\le 2$ known files directly in the orchestrator (`view_file`, `write_to_file`, `replace_file_content`, `run_command`).
+- **Subagent Delegation Threshold**: Delegate to subagents only when a task spans $3+$ files or requires broad search. Also delegate iterative test loops that bloat context.
 - Never pass `Model: "inherit"` or `Model: "pro"` to `invoke_subagent`.
 - Use `Model: "flash_lite"` with `TypeName: "scout"` and `Workspace: "inherit"` for single-hop lookups, symbol searches, and log slicing ($\le 3$ rules, read-only).
 - Use `Model: "flash"` with `TypeName: "research"` and `Workspace: "inherit"` for multi-file analysis and documentation lookups ($> 3$ rules). Simple read-only `research` prompts ($\le 3$ rules) are automatically downgraded to `flash_lite` by the guard hook.
@@ -38,6 +38,7 @@ Write all `invoke_subagent` prompts and `send_message` instructions in ASD-STE10
 - Do not use semicolons, soft phrasal verbs, or synonym rotation.
 - Specify an explicit file allowlist and verification command.
 - Require the four-line `REPORT FORMAT` below. On failure or blocker, instruct `implementer` to write raw output to `<artifactDirectoryPath>/scratch/<task_id>.log` and cite the `file://` URI in `NOTES`.
+- If you are a subagent, `REPORT FORMAT` overrides workspace formatting rules: return only those four lines and omit any post-action retrospective.
 
 ```markdown
 TASK: <single-sentence objective>
@@ -59,7 +60,7 @@ NOTES: <one sentence stating findings, or file:// log URI if BLOCKED/FAILED>
 
 ## 4. Reactive Coordination and Context Hygiene
 
-- Launch independent subagents together in one `invoke_subagent` call.
+- Invoke independent subagents together in one `invoke_subagent` call.
 - End your turn immediately after calling `invoke_subagent` or `send_message`. Do not poll with `manage_subagents`.
 - Reuse an idle `flash` subagent via `send_message` when continuing work in the same module. Never send multi-step or code-editing tasks to a `flash_lite` (`scout`) subagent.
 - Stop completed `Workspace: "branch"` subagents with `manage_subagents` (`Action: "kill"`) after merging or discarding their changes.
