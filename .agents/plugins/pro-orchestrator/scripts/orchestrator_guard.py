@@ -71,14 +71,22 @@ def _find_project_root() -> Path:
 PROJECT_ROOT = _find_project_root()
 
 
+SMALL_TIER_RE = re.compile(
+    r"(?<![a-z])(flash|lite|mini|nano|haiku|small|tiny)(?![a-z])", re.I
+)
+
+
 def is_pro_tier(model_name: str) -> bool:
-    """Matches current and future Pro releases while rejecting Flash, Lite, or Auto."""
+    """Accept any frontier orchestrator model and reject small or auto-routed tiers.
+
+    Uses a denylist of small-tier markers so that flagship models from any vendor
+    (Gemini Pro/Argon/Ultra, Claude Opus/Sonnet, GPT, o-series, Grok, DeepSeek)
+    pass without code changes.
+    """
     normalized = (model_name or "").strip().lower()
     if not normalized or normalized in {"auto", "none"}:
         return False
-    if "flash" in normalized or "lite" in normalized:
-        return False
-    return any(token in normalized for token in ("pro", "argon", "ultra"))
+    return not SMALL_TIER_RE.search(normalized)
 
 
 def _state_file_path(payload: Dict[str, Any]) -> Path:
@@ -250,8 +258,8 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
             {
                 "ephemeralMessage": (
                     f"[ORCHESTRATOR GUARD] Active session model is '{model_name}', "
-                    "which is not a Pro-tier model. Warn the user to switch Model Selection "
-                    "to a Pro model before running orchestration tasks."
+                    "which is a small or auto-routed tier. Warn the user to switch Model Selection "
+                    "to a frontier model (for example Gemini Pro, Claude Opus, or GPT) before running orchestration tasks."
                 )
             }
         ]

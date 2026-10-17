@@ -62,6 +62,20 @@ class TestOrchestratorGuard(unittest.TestCase):
         self.assertFalse(orchestrator_guard.is_pro_tier("auto"))
         self.assertFalse(orchestrator_guard.is_pro_tier(""))
 
+    def test_is_pro_tier_accepts_other_frontier_vendors(self) -> None:
+        for name in (
+            "Claude Opus 5.5 (Medium)",
+            "claude-sonnet-5",
+            "gpt-6",
+            "gpt-6-pro",
+            "o5",
+            "grok-5",
+            "deepseek-v4",
+        ):
+            self.assertTrue(orchestrator_guard.is_pro_tier(name), name)
+        for name in ("claude-haiku-5", "gpt-6-mini", "gpt-6-nano", "gemini-3-flash-lite"):
+            self.assertFalse(orchestrator_guard.is_pro_tier(name), name)
+
     def test_pre_invocation_pro_vs_non_pro_and_dedup(self) -> None:
         # Pro model produces no warning
         res_pro = orchestrator_guard.handle_pre_invocation(self.base_payload)
