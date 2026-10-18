@@ -521,6 +521,475 @@ NOTES: <one sentence summarizing findings>
             orchestrator_guard.handle_pre_tool(payload_worktree)["decision"], "allow"
         )
 
+    def test_direct_mutation_budget_blocks_third_workspace_file(self) -> None:
+        file1 = str(orchestrator_guard.PROJECT_ROOT / "file1.py")
+        file2 = str(orchestrator_guard.PROJECT_ROOT / "file2.py")
+        file3 = str(orchestrator_guard.PROJECT_ROOT / "file3.py")
+
+        payload1 = dict(
+            self.base_payload,
+            toolCall={
+                "name": "write_to_file",
+                "args": {"TargetFile": file1},
+            },
+        )
+        self.assertEqual(orchestrator_guard.handle_pre_tool(payload1)["decision"], "allow")
+
+        payload1_repeat = dict(
+            self.base_payload,
+            toolCall={
+                "name": "replace_file_content",
+                "args": {"TargetFile": file1},
+            },
+        )
+        self.assertEqual(
+            orchestrator_guard.handle_pre_tool(payload1_repeat)["decision"], "allow"
+        )
+
+        payload2 = dict(
+            self.base_payload,
+            toolCall={
+                "name": "write_to_file",
+                "args": {"TargetFile": file2},
+            },
+        )
+        self.assertEqual(orchestrator_guard.handle_pre_tool(payload2)["decision"], "allow")
+
+        payload2_repeat = dict(
+            self.base_payload,
+            toolCall={
+                "name": "replace_file_content",
+                "args": {"TargetFile": file2},
+            },
+        )
+        self.assertEqual(
+            orchestrator_guard.handle_pre_tool(payload2_repeat)["decision"], "allow"
+        )
+
+        payload3 = dict(
+            self.base_payload,
+            toolCall={
+                "name": "write_to_file",
+                "args": {"TargetFile": file3},
+            },
+        )
+        res3 = orchestrator_guard.handle_pre_tool(payload3)
+        self.assertEqual(res3["decision"], "deny")
+        self.assertIn("[ORCHESTRATOR GUARD]", res3["reason"])
+
+        subagent_payload = dict(
+            self.base_payload,
+            modelName="gemini-3-flash",
+            toolCall={
+                "name": "write_to_file",
+                "args": {"TargetFile": file3},
+            },
+        )
+        res_sub = orchestrator_guard.handle_pre_tool(subagent_payload)
+        self.assertEqual(res_sub["decision"], "allow")
+
+    def test_direct_edit_then_test_command_blocked_for_orchestrator(self) -> None:
+        file1 = str(orchestrator_guard.PROJECT_ROOT / "file1.py")
+        payload_write = dict(
+            self.base_payload,
+            toolCall={
+                "name": "write_to_file",
+                "args": {"TargetFile": file1},
+            },
+        )
+        self.assertEqual(
+            orchestrator_guard.handle_pre_tool(payload_write)["decision"], "allow"
+        )
+
+        git_payload = dict(
+            self.base_payload,
+            toolCall={
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "git status",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+        )
+        self.assertEqual(
+            orchestrator_guard.handle_pre_tool(git_payload)["decision"], "allow"
+        )
+
+        test_payload = dict(
+            self.base_payload,
+            toolCall={
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "python3 -m unittest discover -s tests",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+        )
+        res_test = orchestrator_guard.handle_pre_tool(test_payload)
+        self.assertEqual(res_test["decision"], "deny")
+        self.assertIn("[ORCHESTRATOR GUARD]", res_test["reason"])
+
+    def test_direct_command_budget_blocks_third_command_and_deduplicates(self) -> None:
+        payload_cmd1 = dict(
+            self.base_payload,
+            toolCall={
+                "id": "cmd_call_1",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "ls -la",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+        )
+        self.assertEqual(
+            orchestrator_guard.handle_pre_tool(payload_cmd1)["decision"], "allow"
+        )
+        self.assertEqual(
+            orchestrator_guard.handle_pre_tool(payload_cmd1)["decision"], "allow"
+        )
+
+        state = orchestrator_guard._load_state(payload_cmd1)
+        self.assertEqual(len(state["direct_budget"]["1"]["commands"]), 1)
+
+        payload_cmd2 = dict(
+            self.base_payload,
+            toolCall={
+                "id": "cmd_call_2",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "python3 --version",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+        )
+        self.assertEqual(
+            orchestrator_guard.handle_pre_tool(payload_cmd2)["decision"], "allow"
+        )
+
+        payload_cmd3 = dict(
+            self.base_payload,
+            toolCall={
+                "id": "cmd_call_3",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "echo hello",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+        )
+        res_cmd3 = orchestrator_guard.handle_pre_tool(payload_cmd3)
+        self.assertEqual(res_cmd3["decision"], "deny")
+        self.assertIn("[ORCHESTRATOR GUARD]", res_cmd3["reason"])
+
+        payload_next_inv = dict(
+            self.base_payload,
+            invocationNum=2,
+            toolCall={
+                "id": "cmd_call_4",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "echo hello",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+        )
+        self.assertEqual(
+            orchestrator_guard.handle_pre_tool(payload_next_inv)["decision"], "allow"
+        )
+
+    def test_empirical_test_receipt_required_before_stop(self) -> None:
+        code_file = str(orchestrator_guard.PROJECT_ROOT / "src" / "app.py")
+        edit_payload = dict(
+            self.base_payload,
+            toolCall={
+                "name": "write_to_file",
+                "args": {"TargetFile": code_file, "CodeContent": "print('hello')"},
+            },
+        )
+        self.assertEqual(
+            orchestrator_guard.handle_pre_tool(edit_payload)["decision"], "allow"
+        )
+
+        stop_payload_1 = dict(
+            self.base_payload,
+            fullyIdle=True,
+            terminationReason="NO_TOOL_CALL",
+            executionNum=1,
+        )
+        res_stop_1 = orchestrator_guard.handle_stop(stop_payload_1)
+        self.assertEqual(res_stop_1["decision"], "continue")
+        self.assertIn("Empirical test receipt missing", res_stop_1["reason"])
+
+        # Failing test run
+        fail_test_payload = dict(
+            self.base_payload,
+            toolCall={
+                "id": "test_cmd_1",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "pytest tests/",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+            error="exit status 1",
+        )
+        orchestrator_guard.handle_post_tool(fail_test_payload)
+
+        stop_payload_2 = dict(
+            self.base_payload,
+            fullyIdle=True,
+            terminationReason="NO_TOOL_CALL",
+            executionNum=2,
+        )
+        res_stop_2 = orchestrator_guard.handle_stop(stop_payload_2)
+        self.assertEqual(res_stop_2["decision"], "continue")
+
+        # Passing test run
+        pass_test_payload = dict(
+            self.base_payload,
+            toolCall={
+                "id": "test_cmd_2",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "pytest tests/",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+            error="",
+        )
+        orchestrator_guard.handle_post_tool(pass_test_payload)
+
+        stop_payload_3 = dict(
+            self.base_payload,
+            fullyIdle=True,
+            terminationReason="NO_TOOL_CALL",
+            executionNum=3,
+        )
+        res_stop_3 = orchestrator_guard.handle_stop(stop_payload_3)
+        self.assertEqual(res_stop_3["decision"], "allow")
+
+    def test_two_turn_circuit_breaker_halts_retries_and_allows_scratch_log(self) -> None:
+        fail_1 = dict(
+            self.base_payload,
+            toolCall={
+                "id": "cmd_fail_1",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "pytest tests/",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+            error="exit status 1",
+        )
+        orchestrator_guard.handle_post_tool(fail_1)
+
+        fail_2 = dict(
+            self.base_payload,
+            toolCall={
+                "id": "cmd_fail_2",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "pytest tests/",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+            error="exit status 1",
+        )
+        orchestrator_guard.handle_post_tool(fail_2)
+
+        # 3rd run_command (pytest) denied
+        cmd_3 = dict(
+            self.base_payload,
+            toolCall={
+                "id": "cmd_fail_3",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "pytest tests/",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+        )
+        res_cmd_3 = orchestrator_guard.handle_pre_tool(cmd_3)
+        self.assertEqual(res_cmd_3["decision"], "deny")
+        self.assertIn("2-turn circuit breaker tripped", res_cmd_3["reason"])
+
+        # Workspace code edit denied
+        edit_code = dict(
+            self.base_payload,
+            toolCall={
+                "name": "write_to_file",
+                "args": {
+                    "TargetFile": str(orchestrator_guard.PROJECT_ROOT / "src" / "app.py"),
+                    "CodeContent": "print('retry')",
+                },
+            },
+        )
+        res_edit = orchestrator_guard.handle_pre_tool(edit_code)
+        self.assertEqual(res_edit["decision"], "deny")
+        self.assertIn("2-turn circuit breaker tripped", res_edit["reason"])
+
+        # Writing failure output to scratch log is allowed
+        scratch_log = str(Path(self.artifact_dir) / "scratch" / "fail.log")
+        scratch_write = dict(
+            self.base_payload,
+            toolCall={
+                "name": "write_to_file",
+                "args": {
+                    "TargetFile": scratch_log,
+                    "CodeContent": "Traceback: test failed twice",
+                },
+            },
+        )
+        res_scratch = orchestrator_guard.handle_pre_tool(scratch_write)
+        self.assertEqual(res_scratch["decision"], "allow")
+
+        # handle_stop (fullyIdle=True) returns allow so agent can report STATUS: BLOCKED
+        stop_payload = dict(
+            self.base_payload,
+            fullyIdle=True,
+            terminationReason="NO_TOOL_CALL",
+        )
+        res_stop = orchestrator_guard.handle_stop(stop_payload)
+        self.assertEqual(res_stop["decision"], "allow")
+
+    def test_pre_tool_blocks_test_tampering_edits(self) -> None:
+        test_file = str(orchestrator_guard.PROJECT_ROOT / "tests" / "test_sample.py")
+
+        # 1. Deleting an assertion is denied
+        payload_del_assert = dict(
+            self.base_payload,
+            toolCall={
+                "name": "replace_file_content",
+                "args": {
+                    "TargetFile": test_file,
+                    "TargetContent": "        self.assertEqual(a, b)\n",
+                    "ReplacementContent": "",
+                    "StartLine": 10,
+                    "EndLine": 11,
+                },
+            },
+        )
+        res_del_assert = orchestrator_guard.handle_pre_tool(payload_del_assert)
+        self.assertEqual(res_del_assert["decision"], "deny")
+        self.assertIn("reduces assertion count", res_del_assert["reason"])
+
+        # 2. Deleting a test function is denied
+        payload_del_test = dict(
+            self.base_payload,
+            toolCall={
+                "name": "replace_file_content",
+                "args": {
+                    "TargetFile": test_file,
+                    "TargetContent": "    def test_login(self):\n        pass\n",
+                    "ReplacementContent": "",
+                    "StartLine": 5,
+                    "EndLine": 7,
+                },
+            },
+        )
+        res_del_test = orchestrator_guard.handle_pre_tool(payload_del_test)
+        self.assertEqual(res_del_test["decision"], "deny")
+        self.assertIn("reduces test count", res_del_test["reason"])
+
+        # 3. Adding a skip decorator is denied (use string concatenation so test file itself doesn't trigger skip regex)
+        skip_marker = "@" + "unittest.skip('skip')"
+        payload_add_skip = dict(
+            self.base_payload,
+            toolCall={
+                "name": "replace_file_content",
+                "args": {
+                    "TargetFile": test_file,
+                    "TargetContent": "    def test_login(self):",
+                    "ReplacementContent": f"    {skip_marker}\n    def test_login(self):",
+                    "StartLine": 5,
+                    "EndLine": 6,
+                },
+            },
+        )
+        res_add_skip = orchestrator_guard.handle_pre_tool(payload_add_skip)
+        self.assertEqual(res_add_skip["decision"], "deny")
+        self.assertIn("adding skip/xfail decorators", res_add_skip["reason"])
+
+        # 4. Adding trivial assert True is denied (use string concatenation)
+        trivial_assert = "assert " + "True"
+        payload_trivial = dict(
+            self.base_payload,
+            toolCall={
+                "name": "replace_file_content",
+                "args": {
+                    "TargetFile": test_file,
+                    "TargetContent": "        self.assertEqual(a, b)",
+                    "ReplacementContent": f"        {trivial_assert}",
+                    "StartLine": 10,
+                    "EndLine": 11,
+                },
+            },
+        )
+        res_trivial = orchestrator_guard.handle_pre_tool(payload_trivial)
+        self.assertEqual(res_trivial["decision"], "deny")
+        self.assertIn("trivial 'assert True'", res_trivial["reason"])
+
+        # 5. Adding new test function and new assertions is allowed
+        payload_add_test = dict(
+            self.base_payload,
+            toolCall={
+                "name": "replace_file_content",
+                "args": {
+                    "TargetFile": test_file,
+                    "TargetContent": "    def test_existing(self):\n        self.assertEqual(1, 1)",
+                    "ReplacementContent": (
+                        "    def test_existing(self):\n"
+                        "        self.assertEqual(1, 1)\n\n"
+                        "    def test_new(self):\n"
+                        "        self.assertEqual(2, 2)"
+                    ),
+                    "StartLine": 15,
+                    "EndLine": 17,
+                },
+            },
+        )
+        res_add_test = orchestrator_guard.handle_pre_tool(payload_add_test)
+        self.assertEqual(res_add_test["decision"], "allow")
+
+    def test_audit_diff_text_detects_test_tampering(self) -> None:
+        # 1. Removing an assertion in tests/test_auth.py returns error string
+        diff_rem_assert = (
+            "--- a/tests/test_auth.py\n"
+            "+++ b/tests/test_auth.py\n"
+            "@@ -10,3 +10,2 @@\n"
+            "-    self.assertEqual(token, 'abc')\n"
+            "     return True\n"
+        )
+        res_rem = orchestrator_guard.audit_diff_text(diff_rem_assert)
+        self.assertIsNotNone(res_rem)
+        self.assertIn("Diff audit detected net removal of 1 assertion(s)", res_rem)
+
+        # 2. Adding skip marker in tests/test_auth.py returns error string
+        skip_line = "+@" + "pytest.mark.skip"
+        diff_add_skip = (
+            "--- a/tests/test_auth.py\n"
+            "+++ b/tests/test_auth.py\n"
+            "@@ -5,2 +5,3 @@\n"
+            f"{skip_line}\n"
+            " def test_login():\n"
+            "     pass\n"
+        )
+        res_skip = orchestrator_guard.audit_diff_text(diff_add_skip)
+        self.assertIsNotNone(res_skip)
+        self.assertIn("Diff audit detected test skip/xfail marker added", res_skip)
+
+        # 3. Adding a new test + assertion in tests/test_auth.py returns None
+        diff_add_test = (
+            "--- a/tests/test_auth.py\n"
+            "+++ b/tests/test_auth.py\n"
+            "@@ -20,2 +20,6 @@\n"
+            "+def test_new_feature():\n"
+            "+    self.assertEqual(1, 1)\n"
+            " def test_existing():\n"
+        )
+        res_good = orchestrator_guard.audit_diff_text(diff_add_test)
+        self.assertIsNone(res_good)
+
 
 if __name__ == "__main__":
     unittest.main()

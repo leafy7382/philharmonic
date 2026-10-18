@@ -7,6 +7,9 @@ A zero-dependency **Antigravity (`agy`) plugin** that enforces a Pro-tier Centra
 ## Features
 
 - **Strict Tiered Delegation**: Pins the root session as the Central Orchestrator (`pro`) and delegates file discovery, research, and bounded code changes to `flash_lite` (`scout`) and `flash` (`research`, `implementer`) subagents.
+- **Empirical Test Receipts**: Every code change requires a subsequent passing test run recorded in `post-tool` before the `stop` hook allows completion.
+- **2-Turn Circuit Breaker**: Tracks consecutive command/subagent failures in `post-tool` and trips after 2 failures, halting retries in `pre-tool` (while allowing scratch log writes) and allowing immediate `STATUS: BLOCKED` termination.
+- **Test Tampering Audit**: `pre-tool` and `stop` unified diff auditing block edits to test files that remove test functions, reduce assertion counts, add skip/xfail markers, or insert trivial `assert True` checks.
 - **Deterministic Guard Hooks**: Four lifecycle hooks (`pre-invocation`, `pre-tool`, `post-tool`, `stop`) implemented in [orchestrator_guard.py](.agents/plugins/pro-orchestrator/scripts/orchestrator_guard.py) prevent direct workspace mutations by the orchestrator, block `Model: "inherit"` / `Model: "pro"` subagent spawns, and track active subagents and branch worktrees.
 - **ASD-STE100 Prompt Linter Gate**: Every `invoke_subagent` and `send_message` payload is checked by [ste_lint.py](.agents/plugins/pro-orchestrator/scripts/ste_lint.py) before execution to reject ambiguous instructions.
 - **Zero External Dependencies**: Uses only the Python 3 standard library.
@@ -58,7 +61,7 @@ ln -s "$(pwd)/.agents/plugins/pro-orchestrator" ~/.gemini/config/plugins/pro-orc
 ## Subagent Architecture & Automatic Token Optimization
 
 To minimize both Pro-tier context growth and subagent spawn overhead:
-- **Direct Execution Fast-Path**: Single-step commands and reads/edits of $\le 2$ known files execute directly in the orchestrator with zero subagent overhead.
+- **Direct Execution Fast-Path**: Single-step commands and reads/edits of $\le 2$ known files execute directly in the orchestrator with zero subagent overhead, enforced by a deterministic fast-path budget gate ($\le 2$ workspace files, $\le 2$ non-git commands, and blocking direct code+test loops in the root orchestrator).
 - **Lazy Subagent Registration**: Custom subagents (`scout` and `implementer`) are registered via `define_subagent` only immediately before first invoking them.
 - **Automatic Tier Downgrade**: The `pre-tool` hook automatically downgrades read-only subagent calls (`scout` / `research`) with $\le 3$ numbered rules and no mutation verbs to `Model: "flash_lite"`.
 
@@ -108,12 +111,21 @@ Configured in [hooks.json](.agents/plugins/pro-orchestrator/hooks.json) and exec
 
 1. **`pre-invocation`**: Verifies the active session is pinned to a Pro-tier model and deduplicates warnings per invocation.
 2. **`pre-tool`**:
-   - Auto-allows workspace, worktree, and scratch artifact file/command operations.
+   - Auto-allows workspace, worktree, and scratch artifact file/command operations while enforcing the deterministic fast-path budget gate ($\le 2$ workspace files, $\le 2$ non-git commands, and blocking direct code+test loops in the root orchestrator).
    - Blocks `Model: "pro"`, rewrites `Model: "inherit"`, and automatically downgrades simple read-only subagent tasks ($\le 3$ rules) to `Model: "flash_lite"`.
    - Runs the STE-100 linter gate on all `invoke_subagent` and `send_message` prompts.
+   - Blocks test file edits that remove test functions, reduce assertion counts, add skip/xfail markers, or insert trivial `assert True` checks (Test Tampering Audit).
+   - Halts retries when the 2-Turn Circuit Breaker is tripped, while allowing scratch log writes.
    - Deduplicates `pending_spawns` tracking across multiple hook registrations.
-3. **`post-tool`**: Synchronizes spawned subagent conversation IDs, model tiers, and `branch` workspaces in session state, rolling back failed spawns.
-4. **`stop`**: Blocks premature completion if any `Workspace: "branch"` subagent worktrees remain unkilled when the session goes idle.
+3. **`post-tool`**:
+   - Synchronizes spawned subagent conversation IDs, model tiers, and `branch` workspaces in session state, rolling back failed spawns.
+   - Tracks command and subagent failures, tripping the 2-turn circuit breaker after 2 consecutive failures.
+   - Records empirical test receipts on passing test commands following code mutations.
+4. **`stop`**:
+   - Blocks premature completion if any `Workspace: "branch"` subagent worktrees remain unkilled when the session goes idle.
+   - Blocks completion with missing empirical test receipts when code files were modified without a subsequent passing test run recorded in `post-tool`.
+   - Performs git diff auditing to block test tampering.
+   - Allows immediate turn termination when the 2-turn circuit breaker is tripped so the agent can report `STATUS: BLOCKED`.
 
 ---
 

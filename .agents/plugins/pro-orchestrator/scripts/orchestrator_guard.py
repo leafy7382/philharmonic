@@ -58,6 +58,40 @@ CONVERSATION_ID_RE = re.compile(
     re.I,
 )
 
+MAX_DIRECT_MUTATION_FILES = 2
+MAX_DIRECT_COMMANDS = 2
+MUTATION_TOOLS = {
+    "write_to_file",
+    "replace_file_content",
+    "multi_replace_file_content",
+}
+GIT_COMMAND_RE = re.compile(r"^\s*git\b")
+TEST_RUNNER_RE = re.compile(
+    r"\b(pytest|unittest|cargo\s+test|npm\s+test|pnpm\s+test|yarn\s+test|go\s+test|jest|vitest|tox|nox)\b"
+)
+MAX_CONSECUTIVE_FAILURES = 2
+DOC_EXTENSIONS = {".md", ".txt", ".rst", ".adoc"}
+TEST_FILE_RE = re.compile(
+    r"(^|/)(tests?|__tests__)/|(^|/)(test_[^/]+\.py|[^/]+_test\.(py|go|rs)|[^/]+\.(test|spec)\.[jt]sx?)$",
+    re.I,
+)
+TEST_DEF_RE = re.compile(
+    r"(?m)^\s*(?:async\s+def|def)\s+test_[A-Za-z0-9_]+\s*\(|^\s*(?:it|test)\s*\("
+)
+ASSERTION_RE = re.compile(
+    r"\b(?:assert\b|self\.assert[A-Za-z0-9_]*\s*\(|expect\s*\(|should\.)"
+)
+TAMPER_SKIP_RE = re.compile(
+    r"(?m)^\s*(?:@unittest\.(?:skip|expectedFailure)\b|@pytest\.mark\.(?:skip|xfail)\b|"
+    r"pytest\.(?:skip|xfail)\s*\(|self\.skipTest\s*\(|unittest\.SkipTest\b|"
+    r"(?:it|test|describe)\.(?:skip|only)\s*\(|(?:xit|xtest|xdescribe)\s*\(|#\s*\[ignore\b)"
+)
+TRIVIAL_ASSERT_RE = re.compile(
+    r"(?m)^\s*(?:assert\s+True\b|self\.assertTrue\s*\(\s*True\s*\))"
+)
+
+
+
 
 def _find_project_root() -> Path:
     """Resolve the project workspace root from the script location."""
@@ -115,6 +149,9 @@ def _load_state(payload: Dict[str, Any]) -> Dict[str, Any]:
         "pending_spawns": [],
         "subagents": {},
         "stop_reminded_executions": [],
+        "direct_budget": {},
+        "test_receipt": {},
+        "circuit_breaker": {},
     }
 
 
@@ -431,10 +468,339 @@ def _handle_manage_subagents(
     return {"decision": "allow"}
 
 
+def _is_orchestrator_caller(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
+    """Return True when the caller is the Pro-tier root orchestrator rather than a worker subagent."""
+    if not is_pro_tier(payload.get("modelName", "")):
+        return False
+    cid = (payload.get("conversationId") or "").strip().lower()
+    if cid and cid in state.get("subagents", {}):
+        return False
+    return True
+
+
+def _is_artifact_or_worktree_path(target: str, payload: Dict[str, Any]) -> bool:
+    """Return True if target is inside the conversation artifact/brain directory or a subagent worktree."""
+    artifact_dir = payload.get("artifactDirectoryPath")
+    if not artifact_dir or not target:
+        return False
+    try:
+        resolved_target = Path(os.path.expanduser(target)).resolve()
+        resolved_artifact = Path(artifact_dir).resolve()
+    except OSError:
+        return False
+
+    exempt_roots = [resolved_artifact]
+    if resolved_artifact.parent.name == "brain":
+        exempt_roots.append(resolved_artifact.parent)
+        exempt_roots.append(resolved_artifact.parent.parent / "worktrees")
+
+    for root in exempt_roots:
+        try:
+            resolved_target.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _check_and_record_direct_budget(
+    payload: Dict[str, Any], tool_name: str, args: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Enforce direct execution fast-path limits on the Pro-tier orchestrator."""
+    state = _load_state(payload)
+    if not _is_orchestrator_caller(payload, state):
+        return None
+
+    inv_key = str(payload.get("invocationNum", 0))
+    budget = state.setdefault("direct_budget", {}).setdefault(
+        inv_key, {"mutated_files": [], "commands": [], "seen_calls": []}
+    )
+    call_id = (payload.get("toolCall") or {}).get("id") or ""
+
+    if tool_name in MUTATION_TOOLS:
+        target = args.get("TargetFile") or args.get("AbsolutePath") or ""
+        if not target or _is_artifact_or_worktree_path(target, payload):
+            return None
+        try:
+            norm_target = str(Path(os.path.expanduser(target)).resolve())
+        except OSError:
+            return None
+
+        mutated_files: List[str] = budget.setdefault("mutated_files", [])
+        if norm_target not in mutated_files:
+            if len(mutated_files) >= MAX_DIRECT_MUTATION_FILES:
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"[ORCHESTRATOR GUARD] Direct execution fast-path limit "
+                        f"({MAX_DIRECT_MUTATION_FILES} workspace files) exceeded when editing "
+                        f"'{Path(norm_target).name}'. Delegate multi-file changes to an "
+                        "'implementer' subagent (Model='flash')."
+                    ),
+                }
+            mutated_files.append(norm_target)
+            _save_state(payload, state)
+        return None
+
+    if tool_name == "run_command":
+        cmd = (args.get("CommandLine") or "").strip()
+        if GIT_COMMAND_RE.match(cmd):
+            return None
+
+        mutated_files = budget.get("mutated_files", [])
+        if mutated_files and TEST_RUNNER_RE.search(cmd):
+            return {
+                "decision": "deny",
+                "reason": (
+                    "[ORCHESTRATOR GUARD] Direct workspace edit followed by test execution "
+                    "detected in the orchestrator. Delegate code and test execution loops "
+                    "to an 'implementer' subagent (Model='flash')."
+                ),
+            }
+
+        seen_calls: List[str] = budget.setdefault("seen_calls", [])
+        if call_id and call_id in seen_calls:
+            return None
+
+        commands: List[str] = budget.setdefault("commands", [])
+        if len(commands) >= MAX_DIRECT_COMMANDS:
+            return {
+                "decision": "deny",
+                "reason": (
+                    f"[ORCHESTRATOR GUARD] Direct execution fast-path command limit "
+                    f"({MAX_DIRECT_COMMANDS} commands per turn) exceeded. Delegate iterative "
+                    "command or test execution to a 'scout', 'research', or 'implementer' subagent."
+                ),
+            }
+
+        if call_id:
+            seen_calls.append(call_id)
+        commands.append(cmd)
+        _save_state(payload, state)
+        return None
+
+    return None
+
+
+def _is_test_file(path_str: str) -> bool:
+    if not path_str:
+        return False
+    norm = path_str.replace("\\", "/")
+    return bool(TEST_FILE_RE.search(norm))
+
+
+def _is_code_file(path_str: str) -> bool:
+    if not path_str:
+        return False
+    ext = Path(path_str).suffix.lower()
+    return ext not in DOC_EXTENSIONS
+
+
+def _check_test_tampering_in_edit(
+    tool_name: str, args: Dict[str, Any], payload: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Block edits to test files that delete tests/assertions or add skip markers."""
+    target = args.get("TargetFile") or args.get("AbsolutePath") or ""
+    if not target or _is_artifact_or_worktree_path(target, payload):
+        return None
+    if not _is_test_file(target):
+        return None
+
+    chunks: List[Tuple[str, str]] = []
+    if tool_name == "replace_file_content":
+        chunks.append(
+            (args.get("TargetContent") or "", args.get("ReplacementContent") or "")
+        )
+    elif tool_name == "multi_replace_file_content":
+        for ch in args.get("ReplacementChunks") or []:
+            chunks.append(
+                (ch.get("TargetContent") or "", ch.get("ReplacementContent") or "")
+            )
+    elif tool_name == "write_to_file":
+        new_code = args.get("CodeContent") or ""
+        old_code = ""
+        try:
+            resolved = Path(os.path.expanduser(target)).resolve()
+            if resolved.exists():
+                old_code = resolved.read_text(encoding="utf-8")
+        except OSError:
+            old_code = ""
+        chunks.append((old_code, new_code))
+
+    file_name = Path(target).name
+    for old_text, new_text in chunks:
+        old_skips = len(TAMPER_SKIP_RE.findall(old_text))
+        new_skips = len(TAMPER_SKIP_RE.findall(new_text))
+        if new_skips > old_skips:
+            return {
+                "decision": "deny",
+                "reason": (
+                    f"[ORCHESTRATOR GUARD] Test tampering blocked in '{file_name}': "
+                    "adding skip/xfail decorators or disabling tests is prohibited."
+                ),
+            }
+
+        old_trivial = len(TRIVIAL_ASSERT_RE.findall(old_text))
+        new_trivial = len(TRIVIAL_ASSERT_RE.findall(new_text))
+        if new_trivial > old_trivial:
+            return {
+                "decision": "deny",
+                "reason": (
+                    f"[ORCHESTRATOR GUARD] Test tampering blocked in '{file_name}': "
+                    "replacing checks with trivial 'assert True' is prohibited."
+                ),
+            }
+
+        if old_text:
+            old_tests = len(TEST_DEF_RE.findall(old_text))
+            new_tests = len(TEST_DEF_RE.findall(new_text))
+            if new_tests < old_tests:
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"[ORCHESTRATOR GUARD] Test tampering blocked in '{file_name}': "
+                        f"edit reduces test count from {old_tests} to {new_tests}."
+                    ),
+                }
+
+            old_asserts = len(ASSERTION_RE.findall(old_text))
+            new_asserts = len(ASSERTION_RE.findall(new_text))
+            if new_asserts < old_asserts:
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"[ORCHESTRATOR GUARD] Test tampering blocked in '{file_name}': "
+                        f"edit reduces assertion count from {old_asserts} to {new_asserts}."
+                    ),
+                }
+
+    return None
+
+
+def audit_diff_text(diff_text: str) -> Optional[str]:
+    """Audit unified git diff text for test tampering across test files."""
+    if not diff_text:
+        return None
+
+    current_file: Optional[str] = None
+    removed_lines: List[str] = []
+    added_lines: List[str] = []
+
+    def _check_accumulated(fname: Optional[str], rem: List[str], add: List[str]) -> Optional[str]:
+        if not fname or not _is_test_file(fname):
+            return None
+        rem_blob = "\n".join(rem)
+        add_blob = "\n".join(add)
+        short_name = Path(fname).name
+
+        if len(TAMPER_SKIP_RE.findall(add_blob)) > len(TAMPER_SKIP_RE.findall(rem_blob)):
+            return (
+                f"[ORCHESTRATOR GUARD] Diff audit detected test skip/xfail marker added in '{short_name}'."
+            )
+        if len(TRIVIAL_ASSERT_RE.findall(add_blob)) > len(TRIVIAL_ASSERT_RE.findall(rem_blob)):
+            return (
+                f"[ORCHESTRATOR GUARD] Diff audit detected trivial 'assert True' added in '{short_name}'."
+            )
+        rem_tests = len(TEST_DEF_RE.findall(rem_blob))
+        add_tests = len(TEST_DEF_RE.findall(add_blob))
+        if rem_tests > add_tests:
+            return (
+                f"[ORCHESTRATOR GUARD] Diff audit detected net removal of {rem_tests - add_tests} "
+                f"test definition(s) in '{short_name}'."
+            )
+        rem_asserts = len(ASSERTION_RE.findall(rem_blob))
+        add_asserts = len(ASSERTION_RE.findall(add_blob))
+        if rem_asserts > add_asserts:
+            return (
+                f"[ORCHESTRATOR GUARD] Diff audit detected net removal of {rem_asserts - add_asserts} "
+                f"assertion(s) in '{short_name}'."
+            )
+        return None
+
+    for raw_line in diff_text.splitlines():
+        if raw_line.startswith("+++ b/"):
+            verdict = _check_accumulated(current_file, removed_lines, added_lines)
+            if verdict:
+                return verdict
+            current_file = raw_line[6:].strip()
+            removed_lines = []
+            added_lines = []
+        elif raw_line.startswith("---") or raw_line.startswith("@@") or raw_line.startswith("diff --git"):
+            continue
+        elif raw_line.startswith("-"):
+            removed_lines.append(raw_line[1:])
+        elif raw_line.startswith("+"):
+            added_lines.append(raw_line[1:])
+
+    return _check_accumulated(current_file, removed_lines, added_lines)
+
+
+def _get_circuit_breaker(state: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    inv_key = str(payload.get("invocationNum", 0))
+    return state.setdefault("circuit_breaker", {}).setdefault(
+        inv_key,
+        {"failure_streak": 0, "tripped": False, "seen_failures": [], "last_error": ""},
+    )
+
+
+def _get_test_receipt(state: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    inv_key = str(payload.get("invocationNum", 0))
+    return state.setdefault("test_receipt", {}).setdefault(
+        inv_key,
+        {
+            "dirty": False,
+            "verified": False,
+            "last_mutated_file": "",
+            "last_test_cmd": "",
+        },
+    )
+
+
 def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
     tool_call = payload.get("toolCall", {})
     tool_name = tool_call.get("name", "")
     args = tool_call.get("args", {}) or {}
+
+    state = _load_state(payload)
+    cb = _get_circuit_breaker(state, payload)
+    if cb.get("tripped"):
+        if tool_name in MUTATION_TOOLS:
+            target = args.get("TargetFile") or args.get("AbsolutePath") or ""
+            if not _is_artifact_or_worktree_path(target, payload):
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"[ORCHESTRATOR GUARD] 2-turn circuit breaker tripped after "
+                        f"{cb.get('failure_streak', 2)} consecutive failures "
+                        f"(last error: {cb.get('last_error', 'command/subagent failed')}). "
+                        "Stop retrying, write failure details to the scratch log if needed, "
+                        "and report STATUS: BLOCKED."
+                    ),
+                }
+        elif tool_name == "run_command":
+            cmd = (args.get("CommandLine") or "").strip()
+            if not re.match(r"^\s*git\s+(status|diff|log)\b", cmd):
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"[ORCHESTRATOR GUARD] 2-turn circuit breaker tripped after "
+                        f"{cb.get('failure_streak', 2)} consecutive failures "
+                        f"(last error: {cb.get('last_error', 'command/subagent failed')}). "
+                        "Stop retrying, write failure details to the scratch log if needed, "
+                        "and report STATUS: BLOCKED."
+                    ),
+                }
+        elif tool_name in {"invoke_subagent", "send_message"}:
+            return {
+                "decision": "deny",
+                "reason": (
+                    f"[ORCHESTRATOR GUARD] 2-turn circuit breaker tripped after "
+                    f"{cb.get('failure_streak', 2)} consecutive failures "
+                    f"(last error: {cb.get('last_error', 'command/subagent failed')}). "
+                    "Stop retrying, write failure details to the scratch log if needed, "
+                    "and report STATUS: BLOCKED."
+                ),
+            }
 
     if tool_name == "define_subagent":
         return _handle_define_subagent(args)
@@ -448,6 +814,11 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
     if tool_name == "manage_subagents":
         return _handle_manage_subagents(payload, args)
 
+    if tool_name in MUTATION_TOOLS:
+        tamper_denial = _check_test_tampering_in_edit(tool_name, args, payload)
+        if tamper_denial is not None:
+            return tamper_denial
+
     # Workspace auto-allow gate for project-scoped operations
     roots = _allowed_roots(payload)
 
@@ -457,6 +828,9 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
         if _is_within_allowed_roots(cwd, roots) and _command_stays_in_workspace(
             cmd, cwd, roots
         ):
+            budget_denial = _check_and_record_direct_budget(payload, tool_name, args)
+            if budget_denial:
+                return budget_denial
             return {
                 "decision": "allow",
                 "permissionOverrides": [f"command({cmd})", "command(*)"],
@@ -465,7 +839,23 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     for path_key in ("TargetFile", "AbsolutePath", "SearchPath", "DirectoryPath"):
         if path_key in args:
-            if _is_within_allowed_roots(args.get(path_key), roots):
+            target_path = args.get(path_key)
+            if _is_within_allowed_roots(target_path, roots):
+                budget_denial = _check_and_record_direct_budget(payload, tool_name, args)
+                if budget_denial:
+                    return budget_denial
+                if tool_name in MUTATION_TOOLS:
+                    target = target_path or ""
+                    if not _is_artifact_or_worktree_path(target, payload) and _is_code_file(target):
+                        state = _load_state(payload)
+                        receipt = _get_test_receipt(state, payload)
+                        receipt["dirty"] = True
+                        receipt["verified"] = False
+                        try:
+                            receipt["last_mutated_file"] = str(Path(os.path.expanduser(target)).resolve())
+                        except OSError:
+                            receipt["last_mutated_file"] = target
+                        _save_state(payload, state)
                 return {"decision": "allow"}
             return {"decision": "ask"}
 
@@ -485,6 +875,37 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
             state["pending_spawns"] = []
     else:
         _sync_subagents_from_transcript(payload, state)
+
+    cb = _get_circuit_breaker(state, payload)
+    receipt = _get_test_receipt(state, payload)
+    error_text = str(payload.get("error") or "").strip()
+    call_id = str(tool_call.get("id") or payload.get("stepIdx") or "")
+
+    if tool_name in {"run_command", "invoke_subagent"}:
+        cmd = ((tool_call.get("args") or {}).get("CommandLine") or "").strip()
+        is_test_cmd = (tool_name == "run_command" and bool(TEST_RUNNER_RE.search(cmd)))
+        if error_text:
+            seen_failures: List[str] = cb.setdefault("seen_failures", [])
+            dedup_id = f"{tool_name}:{call_id}:{error_text}"
+            if not call_id or dedup_id not in seen_failures:
+                if call_id:
+                    seen_failures.append(dedup_id)
+                cb["failure_streak"] = cb.get("failure_streak", 0) + 1
+                cb["last_error"] = error_text
+                if cb["failure_streak"] >= MAX_CONSECUTIVE_FAILURES:
+                    cb["tripped"] = True
+            if is_test_cmd:
+                receipt["verified"] = False
+                receipt["last_test_cmd"] = cmd
+        else:
+            if tool_name == "invoke_subagent" or is_test_cmd or (tool_name == "run_command" and not GIT_COMMAND_RE.match(cmd)):
+                cb["failure_streak"] = 0
+                cb["tripped"] = False
+            if is_test_cmd:
+                receipt["dirty"] = False
+                receipt["verified"] = True
+                receipt["last_test_cmd"] = cmd
+
     _save_state(payload, state)
     return {}
 
@@ -532,6 +953,37 @@ def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "reason": (
                     f"[ORCHESTRATOR GUARD] Uncleaned branched subagent worktrees remain ({targets}). "
                     "Verify/merge branch changes and call manage_subagents(Action='kill') before finishing."
+                ),
+            }
+
+    cb = _get_circuit_breaker(state, payload)
+    if cb.get("tripped"):
+        return {"decision": "allow"}
+
+    if payload.get("gitDiff"):
+        tamper_finding = audit_diff_text(payload["gitDiff"])
+        if tamper_finding:
+            exec_key = f"tamper:{payload.get('conversationId', '')}:{payload.get('executionNum', 0)}"
+            reminded = state.setdefault("stop_reminded_executions", [])
+            if exec_key not in reminded:
+                reminded.append(exec_key)
+                _save_state(payload, state)
+                return {"decision": "continue", "reason": tamper_finding}
+
+    receipt = _get_test_receipt(state, payload)
+    if receipt.get("dirty") and not receipt.get("verified"):
+        exec_key = f"receipt:{payload.get('conversationId', '')}:{payload.get('executionNum', 0)}"
+        reminded = state.setdefault("stop_reminded_executions", [])
+        if exec_key not in reminded:
+            reminded.append(exec_key)
+            _save_state(payload, state)
+            last_file = Path(receipt.get("last_mutated_file") or "workspace").name
+            return {
+                "decision": "continue",
+                "reason": (
+                    f"[ORCHESTRATOR GUARD] Empirical test receipt missing: code file "
+                    f"'{last_file}' was modified without a subsequent passing test run "
+                    "recorded in PostToolUse. Run the test suite to verify changes before finishing."
                 ),
             }
 

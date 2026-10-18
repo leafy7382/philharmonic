@@ -22,8 +22,8 @@ Do not call `define_subagent` upfront at session start. Register `scout` or `imp
 
 ## 2. Token-Optimal Dispatch and Model Selection Rules
 
-- **Direct Execution Fast-Path**: Execute single-step commands and reads or edits of $\le 2$ known files directly in the orchestrator (`view_file`, `write_to_file`, `replace_file_content`, `run_command`).
-- **Subagent Delegation Threshold**: Delegate to subagents only when a task spans $3+$ files or requires broad search. Also delegate iterative test loops that bloat context.
+- **Direct Execution Fast-Path**: Execute single-step commands and reads or trivial non-tested edits of $\le 2$ known files directly in the orchestrator (`view_file`, `write_to_file`, `replace_file_content`, `run_command`).
+- **Subagent Delegation Threshold**: Delegate to `implementer` whenever a task edits code and runs tests. Also delegate any task that touches $3+$ cumulative files, requires broad search, or runs iterative test loops.
 - Never pass `Model: "inherit"` or `Model: "pro"` to `invoke_subagent`.
 - Use `Model: "flash_lite"` with `TypeName: "scout"` and `Workspace: "inherit"` for single-hop lookups, symbol searches, and log slicing ($\le 3$ rules, read-only).
 - Use `Model: "flash"` with `TypeName: "research"` and `Workspace: "inherit"` for multi-file analysis and documentation lookups ($> 3$ rules). Simple read-only `research` prompts ($\le 3$ rules) are automatically downgraded to `flash_lite` by the guard hook.
@@ -64,3 +64,10 @@ NOTES: <one sentence stating findings, or file:// log URI if BLOCKED/FAILED>
 - End your turn immediately after calling `invoke_subagent` or `send_message`. Do not poll with `manage_subagents`.
 - Reuse an idle `flash` subagent via `send_message` when continuing work in the same module. Never send multi-step or code-editing tasks to a `flash_lite` (`scout`) subagent.
 - Stop completed `Workspace: "branch"` subagents with `manage_subagents` (`Action: "kill"`) after merging or discarding their changes.
+
+## 5. Empirical Test Receipts, Circuit Breaker, and Diff Audit
+
+- **Empirical Test Receipts**: Every code change requires a passing test command recorded by the guard hook after the last file edit.
+- **Two-Turn Circuit Breaker**: Stop retrying after 2 consecutive command or subagent failures, write raw output to the scratch log, and report `STATUS: BLOCKED`.
+- **No Test Tampering**: Never delete, skip, or weaken existing test functions or assertions to make a test suite pass.
+
