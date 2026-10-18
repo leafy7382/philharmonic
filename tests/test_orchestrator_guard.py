@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from typing import Any, Dict
 import unittest
 
 SCRIPT_DIR = (
@@ -989,6 +990,201 @@ NOTES: <one sentence summarizing findings>
         )
         res_good = orchestrator_guard.audit_diff_text(diff_add_test)
         self.assertIsNone(res_good)
+
+    def test_subagent_pre_invocation_injects_isolation_reminder_instead_of_tier_warning(
+        self,
+    ) -> None:
+        orchestrator_guard.register_subagent(
+            self.base_payload,
+            conversation_id="sub-1111",
+            type_name="scout",
+            model="flash_lite",
+        )
+        payload = dict(
+            self.base_payload,
+            conversationId="sub-1111",
+            modelName="gemini-3-flash-lite",
+            invocationNum=1,
+        )
+        res = orchestrator_guard.handle_pre_invocation(payload)
+        self.assertIn("injectSteps", res)
+        msg = res["injectSteps"][0]["ephemeralMessage"]
+        self.assertIn("Subagent context isolation active", msg)
+        self.assertIn("REPORT FORMAT", msg)
+
+    def test_subagent_stop_enforces_four_line_report_format(self) -> None:
+        payload_bad = dict(
+            self.base_payload,
+            modelName="gemini-3-flash",
+            fullyIdle=True,
+            terminationReason="NO_TOOL_CALL",
+            executionNum=1,
+            lastAssistantMessage="Here is my long verbose summary:\nLine 2\nLine 3\nLine 4\nLine 5",
+        )
+        res_bad = orchestrator_guard.handle_stop(payload_bad)
+        self.assertEqual(res_bad["decision"], "continue")
+        self.assertIn("Subagent context-separation violation", res_bad["reason"])
+
+        payload_good = dict(
+            self.base_payload,
+            modelName="gemini-3-flash",
+            fullyIdle=True,
+            terminationReason="NO_TOOL_CALL",
+            executionNum=2,
+            lastAssistantMessage=(
+                "STATUS: COMPLETED\n"
+                "FILES_CHANGED: NONE\n"
+                "VERIFICATION: Ran unittest with exit code 0.\n"
+                "NOTES: All checks passed."
+            ),
+        )
+        res_good = orchestrator_guard.handle_stop(payload_good)
+        self.assertEqual(res_good["decision"], "allow")
+
+        # Root orchestrator with omitted modelName in Stop hook should be allowed
+        orchestrator_guard.handle_pre_invocation(self.base_payload)
+        payload_root_stop = dict(
+            self.base_payload,
+            modelName="",
+            fullyIdle=True,
+            terminationReason="NO_TOOL_CALL",
+            executionNum=3,
+            lastAssistantMessage=(
+                "Summary of work completed:\n\n"
+                "First, we investigated the root cause of the bug.\n"
+                "Second, we applied the fix across the affected components.\n\n"
+                "Finally, all tests were verified successfully."
+            ),
+        )
+        res_root = orchestrator_guard.handle_stop(payload_root_stop)
+        self.assertEqual(res_root["decision"], "allow")
+
+    def test_validate_subagent_report_allows_bounded_bullets_and_enforces_blocked_diagnosis(
+        self,
+    ) -> None:
+        report_bullets = (
+            "STATUS: COMPLETED\n"
+            "FILES_CHANGED: src/app.py\n"
+            "VERIFICATION: python3 -m unittest discover -s tests -v exited with 0.\n"
+            "NOTES: All unit tests passed.\n"
+            "- Added input validation check.\n"
+            "- Updated docstrings.\n"
+            "- Added unit tests in test_app.py."
+        )
+        self.assertIsNone(orchestrator_guard.validate_subagent_report(report_bullets))
+        payload_sub_stop = dict(
+            self.base_payload,
+            modelName="gemini-3-flash",
+            fullyIdle=True,
+            terminationReason="NO_TOOL_CALL",
+            executionNum=10,
+            lastAssistantMessage=report_bullets,
+        )
+        res_stop = orchestrator_guard.handle_stop(payload_sub_stop)
+        self.assertEqual(res_stop["decision"], "allow")
+
+        report_non_bullet = (
+            "STATUS: COMPLETED\n"
+            "FILES_CHANGED: NONE\n"
+            "VERIFICATION: Ran unittest with exit 0.\n"
+            "NOTES: Everything finished.\n"
+            "This is a non-bullet line."
+        )
+        err_non_bullet = orchestrator_guard.validate_subagent_report(report_non_bullet)
+        self.assertIsNotNone(err_non_bullet)
+        self.assertIn("must be a compact bullet", err_non_bullet)
+
+        eleven_bullets = "\n".join(f"- bullet line {i}" for i in range(1, 12))
+        report_too_many_bullets = (
+            "STATUS: COMPLETED\n"
+            "FILES_CHANGED: NONE\n"
+            "VERIFICATION: Ran unittest with exit 0.\n"
+            f"NOTES: Summary with 11 bullets.\n{eleven_bullets}"
+        )
+        err_too_many = orchestrator_guard.validate_subagent_report(report_too_many_bullets)
+        self.assertIsNotNone(err_too_many)
+        self.assertIn("at most 10 bullet lines", err_too_many)
+
+        report_no_summary = (
+            "STATUS: BLOCKED\n"
+            "FILES_CHANGED: NONE\n"
+            "VERIFICATION: pytest tests/ failed with exit 1.\n"
+            "NOTES: file:///tmp/scratch/fail.log"
+        )
+        err_no_summary = orchestrator_guard.validate_subagent_report(report_no_summary)
+        self.assertIsNotNone(err_no_summary)
+        self.assertIn("inline error summary", err_no_summary)
+
+        report_no_uri = (
+            "STATUS: BLOCKED\n"
+            "FILES_CHANGED: NONE\n"
+            "VERIFICATION: pytest tests/ failed with exit 1.\n"
+            "NOTES: AssertionError in test_login on line 42"
+        )
+        err_no_uri = orchestrator_guard.validate_subagent_report(report_no_uri)
+        self.assertIsNotNone(err_no_uri)
+        self.assertIn("scratch log URI", err_no_uri)
+
+        report_valid_blocked = (
+            "STATUS: BLOCKED\n"
+            "FILES_CHANGED: NONE\n"
+            "VERIFICATION: pytest tests/ failed with exit 1.\n"
+            "NOTES: AssertionError in test_login on line 42 at file:///tmp/scratch/fail.log"
+        )
+        self.assertIsNone(orchestrator_guard.validate_subagent_report(report_valid_blocked))
+
+    def test_orchestrator_direct_read_budget_and_log_peeking_blocked(self) -> None:
+        file_a = str(orchestrator_guard.PROJECT_ROOT / "file_a.py")
+        file_b = str(orchestrator_guard.PROJECT_ROOT / "file_b.py")
+        file_c = str(orchestrator_guard.PROJECT_ROOT / "file_c.py")
+
+        def make_read_payload(path: str, model: str = "Gemini 4 Argon (Medium)") -> Dict[str, Any]:
+            return dict(
+                self.base_payload,
+                modelName=model,
+                toolCall={
+                    "name": "view_file",
+                    "args": {"AbsolutePath": path},
+                },
+            )
+
+        # 1. First 2 distinct workspace files are allowed, including repeated read of file_a
+        res_a1 = orchestrator_guard.handle_pre_tool(make_read_payload(file_a))
+        self.assertEqual(res_a1["decision"], "allow")
+
+        res_b = orchestrator_guard.handle_pre_tool(make_read_payload(file_b))
+        self.assertEqual(res_b["decision"], "allow")
+
+        res_a2 = orchestrator_guard.handle_pre_tool(make_read_payload(file_a))
+        self.assertEqual(res_a2["decision"], "allow")
+
+        # 3rd distinct workspace file exceeds limit
+        res_c = orchestrator_guard.handle_pre_tool(make_read_payload(file_c))
+        self.assertEqual(res_c["decision"], "deny")
+        self.assertIn("read limit (2 workspace files) exceeded", res_c["reason"])
+
+        # 2. Reading raw log or transcript is denied for orchestrator
+        fail_log = str(Path(self.artifact_dir) / "scratch" / "fail.log")
+        transcript = str(Path(self.artifact_dir) / "transcript.jsonl")
+
+        res_log = orchestrator_guard.handle_pre_tool(make_read_payload(fail_log))
+        self.assertEqual(res_log["decision"], "deny")
+        self.assertIn("cannot directly read raw log or transcript", res_log["reason"])
+
+        res_tr = orchestrator_guard.handle_pre_tool(make_read_payload(transcript))
+        self.assertEqual(res_tr["decision"], "deny")
+        self.assertIn("cannot directly read raw log or transcript", res_tr["reason"])
+
+        # 3. Scout subagent is allowed to read both fail.log and file_c.py
+        scout_log = orchestrator_guard.handle_pre_tool(
+            make_read_payload(fail_log, model="gemini-3-flash-lite")
+        )
+        self.assertEqual(scout_log["decision"], "allow")
+
+        scout_c = orchestrator_guard.handle_pre_tool(
+            make_read_payload(file_c, model="gemini-3-flash-lite")
+        )
+        self.assertEqual(scout_c["decision"], "allow")
 
 
 if __name__ == "__main__":

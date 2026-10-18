@@ -37,8 +37,8 @@ Write all `invoke_subagent` prompts and `send_message` instructions in ASD-STE10
 - Write one instruction per sentence (maximum 20 words per numbered instruction).
 - Do not use semicolons, soft phrasal verbs, or synonym rotation.
 - Specify an explicit file allowlist and verification command.
-- Require the four-line `REPORT FORMAT` below. On failure or blocker, instruct `implementer` to write raw output to `<artifactDirectoryPath>/scratch/<task_id>.log` and cite the `file://` URI in `NOTES`.
-- If you are a subagent, `REPORT FORMAT` overrides workspace formatting rules: return only those four lines and omit any post-action retrospective.
+- Require the four-header `REPORT FORMAT` below. On failure or blocker, instruct `implementer` to write raw output to `<artifactDirectoryPath>/scratch/<task_id>.log` and state the error cause and `file://` URI in `NOTES`.
+- If you are a subagent, `REPORT FORMAT` overrides workspace formatting rules. Return only the four headers (plus up to 10 compact bullet lines under `NOTES`) and omit any post-action retrospective.
 
 ```markdown
 TASK: <single-sentence objective>
@@ -51,11 +51,11 @@ RULES:
 5. On failure, write raw output to `<artifactDirectoryPath>/scratch/<task_id>.log`.
 
 REPORT FORMAT:
-Return only these four lines:
+Return only these four headers (plus up to 10 `- ` bullet lines under NOTES if needed):
 STATUS: COMPLETED | BLOCKED | FAILED
 FILES_CHANGED: <comma-separated paths or NONE>
 VERIFICATION: <one sentence stating the command run and exit result>
-NOTES: <one sentence stating findings, or file:// log URI if BLOCKED/FAILED>
+NOTES: <summary (and up to 10 `- ` bullets), or inline error cause plus file://.log URI if BLOCKED/FAILED>
 ```
 
 ## 4. Reactive Coordination and Context Hygiene
@@ -64,6 +64,7 @@ NOTES: <one sentence stating findings, or file:// log URI if BLOCKED/FAILED>
 - End your turn immediately after calling `invoke_subagent` or `send_message`. Do not poll with `manage_subagents`.
 - Reuse an idle `flash` subagent via `send_message` when continuing work in the same module. Never send multi-step or code-editing tasks to a `flash_lite` (`scout`) subagent.
 - Stop completed `Workspace: "branch"` subagents with `manage_subagents` (`Action: "kill"`) after merging or discarding their changes.
+- Keep context clean: do not read `.log` or `transcript.jsonl` files or $> 2$ workspace files directly in the orchestrator. Delegate log slicing to `scout`.
 
 ## 5. Empirical Test Receipts, Circuit Breaker, and Diff Audit
 

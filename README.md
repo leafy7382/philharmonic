@@ -7,6 +7,10 @@ A zero-dependency **Antigravity (`agy`) plugin** that enforces a Pro-tier Centra
 ## Features
 
 - **Strict Tiered Delegation**: Pins the root session as the Central Orchestrator (`pro`) and delegates file discovery, research, and bounded code changes to `flash_lite` (`scout`) and `flash` (`research`, `implementer`) subagents.
+- **Strict Context Separation**:
+  - `PreInvocation` detects spawned subagents and injects a subagent isolation reminder instead of root orchestrator rules/warnings.
+  - `PreToolUse` caps direct root orchestrator file reads at $\le 2$ workspace files per turn and blocks the root orchestrator from reading raw `.log` or `transcript.jsonl` files directly (enforcing delegation to `scout`).
+  - `Stop` validates that worker subagents return strictly the 4-header `REPORT FORMAT` (Option A: up to 10 `- ` bullet lines under `NOTES:`, $\le 1,600$ chars; Option B: mandatory inline error summary and `file://.../*.log` URI when `STATUS` is `BLOCKED` or `FAILED`) before their response enters the parent orchestrator's context window.
 - **Empirical Test Receipts**: Every code change requires a subsequent passing test run recorded in `post-tool` before the `stop` hook allows completion.
 - **2-Turn Circuit Breaker**: Tracks consecutive command/subagent failures in `post-tool` and trips after 2 failures, halting retries in `pre-tool` (while allowing scratch log writes) and allowing immediate `STATUS: BLOCKED` termination.
 - **Test Tampering Audit**: `pre-tool` and `stop` unified diff auditing block edits to test files that remove test functions, reduce assertion counts, add skip/xfail markers, or insert trivial `assert True` checks.
@@ -88,12 +92,18 @@ RULES:
 5. On failure, write raw output to `<artifactDirectoryPath>/scratch/<task_id>.log`.
 
 REPORT FORMAT:
-Return only these four lines:
+Return only these four headers (plus up to 10 `- ` bullet lines under NOTES if needed):
 STATUS: COMPLETED | BLOCKED | FAILED
 FILES_CHANGED: <comma-separated paths or NONE>
 VERIFICATION: <one sentence stating the command run and exit result>
-NOTES: <one sentence stating findings, or file:// log URI if BLOCKED/FAILED>
+NOTES: <summary (and up to 10 `- ` bullets), or inline error cause plus file://.log URI if BLOCKED/FAILED>
 ```
+
+### Bounded Subagent Report Format (Option A + Option B)
+
+Subagent reports must follow bounded reporting rules:
+- **Option A (Bounded `NOTES` Bullets)**: Reports may include up to 10 compact bullet lines (`- ` or `* `) under `NOTES:` (total report length capped at $\le 1,600$ chars).
+- **Option B (Inline Diagnosis & Scratch Log URI)**: When `STATUS` is `BLOCKED` or `FAILED`, `NOTES:` must include both an inline error summary (at least 3 words describing the failure) and a `file://.../*.log` URI pointing to raw failure output.
 
 ### Enforced Lint Checks
 
@@ -109,9 +119,10 @@ NOTES: <one sentence stating findings, or file:// log URI if BLOCKED/FAILED>
 
 Configured in [hooks.json](.agents/plugins/pro-orchestrator/hooks.json) and executed by [orchestrator_guard.py](.agents/plugins/pro-orchestrator/scripts/orchestrator_guard.py):
 
-1. **`pre-invocation`**: Verifies the active session is pinned to a Pro-tier model and deduplicates warnings per invocation.
+1. **`pre-invocation`**: Verifies the active session is pinned to a Pro-tier model, detects spawned subagents to inject a subagent context isolation reminder instead of root rules/warnings, and deduplicates warnings per invocation.
 2. **`pre-tool`**:
-   - Auto-allows workspace, worktree, and scratch artifact file/command operations while enforcing the deterministic fast-path budget gate ($\le 2$ workspace files, $\le 2$ non-git commands, and blocking direct code+test loops in the root orchestrator).
+   - Auto-allows workspace, worktree, and scratch artifact file/command operations while enforcing the deterministic fast-path budget gate ($\le 2$ workspace file mutations, $\le 2$ direct file reads, $\le 2$ non-git commands, and blocking direct code+test loops in the root orchestrator).
+   - Blocks the root orchestrator from reading raw `.log` or `transcript.jsonl` files directly (enforcing delegation to `scout`).
    - Blocks `Model: "pro"`, rewrites `Model: "inherit"`, and automatically downgrades simple read-only subagent tasks ($\le 3$ rules) to `Model: "flash_lite"`.
    - Runs the STE-100 linter gate on all `invoke_subagent` and `send_message` prompts.
    - Blocks test file edits that remove test functions, reduce assertion counts, add skip/xfail markers, or insert trivial `assert True` checks (Test Tampering Audit).
@@ -123,6 +134,7 @@ Configured in [hooks.json](.agents/plugins/pro-orchestrator/hooks.json) and exec
    - Records empirical test receipts on passing test commands following code mutations.
 4. **`stop`**:
    - Blocks premature completion if any `Workspace: "branch"` subagent worktrees remain unkilled when the session goes idle.
+   - Validates that worker subagents return strictly the 4-header `REPORT FORMAT` (Option A: up to 10 `- ` bullet lines under `NOTES:`, $\le 1,600$ chars; Option B: mandatory inline error summary and `file://.../*.log` URI when `STATUS` is `BLOCKED` or `FAILED`) before allowing completion.
    - Blocks completion with missing empirical test receipts when code files were modified without a subsequent passing test run recorded in `post-tool`.
    - Performs git diff auditing to block test tampering.
    - Allows immediate turn termination when the 2-turn circuit breaker is tripped so the agent can report `STATUS: BLOCKED`.

@@ -60,6 +60,21 @@ CONVERSATION_ID_RE = re.compile(
 
 MAX_DIRECT_MUTATION_FILES = 2
 MAX_DIRECT_COMMANDS = 2
+MAX_DIRECT_READ_FILES = 2
+MAX_SUBAGENT_REPORT_CHARS = 1600
+MAX_REPORT_BULLET_LINES = 10
+REPORT_BULLET_RE = re.compile(r"^[-*]\s+\S+")
+REPORT_LOG_URI_RE = re.compile(r"file://\S+\.log\b", re.I)
+READ_TOOLS = {"view_file", "view_file_outline", "view_code_item"}
+RAW_LOG_OR_TRANSCRIPT_RE = re.compile(
+    r"(?:^|/)transcript(?:_full)?\.jsonl$|\.log$", re.I
+)
+REPORT_LINE_PATTERNS = (
+    re.compile(r"^STATUS:\s*(?:COMPLETED|BLOCKED|FAILED)\b"),
+    re.compile(r"^FILES_CHANGED:\s*\S+"),
+    re.compile(r"^VERIFICATION:\s*\S+"),
+    re.compile(r"^NOTES:\s*\S+"),
+)
 MUTATION_TOOLS = {
     "write_to_file",
     "replace_file_content",
@@ -277,9 +292,60 @@ def _lint_inter_agent_text(text: str, label: str) -> Optional[str]:
     )
 
 
+def _is_parent_orchestrator(cid: str, state: Dict[str, Any]) -> bool:
+    """Return True if cid is recorded as the root/parent orchestrator."""
+    if not cid or cid in state.get("subagents", {}):
+        return False
+    if state.get("root_conversation_id") == cid:
+        return True
+    prefix = f'["{cid}"'
+    return any(
+        call.startswith(prefix) for call in state.get("recorded_spawn_calls", [])
+    )
+
+
+def _is_known_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
+    """Return True if this invocation belongs to a spawned worker subagent."""
+    if payload.get("isSubagent") is True:
+        return True
+    cid = (payload.get("conversationId") or "").strip().lower()
+    if cid and cid in state.get("subagents", {}):
+        return True
+    if _is_parent_orchestrator(cid, state):
+        return False
+    for wp in payload.get("workspacePaths") or []:
+        if "/worktrees/" in str(wp).replace("\\", "/"):
+            return True
+    artifact_dir = payload.get("artifactDirectoryPath")
+    if artifact_dir:
+        try:
+            resolved_art = Path(artifact_dir).resolve()
+            if resolved_art.parent.name == "brain":
+                for sibling_state_path in resolved_art.parent.glob("*/orchestrator_state.json"):
+                    if sibling_state_path.parent == resolved_art:
+                        continue
+                    try:
+                        sib_data = json.loads(sibling_state_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    if cid and cid in (sib_data.get("subagents") or {}):
+                        return True
+                    if sib_data.get("pending_spawns"):
+                        return True
+        except OSError:
+            pass
+    return False
+
+
 def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
     model_name = payload.get("modelName", "")
     if is_pro_tier(model_name):
+        cid = (payload.get("conversationId") or "").strip().lower()
+        if cid:
+            state = _load_state(payload)
+            if state.get("root_conversation_id") != cid:
+                state["root_conversation_id"] = cid
+                _save_state(payload, state)
         return {}
 
     state = _load_state(payload)
@@ -290,6 +356,22 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     warned.append(dedup_key)
     _save_state(payload, state)
+
+    if _is_known_subagent(payload, state):
+        return {
+            "injectSteps": [
+                {
+                    "ephemeralMessage": (
+                        "[ORCHESTRATOR GUARD] Subagent context isolation active: ignore root orchestrator "
+                        "delegation rules in AGENTS.md. Execute only your assigned TASK and RULES, and return "
+                        "strictly the 4-header REPORT FORMAT (STATUS, FILES_CHANGED, VERIFICATION, NOTES; "
+                        "allowing up to 10 '-' bullet lines under NOTES and requiring inline error cause plus "
+                        "file:// .log URI when BLOCKED or FAILED)."
+                    )
+                }
+            ]
+        }
+
     return {
         "injectSteps": [
             {
@@ -470,12 +552,15 @@ def _handle_manage_subagents(
 
 def _is_orchestrator_caller(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
     """Return True when the caller is the Pro-tier root orchestrator rather than a worker subagent."""
-    if not is_pro_tier(payload.get("modelName", "")):
-        return False
     cid = (payload.get("conversationId") or "").strip().lower()
     if cid and cid in state.get("subagents", {}):
         return False
-    return True
+    if _is_known_subagent(payload, state):
+        return False
+    model_name = (payload.get("modelName") or "").strip()
+    if model_name:
+        return is_pro_tier(model_name)
+    return _is_parent_orchestrator(cid, state)
 
 
 def _is_artifact_or_worktree_path(target: str, payload: Dict[str, Any]) -> bool:
@@ -513,9 +598,52 @@ def _check_and_record_direct_budget(
 
     inv_key = str(payload.get("invocationNum", 0))
     budget = state.setdefault("direct_budget", {}).setdefault(
-        inv_key, {"mutated_files": [], "commands": [], "seen_calls": []}
+        inv_key,
+        {"mutated_files": [], "read_files": [], "commands": [], "seen_calls": []},
     )
     call_id = (payload.get("toolCall") or {}).get("id") or ""
+
+    if tool_name in READ_TOOLS:
+        target = (
+            args.get("AbsolutePath")
+            or args.get("TargetFile")
+            or args.get("File")
+            or ""
+        )
+        if not target:
+            return None
+        norm_slashes = str(target).replace("\\", "/")
+        if RAW_LOG_OR_TRANSCRIPT_RE.search(norm_slashes):
+            return {
+                "decision": "deny",
+                "reason": (
+                    "[ORCHESTRATOR GUARD] Context separation violation: root orchestrator cannot "
+                    f"directly read raw log or transcript file '{Path(target).name}'. "
+                    "Delegate log slicing to a 'scout' subagent (Model='flash_lite')."
+                ),
+            }
+        if _is_artifact_or_worktree_path(target, payload) or "/skills/" in norm_slashes:
+            return None
+        try:
+            norm_target = str(Path(os.path.expanduser(target)).resolve())
+        except OSError:
+            return None
+
+        read_files: List[str] = budget.setdefault("read_files", [])
+        if norm_target not in read_files:
+            if len(read_files) >= MAX_DIRECT_READ_FILES:
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"[ORCHESTRATOR GUARD] Direct execution fast-path read limit "
+                        f"({MAX_DIRECT_READ_FILES} workspace files) exceeded when reading "
+                        f"'{Path(norm_target).name}'. Delegate multi-file reads or discovery to a "
+                        "'scout' (Model='flash_lite') or 'research' (Model='flash') subagent."
+                    ),
+                }
+            read_files.append(norm_target)
+            _save_state(payload, state)
+        return None
 
     if tool_name in MUTATION_TOOLS:
         target = args.get("TargetFile") or args.get("AbsolutePath") or ""
@@ -837,7 +965,7 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
             }
         return {"decision": "ask"}
 
-    for path_key in ("TargetFile", "AbsolutePath", "SearchPath", "DirectoryPath"):
+    for path_key in ("TargetFile", "AbsolutePath", "SearchPath", "DirectoryPath", "File"):
         if path_key in args:
             target_path = args.get(path_key)
             if _is_within_allowed_roots(target_path, roots):
@@ -910,6 +1038,79 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def validate_subagent_report(text: str) -> Optional[str]:
+    """Validate that a subagent's final output matches the 4-header REPORT FORMAT (Option A + B)."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return "Subagent response is empty."
+    if len(stripped) > MAX_SUBAGENT_REPORT_CHARS:
+        return (
+            f"Subagent report length ({len(stripped)} chars) exceeds maximum "
+            f"{MAX_SUBAGENT_REPORT_CHARS} chars."
+        )
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    max_lines = 4 + MAX_REPORT_BULLET_LINES
+    if len(lines) < 4 or len(lines) > max_lines:
+        return (
+            f"Expected 4 header lines plus at most {MAX_REPORT_BULLET_LINES} bullet lines "
+            f"(4-{max_lines} lines total), got {len(lines)}."
+        )
+    expected_prefixes = ("STATUS:", "FILES_CHANGED:", "VERIFICATION:", "NOTES:")
+    for idx, (pattern, prefix) in enumerate(
+        zip(REPORT_LINE_PATTERNS, expected_prefixes), start=1
+    ):
+        if not pattern.match(lines[idx - 1]):
+            return f"Line {idx} must match '{prefix} <value>'."
+
+    bullet_lines = lines[4:]
+    for b_idx, b_line in enumerate(bullet_lines, start=5):
+        if not REPORT_BULLET_RE.match(b_line):
+            return (
+                f"Line {b_idx} after NOTES must be a compact bullet starting with '- ' or '* '."
+            )
+
+    status_val = lines[0].split(":", 1)[1].strip().upper().split()[0]
+    if status_val in {"BLOCKED", "FAILED"}:
+        notes_body = lines[3].split(":", 1)[1].strip()
+        combined_notes = " ".join([notes_body] + [b[1:].strip() for b in bullet_lines]).strip()
+        if not REPORT_LOG_URI_RE.search(combined_notes):
+            return (
+                f"When STATUS is {status_val}, NOTES must include a 'file://.../*.log' scratch log URI."
+            )
+        non_uri_text = REPORT_LOG_URI_RE.sub("", combined_notes).strip(" -—:,.;()")
+        if len(non_uri_text.split()) < 3:
+            return (
+                f"When STATUS is {status_val}, NOTES must include an inline error summary "
+                "(at least 3 words) in addition to the file:// scratch log URI."
+            )
+
+    return None
+
+
+def _extract_last_model_response(payload: Dict[str, Any]) -> Optional[str]:
+    """Extract the final model response text from payload or transcriptPath if available."""
+    if "lastAssistantMessage" in payload and payload["lastAssistantMessage"] is not None:
+        return str(payload["lastAssistantMessage"])
+    transcript_path = payload.get("transcriptPath")
+    if not transcript_path or not os.path.exists(transcript_path):
+        return None
+    last_text: Optional[str] = None
+    try:
+        with open(transcript_path, encoding="utf-8") as fh:
+            for raw_line in fh:
+                try:
+                    step = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                if step.get("type") == "PLANNER_RESPONSE" and not step.get("tool_calls"):
+                    content = step.get("content")
+                    if isinstance(content, str) and content.strip():
+                        last_text = content
+    except OSError:
+        return None
+    return last_text
+
+
 def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
     termination_reason = payload.get("terminationReason", "")
     # Never block user cancellations, errors, or hard budget caps
@@ -955,6 +1156,26 @@ def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
                     "Verify/merge branch changes and call manage_subagents(Action='kill') before finishing."
                 ),
             }
+
+    if not _is_orchestrator_caller(payload, state):
+        last_msg = _extract_last_model_response(payload)
+        if last_msg is not None:
+            report_err = validate_subagent_report(last_msg)
+            if report_err:
+                reminded = state.setdefault("stop_reminded_executions", [])
+                report_key = f"report:{payload.get('conversationId', '')}:{payload.get('executionNum', 0)}"
+                if report_key not in reminded:
+                    reminded.append(report_key)
+                    _save_state(payload, state)
+                    return {
+                        "decision": "continue",
+                        "reason": (
+                            f"[ORCHESTRATOR GUARD] Subagent context-separation violation: {report_err} "
+                            "Return ONLY the exact 4-header REPORT FORMAT (STATUS, FILES_CHANGED, VERIFICATION, NOTES; "
+                            "allowing up to 10 '-' bullet lines under NOTES and requiring inline error cause plus "
+                            "file:// .log URI when BLOCKED or FAILED)."
+                        ),
+                    }
 
     cb = _get_circuit_breaker(state, payload)
     if cb.get("tripped"):
