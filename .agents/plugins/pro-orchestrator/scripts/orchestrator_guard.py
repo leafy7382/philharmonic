@@ -59,6 +59,14 @@ CONVERSATION_ID_RE = re.compile(
     r'\\*"conversationId\\*"\s*:\s*\\*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\*"',
     re.I,
 )
+UUID_RE = re.compile(
+    r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b",
+    re.I,
+)
+SUBAGENT_SPAWN_RE = re.compile(
+    r'(?:\\*["\']?conversationId\\*["\']?\s*[:=]\s*\\*["\']?)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})',
+    re.I,
+)
 
 PENDING_SPAWN_TTL_SECONDS = 120
 
@@ -70,9 +78,10 @@ MAX_REPORT_BULLET_LINES = 10
 REPORT_BULLET_RE = re.compile(r"^[-*]\s+\S+")
 REPORT_LOG_URI_RE = re.compile(r"file://\S+\.log\b", re.I)
 READ_TOOLS = {"view_file", "view_file_outline", "view_code_item"}
-RAW_LOG_OR_TRANSCRIPT_RE = re.compile(
-    r"(?:^|/)transcript(?:_full)?\.jsonl$|\.log$", re.I
+FORBIDDEN_DIRECT_READ_RE = re.compile(
+    r"(?:^|/)transcript(?:_full|[0-9a-zA-Z_\-]*)?\.jsonl$|\.log$", re.I
 )
+RAW_LOG_OR_TRANSCRIPT_RE = FORBIDDEN_DIRECT_READ_RE
 REPORT_LINE_PATTERNS = (
     re.compile(r"^STATUS:\s*(?:COMPLETED|BLOCKED|FAILED)\b"),
     re.compile(r"^FILES_CHANGED:\s*\S+"),
@@ -88,6 +97,32 @@ GIT_COMMAND_RE = re.compile(r"^\s*git\b")
 TEST_RUNNER_RE = re.compile(
     r"\b(pytest|unittest|cargo\s+test|npm\s+test|pnpm\s+test|yarn\s+test|go\s+test|jest|vitest|tox|nox)\b"
 )
+
+
+def _split_shell_commands(cmd: str) -> List[str]:
+    """Split a shell command string by &&, ||, ;, and newline delimiters."""
+    if not cmd:
+        return []
+    parts = re.split(r"\s*(?:&&|\|\||;|\n)\s*", cmd.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _is_git_only_command(cmd: str) -> bool:
+    """Return True only if every non-empty sub-command is a git command."""
+    sub_cmds = _split_shell_commands(cmd)
+    if not sub_cmds:
+        return False
+    return all(bool(GIT_COMMAND_RE.match(c)) for c in sub_cmds)
+
+
+def _is_test_command(cmd: str) -> bool:
+    """Return True if the command or any sub-command invokes a test runner."""
+    if not cmd:
+        return False
+    if bool(TEST_RUNNER_RE.search(cmd)):
+        return True
+    sub_cmds = _split_shell_commands(cmd)
+    return any(bool(TEST_RUNNER_RE.search(c)) for c in sub_cmds)
 MAX_CONSECUTIVE_FAILURES = 2
 DOC_EXTENSIONS = {".md", ".txt", ".rst", ".adoc"}
 TEST_FILE_RE = re.compile(
@@ -181,35 +216,66 @@ def _save_state(payload: Dict[str, Any], state: Dict[str, Any]) -> None:
 
 def _sync_subagents_from_transcript(
     payload: Dict[str, Any], state: Dict[str, Any]
-) -> None:
+) -> bool:
     """Scan transcript.jsonl (if readable) to pair pending_spawns with conversationIds."""
     transcript_path = payload.get("transcriptPath")
     if not transcript_path or not os.path.exists(transcript_path):
-        return
+        return False
 
     pending: List[Dict[str, Any]] = state.get("pending_spawns", [])
     subagents: Dict[str, Dict[str, Any]] = state.setdefault("subagents", {})
     parent_cid = (payload.get("conversationId") or "").lower()
+    changed = False
 
     try:
-        with open(transcript_path, encoding="utf-8") as fh:
-            for raw_line in fh:
-                if "invoke_subagent" not in raw_line or "File Path: `file://" in raw_line:
+        file_size = os.path.getsize(transcript_path)
+        offset = int(state.get("transcript_offset", 0))
+        if offset < 0 or offset > file_size:
+            offset = 0
+
+        with open(transcript_path, "rb") as fh:
+            fh.seek(offset)
+            chunk = fh.read()
+            new_offset = fh.tell()
+
+        if new_offset != offset:
+            state["transcript_offset"] = new_offset
+            changed = True
+
+        if not chunk:
+            return changed
+
+        text = chunk.decode("utf-8", errors="replace")
+        for raw_line in text.splitlines():
+            if not raw_line.strip():
+                continue
+            if (
+                "docs/hooks.md" in raw_line
+                or "docs/" in raw_line
+                or "view_file" in raw_line
+                or "File Path: `file://" in raw_line
+            ):
+                continue
+            if not (
+                "Created the following subagents:" in raw_line
+                or "invoke_subagent" in raw_line
+            ):
+                continue
+            matches = list(SUBAGENT_SPAWN_RE.finditer(raw_line))
+            if not matches and "Created the following subagents:" in raw_line:
+                matches = list(UUID_RE.finditer(raw_line))
+            for match in matches:
+                cid = match.group(1).lower()
+                if cid == parent_cid or cid in subagents:
                     continue
-                try:
-                    step = json.loads(raw_line)
-                except json.JSONDecodeError:
-                    continue
-                content = json.dumps(step)
-                for match in CONVERSATION_ID_RE.finditer(content):
-                    cid = match.group(1).lower()
-                    if cid == parent_cid or cid in subagents:
-                        continue
-                    if pending:
-                        spawn_meta = pending.pop(0)
-                        subagents[cid] = spawn_meta
+                if pending:
+                    spawn_meta = pending.pop(0)
+                    subagents[cid] = spawn_meta
+                    changed = True
     except OSError:
-        return
+        return changed
+
+    return changed
 
 
 def _allowed_roots(payload: Dict[str, Any]) -> List[Path]:
@@ -306,6 +372,8 @@ def _is_parent_orchestrator(cid: str, state: Dict[str, Any]) -> bool:
 
 def _is_known_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
     """Return True if this invocation belongs to a spawned worker subagent."""
+    if state.get("self_subagent_meta"):
+        return True
     if payload.get("isSubagent") is True:
         return True
     cid = (payload.get("conversationId") or "").strip().lower()
@@ -328,7 +396,15 @@ def _is_known_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
                         sib_data = json.loads(sibling_state_path.read_text(encoding="utf-8"))
                     except (OSError, json.JSONDecodeError):
                         continue
-                    if cid and cid in (sib_data.get("subagents") or {}):
+                    sibling_subagents = sib_data.get("subagents") or {}
+                    if cid and cid in sibling_subagents:
+                        meta = dict(sibling_subagents[cid])
+                        if "type" in meta and "type_name" not in meta:
+                            meta["type_name"] = meta["type"]
+                        elif "type_name" in meta and "type" not in meta:
+                            meta["type"] = meta["type_name"]
+                        state["self_subagent_meta"] = meta
+                        _save_state(payload, state)
                         return True
                     if sib_data.get("pending_spawns"):
                         try:
@@ -382,9 +458,17 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _is_research_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
     """Return True if the active caller is a research subagent."""
+    meta = state.get("self_subagent_meta")
+    if isinstance(meta, dict):
+        if meta.get("type_name") is not None:
+            return meta.get("type_name") in {"research", "researcher"} or meta.get("type_name") == "research"
+        if meta.get("type") is not None:
+            return meta.get("type") in {"research", "researcher"}
     cid = (payload.get("conversationId") or "").strip().lower()
     if cid and cid in state.get("subagents", {}):
-        return state["subagents"][cid].get("type") in {"research", "researcher"}
+        sub_info = state["subagents"][cid]
+        t = sub_info.get("type_name") or sub_info.get("type")
+        return t in {"research", "researcher"}
     if _is_parent_orchestrator(cid, state):
         return False
     artifact_dir = payload.get("artifactDirectoryPath")
@@ -401,7 +485,14 @@ def _is_research_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> boo
                         continue
                     sub_map = sib_data.get("subagents") or {}
                     if cid and cid in sub_map:
-                        return sub_map[cid].get("type") in {"research", "researcher"}
+                        meta = dict(sub_map[cid])
+                        if "type" in meta and "type_name" not in meta:
+                            meta["type_name"] = meta["type"]
+                        elif "type_name" in meta and "type" not in meta:
+                            meta["type"] = meta["type_name"]
+                        state["self_subagent_meta"] = meta
+                        _save_state(payload, state)
+                        return meta.get("type_name") in {"research", "researcher"} or meta.get("type_name") == "research"
         except OSError:
             pass
     return False
@@ -426,7 +517,7 @@ def _is_simple_readonly_task(type_name: str, prompt_text: str) -> bool:
 
 
 def _handle_invoke_subagent(
-    payload: Dict[str, Any], args: Dict[str, Any]
+    payload: Dict[str, Any], args: Dict[str, Any], state: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     subagents = args.get("Subagents", [])
     if not subagents:
@@ -473,6 +564,7 @@ def _handle_invoke_subagent(
             {
                 "role": role_label,
                 "type": type_name,
+                "type_name": type_name,
                 "model": entry_copy["Model"],
                 "workspace": workspace_mode,
                 "active_branch": workspace_mode == "branch",
@@ -480,7 +572,8 @@ def _handle_invoke_subagent(
         )
         updated_subagents.append(entry_copy)
 
-    state = _load_state(payload)
+    if state is None:
+        state = _load_state(payload)
     tool_call = payload.get("toolCall", {})
     call_sig = json.dumps(
         [
@@ -507,7 +600,7 @@ def _handle_invoke_subagent(
 
 
 def _handle_send_message(
-    payload: Dict[str, Any], args: Dict[str, Any]
+    payload: Dict[str, Any], args: Dict[str, Any], state: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     recipient = (args.get("Recipient") or "").strip().lower()
     message = args.get("Message") or ""
@@ -516,7 +609,8 @@ def _handle_send_message(
     if lint_error:
         return {"decision": "deny", "reason": lint_error}
 
-    state = _load_state(payload)
+    if state is None:
+        state = _load_state(payload)
     _sync_subagents_from_transcript(payload, state)
     _save_state(payload, state)
 
@@ -538,10 +632,11 @@ def _handle_send_message(
 
 
 def _handle_manage_subagents(
-    payload: Dict[str, Any], args: Dict[str, Any]
+    payload: Dict[str, Any], args: Dict[str, Any], state: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     action = args.get("Action", "")
-    state = _load_state(payload)
+    if state is None:
+        state = _load_state(payload)
     _sync_subagents_from_transcript(payload, state)
     subagents = state.get("subagents", {})
 
@@ -573,14 +668,21 @@ def _handle_manage_subagents(
     return {"decision": "allow"}
 
 
-def _is_orchestrator_caller(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
+def _is_root_orchestrator(
+    payload: Dict[str, Any], state: Optional[Dict[str, Any]] = None
+) -> bool:
     """Return True when the caller is the root orchestrator, for any model."""
+    if state is None:
+        state = _load_state(payload)
     cid = (payload.get("conversationId") or "").strip().lower()
     if cid and cid in state.get("subagents", {}):
         return False
     if _is_known_subagent(payload, state):
         return False
     return True
+
+
+_is_orchestrator_caller = _is_root_orchestrator
 
 
 def _is_artifact_or_worktree_path(target: str, payload: Dict[str, Any]) -> bool:
@@ -620,11 +722,15 @@ def _is_allowed_research_scratch_write(target: str, payload: Dict[str, Any]) -> 
 
 
 def _check_and_record_direct_budget(
-    payload: Dict[str, Any], tool_name: str, args: Dict[str, Any]
+    payload: Dict[str, Any],
+    tool_name: str,
+    args: Dict[str, Any],
+    state: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Enforce direct execution fast-path limits on the root orchestrator."""
-    state = _load_state(payload)
-    if not _is_orchestrator_caller(payload, state):
+    if state is None:
+        state = _load_state(payload)
+    if not _is_root_orchestrator(payload, state):
         return None
 
     inv_key = _current_invocation_key(payload, state)
@@ -633,6 +739,27 @@ def _check_and_record_direct_budget(
         {"mutated_files": [], "read_files": [], "commands": [], "seen_calls": []},
     )
     call_id = (payload.get("toolCall") or {}).get("id") or ""
+
+    if tool_name in ("grep_search", "find_by_name"):
+        search_target = str(
+            args.get("SearchPath")
+            or args.get("SearchDirectory")
+            or args.get("DirectoryPath")
+            or args.get("Path")
+            or ""
+        )
+        if search_target:
+            norm_slashes = search_target.replace("\\", "/")
+            if FORBIDDEN_DIRECT_READ_RE.search(norm_slashes):
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        "[ORCHESTRATOR GUARD] Context separation violation: root orchestrator cannot "
+                        f"directly read raw log or transcript file '{Path(search_target).name}'. "
+                        "Delegate log slicing to a 'scout' subagent (Model='flash_lite')."
+                    ),
+                }
+        return None
 
     if tool_name in READ_TOOLS:
         target = (
@@ -644,7 +771,7 @@ def _check_and_record_direct_budget(
         if not target:
             return None
         norm_slashes = str(target).replace("\\", "/")
-        if RAW_LOG_OR_TRANSCRIPT_RE.search(norm_slashes):
+        if FORBIDDEN_DIRECT_READ_RE.search(norm_slashes):
             return {
                 "decision": "deny",
                 "reason": (
@@ -703,11 +830,11 @@ def _check_and_record_direct_budget(
 
     if tool_name == "run_command":
         cmd = (args.get("CommandLine") or "").strip()
-        if GIT_COMMAND_RE.match(cmd):
+        if _is_git_only_command(cmd):
             return None
 
         mutated_files = budget.get("mutated_files", [])
-        if mutated_files and TEST_RUNNER_RE.search(cmd):
+        if mutated_files and _is_test_command(cmd):
             return {
                 "decision": "deny",
                 "reason": (
@@ -921,6 +1048,7 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
     args = tool_call.get("args", {}) or {}
 
     state = _load_state(payload)
+    is_root = _is_root_orchestrator(payload, state)
     cb = _get_circuit_breaker(state, payload)
     if cb.get("tripped"):
         if tool_name in MUTATION_TOOLS:
@@ -961,17 +1089,22 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                 ),
             }
 
+    if tool_name in ("grep_search", "find_by_name"):
+        budget_denial = _check_and_record_direct_budget(payload, tool_name, args, state)
+        if budget_denial:
+            return budget_denial
+
     if tool_name == "define_subagent":
         return _handle_define_subagent(args)
 
     if tool_name == "invoke_subagent":
-        return _handle_invoke_subagent(payload, args)
+        return _handle_invoke_subagent(payload, args, state)
 
     if tool_name == "send_message":
-        return _handle_send_message(payload, args)
+        return _handle_send_message(payload, args, state)
 
     if tool_name == "manage_subagents":
-        return _handle_manage_subagents(payload, args)
+        return _handle_manage_subagents(payload, args, state)
 
     if tool_name in MUTATION_TOOLS:
         if _is_research_subagent(payload, state):
@@ -998,7 +1131,7 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
         if _is_within_allowed_roots(cwd, roots) and _command_stays_in_workspace(
             cmd, cwd, roots
         ):
-            budget_denial = _check_and_record_direct_budget(payload, tool_name, args)
+            budget_denial = _check_and_record_direct_budget(payload, tool_name, args, state)
             if budget_denial:
                 return budget_denial
             overrides = [f"command({cmd})", "command(*)"]
@@ -1010,17 +1143,16 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
             }
         return {"decision": "ask"}
 
-    for path_key in ("TargetFile", "AbsolutePath", "SearchPath", "DirectoryPath", "File"):
+    for path_key in ("TargetFile", "AbsolutePath", "SearchPath", "SearchDirectory", "DirectoryPath", "File"):
         if path_key in args:
             target_path = args.get(path_key)
             if _is_within_allowed_roots(target_path, roots):
-                budget_denial = _check_and_record_direct_budget(payload, tool_name, args)
+                budget_denial = _check_and_record_direct_budget(payload, tool_name, args, state)
                 if budget_denial:
                     return budget_denial
                 if tool_name in MUTATION_TOOLS:
                     target = target_path or ""
                     if not _is_artifact_or_worktree_path(target, payload) and _is_code_file(target):
-                        state = _load_state(payload)
                         receipt = _get_test_receipt(state, payload)
                         receipt["dirty"] = True
                         receipt["verified"] = False
@@ -1056,7 +1188,7 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     if tool_name in {"run_command", "invoke_subagent"}:
         cmd = ((tool_call.get("args") or {}).get("CommandLine") or "").strip()
-        is_test_cmd = (tool_name == "run_command" and bool(TEST_RUNNER_RE.search(cmd)))
+        is_test_cmd = (tool_name == "run_command" and _is_test_command(cmd))
         if error_text:
             seen_failures: List[str] = cb.setdefault("seen_failures", [])
             dedup_id = f"{tool_name}:{call_id}:{error_text}"
@@ -1071,7 +1203,11 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                 receipt["verified"] = False
                 receipt["last_test_cmd"] = cmd
         else:
-            if tool_name == "invoke_subagent" or is_test_cmd or (tool_name == "run_command" and not GIT_COMMAND_RE.match(cmd)):
+            if (
+                tool_name == "invoke_subagent"
+                or is_test_cmd
+                or (tool_name == "run_command" and not _is_git_only_command(cmd))
+            ):
                 cb["failure_streak"] = 0
                 cb["tripped"] = False
             if is_test_cmd or (tool_name == "invoke_subagent" and receipt.get("dirty")):
@@ -1132,28 +1268,44 @@ def validate_subagent_report(text: str) -> Optional[str]:
     return None
 
 
-def _extract_last_model_response(payload: Dict[str, Any]) -> Optional[str]:
+def _extract_last_model_response(payload_or_path: Any) -> Optional[str]:
     """Extract the final model response text from payload or transcriptPath if available."""
-    if "lastAssistantMessage" in payload and payload["lastAssistantMessage"] is not None:
-        return str(payload["lastAssistantMessage"])
-    transcript_path = payload.get("transcriptPath")
+    if isinstance(payload_or_path, dict):
+        if "lastAssistantMessage" in payload_or_path and payload_or_path["lastAssistantMessage"] is not None:
+            return str(payload_or_path["lastAssistantMessage"])
+        transcript_path = payload_or_path.get("transcriptPath")
+    else:
+        transcript_path = str(payload_or_path)
+
     if not transcript_path or not os.path.exists(transcript_path):
         return None
-    last_text: Optional[str] = None
+
     try:
-        with open(transcript_path, encoding="utf-8") as fh:
-            for raw_line in fh:
-                try:
-                    step = json.loads(raw_line)
-                except json.JSONDecodeError:
-                    continue
-                if step.get("type") == "PLANNER_RESPONSE" and not step.get("tool_calls"):
-                    content = step.get("content")
-                    if isinstance(content, str) and content.strip():
-                        last_text = content
+        file_size = os.path.getsize(transcript_path)
+        tail_size = 65536
+        offset = max(0, file_size - tail_size)
+        with open(transcript_path, "rb") as fh:
+            fh.seek(offset)
+            tail_bytes = fh.read()
+        tail_text = tail_bytes.decode("utf-8", errors="replace")
+        lines = tail_text.splitlines()
+        if offset > 0 and len(lines) > 1:
+            lines = lines[1:]
+        for raw_line in reversed(lines):
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                step = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if step.get("type") == "PLANNER_RESPONSE" and not step.get("tool_calls"):
+                content = step.get("content")
+                if isinstance(content, str) and content.strip():
+                    return content
     except OSError:
         return None
-    return last_text
+    return None
 
 
 def _get_workspace_git_diff(payload: Dict[str, Any]) -> str:
@@ -1299,6 +1451,7 @@ def register_subagent(
     state.setdefault("subagents", {})[cid] = {
         "role": role or type_name,
         "type": type_name,
+        "type_name": type_name,
         "model": model,
         "workspace": workspace,
         "active_branch": workspace == "branch",

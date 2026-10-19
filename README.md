@@ -7,10 +7,15 @@ A zero-dependency **Antigravity (`agy`) plugin** that enforces a Central Orchest
 ## Features
 
 - **Strict Tiered Delegation**: Allows any model to run as the Central Orchestrator, delegating file discovery, research, and bounded code changes to `flash_lite` (`scout`) and `flash` (`research`, `implementer`) subagents.
-- **Strict Context Separation**:
+- **Context Separation & Report Enforcement**:
   - `PreInvocation` records the root orchestrator conversation ID and injects a subagent context isolation reminder into worker subagents.
-  - `PreToolUse` caps direct root orchestrator file reads at $\le 2$ workspace files per turn and blocks the root orchestrator from reading raw `.log` or `transcript.jsonl` files directly (enforcing delegation to `scout`).
+  - `PreToolUse` caps direct root orchestrator file reads at $\le 2$ workspace files per turn and blocks the root orchestrator from reading raw `.log` or `transcript.jsonl` files directly (enforcing delegation to `scout`). `grep_search` and `find_by_name` are also blocked from targeting raw `.log` and `transcript*.jsonl` files directly in the root orchestrator.
+  - Shell command chains (`&&`, `||`, `;`) are split and inspected per sub-command so compound commands like `git status && pytest` cannot bypass the git exemption or edit-and-test loop gate.
   - `Stop` validates that worker subagents return strictly the 4-header `REPORT FORMAT` (Option A: up to 10 `- ` bullet lines under `NOTES:`, $\le 1,600$ chars; Option B: mandatory inline error summary and `file://.../*.log` URI when `STATUS` is `BLOCKED` or `FAILED`) before their response enters the parent orchestrator's context window.
+- **O(1) Hook Performance & State Accuracy**:
+  - Incremental `transcript_offset` cursor for subagent synchronization and $64\text{ KB}$ tail-reading for `Stop` report extraction.
+  - Local subagent identity caching (`self_subagent_meta`) across isolated brain directories.
+  - Pre-compiled regular expression engine in `ste_lint.py`.
 - **Empirical Test Receipts**: Every code change requires a subsequent passing test run recorded in `post-tool` before the `stop` hook allows completion.
 - **2-Turn Circuit Breaker**: Tracks consecutive command/subagent failures in `post-tool` and trips after 2 failures, halting retries in `pre-tool` (while allowing scratch log writes) and allowing immediate `STATUS: BLOCKED` termination.
 - **Test Tampering Audit**: `pre-tool` and `stop` unified diff auditing block edits to test files that remove test functions, reduce assertion counts, add skip/xfail markers, or insert trivial `assert True` checks.
@@ -65,9 +70,15 @@ ln -s "$(pwd)/.agents/plugins/pro-orchestrator" ~/.gemini/config/plugins/pro-orc
 ## Subagent Architecture & Automatic Token Optimization
 
 To minimize both orchestrator context growth and subagent spawn overhead:
-- **Direct Execution Fast-Path**: Single-step commands and reads/edits of $\le 2$ known files execute directly in the orchestrator with zero subagent overhead, enforced by a deterministic fast-path budget gate ($\le 2$ workspace files, $\le 2$ non-git commands, and blocking direct code+test loops in the root orchestrator).
+- **Direct Execution Fast-Path & Fast-Path Budget**: Single-step commands and reads/edits of $\le 2$ known files execute directly in the orchestrator with zero subagent overhead, enforced by a deterministic fast-path budget gate ($\le 2$ workspace files, $\le 2$ non-git commands, and blocking direct code+test loops in the root orchestrator).
+  - `grep_search` and `find_by_name` are also blocked from targeting raw `.log` and `transcript*.jsonl` files directly in the root orchestrator.
+  - Shell command chains (`&&`, `||`, `;`) are split and inspected per sub-command so compound commands like `git status && pytest` cannot bypass the git exemption or edit-and-test loop gate.
 - **Lazy Subagent Registration**: Custom subagents (`scout` and `implementer`) are registered via `define_subagent` only immediately before first invoking them.
 - **Automatic Tier Downgrade**: The `pre-tool` hook automatically downgrades read-only subagent calls (`scout` / `research`) with $\le 3$ numbered rules and no mutation verbs to `Model: "flash_lite"`.
+- **O(1) Hook Performance & State Accuracy**:
+  - Incremental `transcript_offset` cursor for subagent synchronization and $64\text{ KB}$ tail-reading for `Stop` report extraction.
+  - Local subagent identity caching (`self_subagent_meta`) across isolated brain directories.
+  - Pre-compiled regular expression engine in `ste_lint.py`.
 
 | Subagent Type | Model Tier | Write Tools | Workspace Mode | Purpose |
 | :--- | :--- | :--- | :--- | :--- |
@@ -126,23 +137,36 @@ Configured in [hooks.json](.agents/plugins/pro-orchestrator/hooks.json) and exec
 1. **`pre-invocation`**: Records the root orchestrator conversation ID, injects a subagent context isolation reminder into worker subagents, and deduplicates warnings per invocation.
 2. **`pre-tool`**:
    - Auto-allows workspace, worktree, and scratch artifact file/command operations while enforcing the deterministic fast-path budget gate ($\le 2$ workspace file mutations, $\le 2$ direct file reads, $\le 2$ non-git commands, and blocking direct code+test loops in the root orchestrator).
-   - Blocks the root orchestrator from reading raw `.log` or `transcript.jsonl` files directly (enforcing delegation to `scout`).
+   - Blocks the root orchestrator from reading raw `.log` or `transcript*.jsonl` files directly; `grep_search` and `find_by_name` are also blocked from targeting raw `.log` and `transcript*.jsonl` files directly in the root orchestrator (enforcing delegation to `scout`).
+   - Splits and inspects shell command chains (`&&`, `||`, `;`) per sub-command so compound commands like `git status && pytest` cannot bypass the git exemption or edit-and-test loop gate.
    - Gates `research` subagents to writing markdown reports exclusively to `<artifactDirectoryPath>/scratch/*.md` (blocking workspace code mutations).
    - Blocks `Model: "pro"`, rewrites `Model: "inherit"`, and automatically downgrades simple read-only subagent tasks ($\le 3$ rules) to `Model: "flash_lite"`.
-   - Runs the STE-100 linter gate on all `invoke_subagent` and `send_message` prompts.
+   - Runs the STE-100 linter gate on all `invoke_subagent` and `send_message` prompts via a pre-compiled regular expression engine in `ste_lint.py`.
    - Blocks test file edits that remove test functions, reduce assertion counts, add skip/xfail markers, or insert trivial `assert True` checks (Test Tampering Audit).
    - Halts retries when the 2-Turn Circuit Breaker is tripped, while allowing scratch log writes.
-   - Deduplicates `pending_spawns` tracking across multiple hook registrations.
+   - Uses local subagent identity caching (`self_subagent_meta`) across isolated brain directories and deduplicates `pending_spawns` tracking across multiple hook registrations.
 3. **`post-tool`**:
-   - Synchronizes spawned subagent conversation IDs, model tiers, and `branch` workspaces in session state, rolling back failed spawns.
+   - Synchronizes spawned subagent conversation IDs, model tiers, and `branch` workspaces in session state via an incremental `transcript_offset` cursor, rolling back failed spawns.
    - Tracks command and subagent failures, tripping the 2-turn circuit breaker after 2 consecutive failures.
    - Records empirical test receipts on passing test commands following code mutations.
 4. **`stop`**:
    - Blocks premature completion if any `Workspace: "branch"` subagent worktrees remain unkilled when the session goes idle.
-   - Validates that worker subagents return strictly the 4-header `REPORT FORMAT` (Option A: up to 10 `- ` bullet lines under `NOTES:`, $\le 1,600$ chars; Option B: mandatory inline error summary and `file://.../*.log` URI when `STATUS` is `BLOCKED` or `FAILED`) before allowing completion.
+   - Uses $64\text{ KB}$ tail-reading for report extraction and validates that worker subagents return strictly the 4-header `REPORT FORMAT` (Option A: up to 10 `- ` bullet lines under `NOTES:`, $\le 1,600$ chars; Option B: mandatory inline error summary and `file://.../*.log` URI when `STATUS` is `BLOCKED` or `FAILED`) before allowing completion.
    - Blocks completion with missing empirical test receipts when code files were modified without a subsequent passing test run recorded in `post-tool`.
    - Performs git diff auditing to block test tampering.
    - Allows immediate turn termination when the 2-turn circuit breaker is tripped so the agent can report `STATUS: BLOCKED`.
+
+---
+
+## Running Tests
+
+Run the full test suite using `pytest`:
+
+```bash
+pytest -q
+```
+
+This runs all unit test suites covering both the lifecycle guard hooks (`tests/test_orchestrator_guard.py`) and the ASD-STE100 prompt linter (`tests/test_ste_lint.py`).
 
 ---
 
