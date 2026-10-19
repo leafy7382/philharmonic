@@ -72,7 +72,7 @@ To minimize both orchestrator context growth and subagent spawn overhead:
 | Subagent Type | Model Tier | Write Tools | Workspace Mode | Purpose |
 | :--- | :--- | :--- | :--- | :--- |
 | `scout` | `flash_lite` | Disabled | `inherit` | Single-hop lookups, file/symbol extraction, log slicing ($\le 3$ rules) |
-| `research` | `flash` (auto `flash_lite` if $\le 3$ rules) | Disabled | `inherit` | Multi-file analysis and documentation lookups ($> 3$ rules) |
+| `research` | `flash` (auto `flash_lite` if $\le 3$ rules) | Scratch-only (`*.md`) | `inherit` | Multi-file analysis, docs lookups, and scratch reports |
 | `implementer` | `flash` | Enabled | `branch` / `share` | Bounded code edits and test execution |
 
 ---
@@ -105,6 +105,10 @@ Subagent reports must follow bounded reporting rules:
 - **Option A (Bounded `NOTES` Bullets)**: Reports may include up to 10 compact bullet lines (`- ` or `* `) under `NOTES:` (total report length capped at $\le 1,600$ chars).
 - **Option B (Inline Diagnosis & Scratch Log URI)**: When `STATUS` is `BLOCKED` or `FAILED`, `NOTES:` must include both an inline error summary (at least 3 words describing the failure) and a `file://.../*.log` URI pointing to raw failure output.
 
+### Scratch Specification Relay
+
+For complex tasks requiring technical requirements, schema definitions, or test scenarios that exceed ASD-STE100 sentence constraints, write the detailed technical specification to `<artifactDirectoryPath>/scratch/spec_<task>.md` and instruct the subagent to open the spec file in Rule 1.
+
 ### Enforced Lint Checks
 
 - **Sentence Length**: Maximum 20 words per numbered rule (`[long-sentence]`).
@@ -123,6 +127,7 @@ Configured in [hooks.json](.agents/plugins/pro-orchestrator/hooks.json) and exec
 2. **`pre-tool`**:
    - Auto-allows workspace, worktree, and scratch artifact file/command operations while enforcing the deterministic fast-path budget gate ($\le 2$ workspace file mutations, $\le 2$ direct file reads, $\le 2$ non-git commands, and blocking direct code+test loops in the root orchestrator).
    - Blocks the root orchestrator from reading raw `.log` or `transcript.jsonl` files directly (enforcing delegation to `scout`).
+   - Gates `research` subagents to writing markdown reports exclusively to `<artifactDirectoryPath>/scratch/*.md` (blocking workspace code mutations).
    - Blocks `Model: "pro"`, rewrites `Model: "inherit"`, and automatically downgrades simple read-only subagent tasks ($\le 3$ rules) to `Model: "flash_lite"`.
    - Runs the STE-100 linter gate on all `invoke_subagent` and `send_message` prompts.
    - Blocks test file edits that remove test functions, reduce assertion counts, add skip/xfail markers, or insert trivial `assert True` checks (Test Tampering Audit).
