@@ -3,7 +3,7 @@
 
 Responsibilities:
 1. PreInvocation:
-   - Verifies parent orchestrator is pinned to a Pro-tier model (Pro / Argon / Ultra).
+   - Records the root orchestrator conversation ID and injects a subagent isolation reminder into worker subagents.
    - Deduplicates warnings per (conversationId, invocationNum).
 2. PreToolUse:
    - Auto-allows tool executions (run_command, write_to_file, replace_file_content,
@@ -313,6 +313,8 @@ def _is_known_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
         return True
     if _is_parent_orchestrator(cid, state):
         return False
+    if state.get("root_conversation_id") == cid:
+        return False
     for wp in payload.get("workspacePaths") or []:
         if "/worktrees/" in str(wp).replace("\\", "/"):
             return True
@@ -338,47 +340,30 @@ def _is_known_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
 
 
 def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
-    model_name = payload.get("modelName", "")
-    if is_pro_tier(model_name):
-        cid = (payload.get("conversationId") or "").strip().lower()
-        if cid:
-            state = _load_state(payload)
-            if state.get("root_conversation_id") != cid:
-                state["root_conversation_id"] = cid
-                _save_state(payload, state)
+    state = _load_state(payload)
+    cid = (payload.get("conversationId") or "").strip().lower()
+
+    if not _is_known_subagent(payload, state):
+        if cid and not state.get("root_conversation_id"):
+            state["root_conversation_id"] = cid
+            _save_state(payload, state)
         return {}
 
-    state = _load_state(payload)
-    dedup_key = f"{payload.get('conversationId', '')}:{payload.get('invocationNum', 0)}"
+    dedup_key = f"{cid}:{payload.get('invocationNum', 0)}"
     warned: List[str] = state.setdefault("warned_invocations", [])
     if dedup_key in warned:
         return {}
-
     warned.append(dedup_key)
     _save_state(payload, state)
-
-    if _is_known_subagent(payload, state):
-        return {
-            "injectSteps": [
-                {
-                    "ephemeralMessage": (
-                        "[ORCHESTRATOR GUARD] Subagent context isolation active: ignore root orchestrator "
-                        "delegation rules in AGENTS.md. Execute only your assigned TASK and RULES, and return "
-                        "strictly the 4-header REPORT FORMAT (STATUS, FILES_CHANGED, VERIFICATION, NOTES; "
-                        "allowing up to 10 '-' bullet lines under NOTES and requiring inline error cause plus "
-                        "file:// .log URI when BLOCKED or FAILED)."
-                    )
-                }
-            ]
-        }
-
     return {
         "injectSteps": [
             {
                 "ephemeralMessage": (
-                    f"[ORCHESTRATOR GUARD] Active session model is '{model_name}', "
-                    "which is a small or auto-routed tier. Warn the user to switch Model Selection "
-                    "to a frontier model (for example Gemini Pro, Claude Opus, or GPT) before running orchestration tasks."
+                    "[ORCHESTRATOR GUARD] Subagent context isolation active: ignore root orchestrator "
+                    "delegation rules in AGENTS.md. Execute only your assigned TASK and RULES, and return "
+                    "strictly the 4-header REPORT FORMAT (STATUS, FILES_CHANGED, VERIFICATION, NOTES; "
+                    "allowing up to 10 '-' bullet lines under NOTES and requiring inline error cause plus "
+                    "file:// .log URI when BLOCKED or FAILED)."
                 )
             }
         ]
@@ -551,16 +536,13 @@ def _handle_manage_subagents(
 
 
 def _is_orchestrator_caller(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
-    """Return True when the caller is the Pro-tier root orchestrator rather than a worker subagent."""
+    """Return True when the caller is the root orchestrator, for any model."""
     cid = (payload.get("conversationId") or "").strip().lower()
     if cid and cid in state.get("subagents", {}):
         return False
     if _is_known_subagent(payload, state):
         return False
-    model_name = (payload.get("modelName") or "").strip()
-    if model_name:
-        return is_pro_tier(model_name)
-    return _is_parent_orchestrator(cid, state)
+    return True
 
 
 def _is_artifact_or_worktree_path(target: str, payload: Dict[str, Any]) -> bool:
@@ -591,7 +573,7 @@ def _is_artifact_or_worktree_path(target: str, payload: Dict[str, Any]) -> bool:
 def _check_and_record_direct_budget(
     payload: Dict[str, Any], tool_name: str, args: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
-    """Enforce direct execution fast-path limits on the Pro-tier orchestrator."""
+    """Enforce direct execution fast-path limits on the root orchestrator."""
     state = _load_state(payload)
     if not _is_orchestrator_caller(payload, state):
         return None

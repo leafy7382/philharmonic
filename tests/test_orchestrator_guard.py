@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 import unittest
 
 SCRIPT_DIR = (
@@ -78,19 +78,43 @@ class TestOrchestratorGuard(unittest.TestCase):
             self.assertFalse(orchestrator_guard.is_pro_tier(name), name)
 
     def test_pre_invocation_pro_vs_non_pro_and_dedup(self) -> None:
-        # Pro model produces no warning
+        # Root on a Pro model returns {}
         res_pro = orchestrator_guard.handle_pre_invocation(self.base_payload)
         self.assertEqual(res_pro, {})
 
-        # Non-Pro model injects ephemeral warning once per invocationNum
-        bad_payload = dict(self.base_payload, modelName="gemini-flash", invocationNum=2)
-        res_warn = orchestrator_guard.handle_pre_invocation(bad_payload)
-        self.assertIn("injectSteps", res_warn)
-        self.assertIn("ORCHESTRATOR GUARD", res_warn["injectSteps"][0]["ephemeralMessage"])
+        # Root on a small model returns {} and stores root_conversation_id in state
+        small_payload = dict(self.base_payload, modelName="gemini-flash", invocationNum=2)
+        res_small = orchestrator_guard.handle_pre_invocation(small_payload)
+        self.assertEqual(res_small, {})
+        state = orchestrator_guard._load_state(small_payload)
+        self.assertEqual(
+            state.get("root_conversation_id"),
+            self.base_payload["conversationId"].lower(),
+        )
 
-        # Duplicate call on same invocationNum is deduplicated
-        res_dup = orchestrator_guard.handle_pre_invocation(bad_payload)
-        self.assertEqual(res_dup, {})
+        # A registered subagent gets injectSteps with isolation reminder once, deduped on second call
+        sub_cid = "sub-dedup-uuid-9999"
+        orchestrator_guard.register_subagent(
+            self.base_payload,
+            conversation_id=sub_cid,
+            type_name="scout",
+            model="flash_lite",
+        )
+        sub_payload = dict(
+            self.base_payload,
+            conversationId=sub_cid,
+            modelName="gemini-flash-lite",
+            invocationNum=1,
+        )
+        res_sub1 = orchestrator_guard.handle_pre_invocation(sub_payload)
+        self.assertIn("injectSteps", res_sub1)
+        self.assertIn(
+            "Subagent context isolation active",
+            res_sub1["injectSteps"][0]["ephemeralMessage"],
+        )
+
+        res_sub2 = orchestrator_guard.handle_pre_invocation(sub_payload)
+        self.assertEqual(res_sub2, {})
 
     def test_define_subagent_forces_subagent_tools_false(self) -> None:
         payload = dict(
@@ -578,8 +602,16 @@ NOTES: <one sentence summarizing findings>
         self.assertEqual(res3["decision"], "deny")
         self.assertIn("[ORCHESTRATOR GUARD]", res3["reason"])
 
+        subagent_cid = "sub-mutation-cid-1111"
+        orchestrator_guard.register_subagent(
+            self.base_payload,
+            conversation_id=subagent_cid,
+            type_name="implementer",
+            model="flash",
+        )
         subagent_payload = dict(
             self.base_payload,
+            conversationId=subagent_cid,
             modelName="gemini-3-flash",
             toolCall={
                 "name": "write_to_file",
@@ -1013,8 +1045,16 @@ NOTES: <one sentence summarizing findings>
         self.assertIn("REPORT FORMAT", msg)
 
     def test_subagent_stop_enforces_four_line_report_format(self) -> None:
+        sub_cid = "sub-stop-report-uuid-3333"
+        orchestrator_guard.register_subagent(
+            self.base_payload,
+            conversation_id=sub_cid,
+            type_name="implementer",
+            model="flash",
+        )
         payload_bad = dict(
             self.base_payload,
+            conversationId=sub_cid,
             modelName="gemini-3-flash",
             fullyIdle=True,
             terminationReason="NO_TOOL_CALL",
@@ -1027,6 +1067,7 @@ NOTES: <one sentence summarizing findings>
 
         payload_good = dict(
             self.base_payload,
+            conversationId=sub_cid,
             modelName="gemini-3-flash",
             fullyIdle=True,
             terminationReason="NO_TOOL_CALL",
@@ -1072,8 +1113,16 @@ NOTES: <one sentence summarizing findings>
             "- Added unit tests in test_app.py."
         )
         self.assertIsNone(orchestrator_guard.validate_subagent_report(report_bullets))
+        sub_cid = "sub-bullet-report-uuid-4444"
+        orchestrator_guard.register_subagent(
+            self.base_payload,
+            conversation_id=sub_cid,
+            type_name="implementer",
+            model="flash",
+        )
         payload_sub_stop = dict(
             self.base_payload,
+            conversationId=sub_cid,
             modelName="gemini-3-flash",
             fullyIdle=True,
             terminationReason="NO_TOOL_CALL",
@@ -1138,8 +1187,12 @@ NOTES: <one sentence summarizing findings>
         file_b = str(orchestrator_guard.PROJECT_ROOT / "file_b.py")
         file_c = str(orchestrator_guard.PROJECT_ROOT / "file_c.py")
 
-        def make_read_payload(path: str, model: str = "Gemini 4 Argon (Medium)") -> Dict[str, Any]:
-            return dict(
+        def make_read_payload(
+            path: str,
+            model: str = "Gemini 4 Argon (Medium)",
+            cid: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            p = dict(
                 self.base_payload,
                 modelName=model,
                 toolCall={
@@ -1147,6 +1200,9 @@ NOTES: <one sentence summarizing findings>
                     "args": {"AbsolutePath": path},
                 },
             )
+            if cid:
+                p["conversationId"] = cid
+            return p
 
         # 1. First 2 distinct workspace files are allowed, including repeated read of file_a
         res_a1 = orchestrator_guard.handle_pre_tool(make_read_payload(file_a))
@@ -1176,15 +1232,51 @@ NOTES: <one sentence summarizing findings>
         self.assertIn("cannot directly read raw log or transcript", res_tr["reason"])
 
         # 3. Scout subagent is allowed to read both fail.log and file_c.py
+        scout_cid = "sub-scout-read-cid-4444"
+        orchestrator_guard.register_subagent(
+            self.base_payload,
+            conversation_id=scout_cid,
+            type_name="scout",
+            model="flash_lite",
+        )
         scout_log = orchestrator_guard.handle_pre_tool(
-            make_read_payload(fail_log, model="gemini-3-flash-lite")
+            make_read_payload(fail_log, model="gemini-3-flash-lite", cid=scout_cid)
         )
         self.assertEqual(scout_log["decision"], "allow")
 
         scout_c = orchestrator_guard.handle_pre_tool(
-            make_read_payload(file_c, model="gemini-3-flash-lite")
+            make_read_payload(file_c, model="gemini-3-flash-lite", cid=scout_cid)
         )
         self.assertEqual(scout_c["decision"], "allow")
+
+    def test_small_model_root_orchestrator_is_treated_as_root(self) -> None:
+        payload = dict(self.base_payload, modelName="gemini-3-flash-lite")
+        res_pre = orchestrator_guard.handle_pre_invocation(payload)
+        self.assertEqual(res_pre, {})
+
+        f1 = str(orchestrator_guard.PROJECT_ROOT / "root_f1.txt")
+        f2 = str(orchestrator_guard.PROJECT_ROOT / "root_f2.txt")
+        f3 = str(orchestrator_guard.PROJECT_ROOT / "root_f3.txt")
+
+        p1 = dict(payload, toolCall={"name": "write_to_file", "args": {"TargetFile": f1}})
+        self.assertEqual(orchestrator_guard.handle_pre_tool(p1)["decision"], "allow")
+
+        p2 = dict(payload, toolCall={"name": "write_to_file", "args": {"TargetFile": f2}})
+        self.assertEqual(orchestrator_guard.handle_pre_tool(p2)["decision"], "allow")
+
+        p3 = dict(payload, toolCall={"name": "write_to_file", "args": {"TargetFile": f3}})
+        res3 = orchestrator_guard.handle_pre_tool(p3)
+        self.assertEqual(res3["decision"], "deny")
+        self.assertIn("[ORCHESTRATOR GUARD]", res3["reason"])
+
+        stop_payload = dict(
+            payload,
+            fullyIdle=True,
+            terminationReason="NO_TOOL_CALL",
+            lastAssistantMessage="This is a long verbose summary without four-line report format.\nMore details here.\nAnd here.",
+        )
+        res_stop = orchestrator_guard.handle_stop(stop_payload)
+        self.assertEqual(res_stop["decision"], "allow")
 
 
 if __name__ == "__main__":

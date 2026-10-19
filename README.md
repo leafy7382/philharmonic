@@ -1,14 +1,14 @@
 # Philharmonic (`pro-orchestrator`)
 
-A zero-dependency **Antigravity (`agy`) plugin** that enforces a Pro-tier Central Orchestrator workflow with `flash` and `flash_lite` worker subagents and deterministic **ASD-STE100 (Simplified Technical English)** prompt linting.
+A zero-dependency **Antigravity (`agy`) plugin** that enforces a Central Orchestrator workflow (any model can run this role) with `flash` and `flash_lite` worker subagents and deterministic **ASD-STE100 (Simplified Technical English)** prompt linting.
 
 ---
 
 ## Features
 
-- **Strict Tiered Delegation**: Pins the root session as the Central Orchestrator (`pro`) and delegates file discovery, research, and bounded code changes to `flash_lite` (`scout`) and `flash` (`research`, `implementer`) subagents.
+- **Strict Tiered Delegation**: Allows any model to run as the Central Orchestrator, delegating file discovery, research, and bounded code changes to `flash_lite` (`scout`) and `flash` (`research`, `implementer`) subagents.
 - **Strict Context Separation**:
-  - `PreInvocation` detects spawned subagents and injects a subagent isolation reminder instead of root orchestrator rules/warnings.
+  - `PreInvocation` records the root orchestrator conversation ID and injects a subagent context isolation reminder into worker subagents.
   - `PreToolUse` caps direct root orchestrator file reads at $\le 2$ workspace files per turn and blocks the root orchestrator from reading raw `.log` or `transcript.jsonl` files directly (enforcing delegation to `scout`).
   - `Stop` validates that worker subagents return strictly the 4-header `REPORT FORMAT` (Option A: up to 10 `- ` bullet lines under `NOTES:`, $\le 1,600$ chars; Option B: mandatory inline error summary and `file://.../*.log` URI when `STATUS` is `BLOCKED` or `FAILED`) before their response enters the parent orchestrator's context window.
 - **Empirical Test Receipts**: Every code change requires a subsequent passing test run recorded in `post-tool` before the `stop` hook allows completion.
@@ -64,7 +64,7 @@ ln -s "$(pwd)/.agents/plugins/pro-orchestrator" ~/.gemini/config/plugins/pro-orc
 
 ## Subagent Architecture & Automatic Token Optimization
 
-To minimize both Pro-tier context growth and subagent spawn overhead:
+To minimize both orchestrator context growth and subagent spawn overhead:
 - **Direct Execution Fast-Path**: Single-step commands and reads/edits of $\le 2$ known files execute directly in the orchestrator with zero subagent overhead, enforced by a deterministic fast-path budget gate ($\le 2$ workspace files, $\le 2$ non-git commands, and blocking direct code+test loops in the root orchestrator).
 - **Lazy Subagent Registration**: Custom subagents (`scout` and `implementer`) are registered via `define_subagent` only immediately before first invoking them.
 - **Automatic Tier Downgrade**: The `pre-tool` hook automatically downgrades read-only subagent calls (`scout` / `research`) with $\le 3$ numbered rules and no mutation verbs to `Model: "flash_lite"`.
@@ -119,7 +119,7 @@ Subagent reports must follow bounded reporting rules:
 
 Configured in [hooks.json](.agents/plugins/pro-orchestrator/hooks.json) and executed by [orchestrator_guard.py](.agents/plugins/pro-orchestrator/scripts/orchestrator_guard.py):
 
-1. **`pre-invocation`**: Verifies the active session is pinned to a Pro-tier model, detects spawned subagents to inject a subagent context isolation reminder instead of root rules/warnings, and deduplicates warnings per invocation.
+1. **`pre-invocation`**: Records the root orchestrator conversation ID, injects a subagent context isolation reminder into worker subagents, and deduplicates warnings per invocation.
 2. **`pre-tool`**:
    - Auto-allows workspace, worktree, and scratch artifact file/command operations while enforcing the deterministic fast-path budget gate ($\le 2$ workspace file mutations, $\le 2$ direct file reads, $\le 2$ non-git commands, and blocking direct code+test loops in the root orchestrator).
    - Blocks the root orchestrator from reading raw `.log` or `transcript.jsonl` files directly (enforcing delegation to `scout`).
