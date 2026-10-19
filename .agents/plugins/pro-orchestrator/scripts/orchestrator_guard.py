@@ -29,6 +29,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -120,23 +121,6 @@ def _find_project_root() -> Path:
 PROJECT_ROOT = _find_project_root()
 
 
-SMALL_TIER_RE = re.compile(
-    r"(?<![a-z])(flash|lite|mini|nano|haiku|small|tiny)(?![a-z])", re.I
-)
-
-
-def is_pro_tier(model_name: str) -> bool:
-    """Accept any frontier orchestrator model and reject small or auto-routed tiers.
-
-    Uses a denylist of small-tier markers so that flagship models from any vendor
-    (Gemini Pro/Argon/Ultra, Claude Opus/Sonnet, GPT, o-series, Grok, DeepSeek)
-    pass without code changes.
-    """
-    normalized = (model_name or "").strip().lower()
-    if not normalized or normalized in {"auto", "none"}:
-        return False
-    return not SMALL_TIER_RE.search(normalized)
-
 
 def _state_file_path(payload: Dict[str, Any]) -> Path:
     artifact_dir = payload.get("artifactDirectoryPath")
@@ -155,11 +139,16 @@ def _load_state(payload: Dict[str, Any]) -> Dict[str, Any]:
             with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
                 if isinstance(data, dict):
+                    data["isolation_reminded_invocations"] = (
+                        data.get("isolation_reminded_invocations")
+                        or data.get("warned_invocations")
+                        or []
+                    )
                     return data
         except (OSError, json.JSONDecodeError):
             pass
     return {
-        "warned_invocations": [],
+        "isolation_reminded_invocations": [],
         "recorded_spawn_calls": [],
         "pending_spawns": [],
         "subagents": {},
@@ -350,10 +339,10 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {}
 
     dedup_key = f"{cid}:{payload.get('invocationNum', 0)}"
-    warned: List[str] = state.setdefault("warned_invocations", [])
-    if dedup_key in warned:
+    reminded: List[str] = state.setdefault("isolation_reminded_invocations", [])
+    if dedup_key in reminded:
         return {}
-    warned.append(dedup_key)
+    reminded.append(dedup_key)
     _save_state(payload, state)
     return {
         "injectSteps": [
@@ -370,7 +359,19 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _is_research_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
+    """Return True if the active caller is a research subagent."""
+    cid = (payload.get("conversationId") or "").strip().lower()
+    sub_info = state.get("subagents", {}).get(cid, {})
+    return sub_info.get("type") in {"research", "researcher"}
+
+
 def _handle_define_subagent(args: Dict[str, Any]) -> Dict[str, Any]:
+    if args.get("name") in {"research", "researcher"} and args.get("enable_write_tools") is True:
+        return {
+            "decision": "allow",
+            "overwrite": {"enable_subagent_tools": False},
+        }
     if args.get("enable_subagent_tools") is True:
         return {
             "decision": "allow",
@@ -925,6 +926,26 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
         return _handle_manage_subagents(payload, args)
 
     if tool_name in MUTATION_TOOLS:
+        if _is_research_subagent(payload, state):
+            target = args.get("TargetFile") or args.get("AbsolutePath") or ""
+            artifact_dir = payload.get("artifactDirectoryPath") or ""
+            norm_target = str(Path(os.path.expanduser(target)).resolve()) if target else ""
+            scratch_dir = str(Path(os.path.expanduser(artifact_dir)).resolve() / "scratch") if artifact_dir else ""
+
+            is_scratch_md = (
+                scratch_dir
+                and norm_target.startswith(scratch_dir)
+                and norm_target.endswith((".md", ".txt"))
+            )
+            if not is_scratch_md:
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        "[ORCHESTRATOR GUARD] Research subagents may only write markdown reports "
+                        "to <artifactDirectoryPath>/scratch/*.md. Workspace mutations are prohibited."
+                    ),
+                }
+
         tamper_denial = _check_test_tampering_in_edit(tool_name, args, payload)
         if tamper_denial is not None:
             return tamper_denial
@@ -941,9 +962,12 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
             budget_denial = _check_and_record_direct_budget(payload, tool_name, args)
             if budget_denial:
                 return budget_denial
+            overrides = [f"command({cmd})", "command(*)"]
+            for r in roots:
+                overrides.append(f"file({r}/**)")
             return {
                 "decision": "allow",
-                "permissionOverrides": [f"command({cmd})", "command(*)"],
+                "permissionOverrides": overrides,
             }
         return {"decision": "ask"}
 
@@ -1093,6 +1117,26 @@ def _extract_last_model_response(payload: Dict[str, Any]) -> Optional[str]:
     return last_text
 
 
+def _get_workspace_git_diff(payload: Dict[str, Any]) -> str:
+    """Return unified git diff from payload or by running git diff in workspace."""
+    if payload.get("gitDiff"):
+        return str(payload["gitDiff"])
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "-U0"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return proc.stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
+
+
 def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
     termination_reason = payload.get("terminationReason", "")
     # Never block user cancellations, errors, or hard budget caps
@@ -1163,8 +1207,9 @@ def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
     if cb.get("tripped"):
         return {"decision": "allow"}
 
-    if payload.get("gitDiff"):
-        tamper_finding = audit_diff_text(payload["gitDiff"])
+    diff_text = _get_workspace_git_diff(payload)
+    if diff_text:
+        tamper_finding = audit_diff_text(diff_text)
         if tamper_finding:
             exec_key = f"tamper:{payload.get('conversationId', '')}:{payload.get('executionNum', 0)}"
             reminded = state.setdefault("stop_reminded_executions", [])

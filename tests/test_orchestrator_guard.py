@@ -55,27 +55,78 @@ class TestOrchestratorGuard(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def test_is_pro_tier_classification(self) -> None:
-        self.assertTrue(orchestrator_guard.is_pro_tier("Gemini 4 Argon (Medium)"))
-        self.assertTrue(orchestrator_guard.is_pro_tier("gemini-3.1-pro-preview"))
-        self.assertFalse(orchestrator_guard.is_pro_tier("gemini-3-flash"))
-        self.assertFalse(orchestrator_guard.is_pro_tier("gemini-flash-lite"))
-        self.assertFalse(orchestrator_guard.is_pro_tier("auto"))
-        self.assertFalse(orchestrator_guard.is_pro_tier(""))
+    def test_autonomous_git_diff_audit_in_handle_stop(self) -> None:
+        tampered_diff = (
+            "diff --git a/tests/test_example.py b/tests/test_example.py\n"
+            "--- a/tests/test_example.py\n"
+            "+++ b/tests/test_example.py\n"
+            "@@ -10,1 +10,2 @@\n"
+            "+@unittest.skip('temporarily skipping')\n"
+            " def test_feature():\n"
+        )
+        payload = dict(
+            self.base_payload,
+            fullyIdle=True,
+            terminationReason="NO_TOOL_CALL",
+            gitDiff=tampered_diff,
+        )
+        res = orchestrator_guard.handle_stop(payload)
+        self.assertEqual(res["decision"], "continue")
+        self.assertIn("Diff audit detected test skip", res.get("reason", ""))
 
-    def test_is_pro_tier_accepts_other_frontier_vendors(self) -> None:
-        for name in (
-            "Claude Opus 5.5 (Medium)",
-            "claude-sonnet-5",
-            "gpt-6",
-            "gpt-6-pro",
-            "o5",
-            "grok-5",
-            "deepseek-v4",
-        ):
-            self.assertTrue(orchestrator_guard.is_pro_tier(name), name)
-        for name in ("claude-haiku-5", "gpt-6-mini", "gpt-6-nano", "gemini-3-flash-lite"):
-            self.assertFalse(orchestrator_guard.is_pro_tier(name), name)
+        clean_diff = (
+            "diff --git a/tests/test_example.py b/tests/test_example.py\n"
+            "--- a/tests/test_example.py\n"
+            "+++ b/tests/test_example.py\n"
+            "@@ -10,0 +10,3 @@\n"
+            "+def test_new_behavior():\n"
+            "+    assert 1 + 1 == 2\n"
+        )
+        payload_clean = dict(
+            self.base_payload,
+            executionNum=2,
+            fullyIdle=True,
+            terminationReason="NO_TOOL_CALL",
+            gitDiff=clean_diff,
+        )
+        res_clean = orchestrator_guard.handle_stop(payload_clean)
+        self.assertEqual(res_clean["decision"], "allow")
+        self.assertNotIn("reason", res_clean)
+
+    def test_isolation_reminder_deduplication(self) -> None:
+        sub_cid = "sub-dedup-worker-101"
+        orchestrator_guard.register_subagent(
+            self.base_payload,
+            conversation_id=sub_cid,
+            type_name="implementer",
+            model="flash",
+        )
+        payload_1 = dict(
+            self.base_payload,
+            conversationId=sub_cid,
+            invocationNum=1,
+        )
+        res_1 = orchestrator_guard.handle_pre_invocation(payload_1)
+        self.assertIn("injectSteps", res_1)
+        self.assertIn(
+            "Subagent context isolation active",
+            res_1["injectSteps"][0]["ephemeralMessage"],
+        )
+
+        res_2 = orchestrator_guard.handle_pre_invocation(payload_1)
+        self.assertEqual(res_2, {})
+
+        payload_2 = dict(
+            self.base_payload,
+            conversationId=sub_cid,
+            invocationNum=2,
+        )
+        res_3 = orchestrator_guard.handle_pre_invocation(payload_2)
+        self.assertIn("injectSteps", res_3)
+        self.assertIn(
+            "Subagent context isolation active",
+            res_3["injectSteps"][0]["ephemeralMessage"],
+        )
 
     def test_pre_invocation_pro_vs_non_pro_and_dedup(self) -> None:
         # Root on a Pro model returns {}
@@ -130,6 +181,21 @@ class TestOrchestratorGuard(unittest.TestCase):
         res = orchestrator_guard.handle_pre_tool(payload)
         self.assertEqual(res["decision"], "allow")
         self.assertEqual(res["overwrite"], {"enable_subagent_tools": False})
+
+        # Research subagent with enable_write_tools: True is allowed with enable_subagent_tools: False
+        payload_research = dict(
+            self.base_payload,
+            toolCall={
+                "name": "define_subagent",
+                "args": {
+                    "name": "research",
+                    "enable_write_tools": True,
+                },
+            },
+        )
+        res_research = orchestrator_guard.handle_pre_tool(payload_research)
+        self.assertEqual(res_research["decision"], "allow")
+        self.assertEqual(res_research["overwrite"], {"enable_subagent_tools": False})
 
     def test_invoke_subagent_blocks_pro_model(self) -> None:
         payload = dict(
@@ -305,6 +371,8 @@ class TestOrchestratorGuard(unittest.TestCase):
         res_in = orchestrator_guard.handle_pre_tool(inside_cmd)
         self.assertEqual(res_in["decision"], "allow")
         self.assertIn("permissionOverrides", res_in)
+        overrides = res_in["permissionOverrides"]
+        self.assertTrue(any(o.startswith("file(") for o in overrides))
 
         # Command referencing an outside path falls back to ask
         outside_cmd = dict(
@@ -1277,6 +1345,48 @@ NOTES: <one sentence summarizing findings>
         )
         res_stop = orchestrator_guard.handle_stop(stop_payload)
         self.assertEqual(res_stop["decision"], "allow")
+
+    def test_research_subagent_can_write_scratch_markdown_but_not_workspace_files(self) -> None:
+        sub_cid = "research-worker-001"
+        orchestrator_guard.register_subagent(
+            self.base_payload,
+            conversation_id=sub_cid,
+            type_name="research",
+            model="flash",
+        )
+        scratch_file = str(Path(self.artifact_dir) / "scratch" / "findings.md")
+        payload_scratch = dict(
+            self.base_payload,
+            conversationId=sub_cid,
+            toolCall={
+                "name": "write_to_file",
+                "args": {
+                    "TargetFile": scratch_file,
+                    "CodeContent": "# Research Findings\nAnalysis summary.",
+                },
+            },
+        )
+        res_scratch = orchestrator_guard.handle_pre_tool(payload_scratch)
+        self.assertEqual(res_scratch["decision"], "allow")
+
+        workspace_file = str(orchestrator_guard.PROJECT_ROOT / "src" / "app.py")
+        payload_workspace = dict(
+            self.base_payload,
+            conversationId=sub_cid,
+            toolCall={
+                "name": "write_to_file",
+                "args": {
+                    "TargetFile": workspace_file,
+                    "CodeContent": "# Workspace mutation",
+                },
+            },
+        )
+        res_workspace = orchestrator_guard.handle_pre_tool(payload_workspace)
+        self.assertEqual(res_workspace["decision"], "deny")
+        self.assertIn(
+            "Research subagents may only write markdown reports",
+            res_workspace.get("reason", ""),
+        )
 
 
 if __name__ == "__main__":

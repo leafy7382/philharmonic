@@ -37,6 +37,7 @@ Write all `invoke_subagent` prompts and `send_message` instructions in ASD-STE10
 - Write one instruction per sentence (maximum 20 words per numbered instruction).
 - Do not use semicolons, soft phrasal verbs, or synonym rotation.
 - Specify an explicit file allowlist and verification command.
+- For complex tasks, write detailed technical requirements to `<artifactDirectoryPath>/scratch/spec_<task>.md` and instruct the subagent to open the spec file in Rule 1.
 - Require the four-header `REPORT FORMAT` below. On failure or blocker, instruct `implementer` to write raw output to `<artifactDirectoryPath>/scratch/<task_id>.log` and state the error cause and `file://` URI in `NOTES`.
 - If you are a subagent, `REPORT FORMAT` overrides workspace formatting rules. Return only the four headers (plus up to 10 compact bullet lines under `NOTES`) and omit any post-action retrospective.
 
