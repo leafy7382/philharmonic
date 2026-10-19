@@ -182,7 +182,7 @@ class TestOrchestratorGuard(unittest.TestCase):
         self.assertEqual(res["decision"], "allow")
         self.assertEqual(res["overwrite"], {"enable_subagent_tools": False})
 
-        # Research subagent with enable_write_tools: True is allowed with enable_subagent_tools: False
+        # Research subagent with enable_subagent_tools: True is allowed with enable_subagent_tools: False
         payload_research = dict(
             self.base_payload,
             toolCall={
@@ -190,6 +190,7 @@ class TestOrchestratorGuard(unittest.TestCase):
                 "args": {
                     "name": "research",
                     "enable_write_tools": True,
+                    "enable_subagent_tools": True,
                 },
             },
         )
@@ -1387,6 +1388,123 @@ NOTES: <one sentence summarizing findings>
             "Research subagents may only write markdown reports",
             res_workspace.get("reason", ""),
         )
+
+    def test_live_runtime_pitfalls_invocation_sync_and_cross_brain_research(self) -> None:
+        # 1. Calling handle_pre_invocation with invocationNum=5 persists current_invocation_num=5,
+        # so subsequent handle_pre_tool calls that omit invocationNum use bucket "5" instead of "0".
+        payload_pre = dict(self.base_payload, invocationNum=5)
+        orchestrator_guard.handle_pre_invocation(payload_pre)
+        state_after_pre = orchestrator_guard._load_state(payload_pre)
+        self.assertEqual(state_after_pre.get("current_invocation_num"), 5)
+
+        tool_payload = dict(
+            self.base_payload,
+            toolCall={
+                "id": "cmd_inv_5",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "echo 'pitfall 1 test'",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+        )
+        tool_payload.pop("invocationNum", None)
+        res_tool = orchestrator_guard.handle_pre_tool(tool_payload)
+        self.assertEqual(res_tool.get("decision"), "allow")
+        state_after_tool = orchestrator_guard._load_state(tool_payload)
+        self.assertIn("5", state_after_tool.get("direct_budget", {}))
+        self.assertNotIn("0", state_after_tool.get("direct_budget", {}))
+
+        # 2. A research subagent running in its own brain/sub-research directory
+        # (while registered in brain/parent-root/orchestrator_state.json) is recognized
+        # by _is_research_subagent, can write to brain/parent-root/scratch/brief.md,
+        # and is denied when writing to PROJECT_ROOT / "src.py".
+        app_data = Path(self.artifact_dir) / "appdata"
+        parent_brain = app_data / "brain" / "parent-root"
+        sub_brain = app_data / "brain" / "sub-research"
+        parent_brain.mkdir(parents=True, exist_ok=True)
+        sub_brain.mkdir(parents=True, exist_ok=True)
+        (parent_brain / "scratch").mkdir(parents=True, exist_ok=True)
+
+        research_cid = "sub-research-cross-brain-001"
+        parent_payload = dict(
+            self.base_payload,
+            conversationId="parent-root",
+            artifactDirectoryPath=str(parent_brain),
+        )
+        orchestrator_guard.register_subagent(
+            parent_payload,
+            conversation_id=research_cid,
+            type_name="research",
+            model="flash",
+            role="Cross-Brain Researcher",
+        )
+
+        sub_payload = dict(
+            self.base_payload,
+            conversationId=research_cid,
+            artifactDirectoryPath=str(sub_brain),
+            modelName="gemini-3-flash",
+        )
+        sub_state = orchestrator_guard._load_state(sub_payload)
+        self.assertTrue(orchestrator_guard._is_research_subagent(sub_payload, sub_state))
+
+        brief_file = str(parent_brain / "scratch" / "brief.md")
+        sub_write_scratch = dict(
+            sub_payload,
+            toolCall={
+                "name": "write_to_file",
+                "args": {
+                    "TargetFile": brief_file,
+                    "CodeContent": "# Sibling Research Brief\nContent here.",
+                },
+            },
+        )
+        res_scratch = orchestrator_guard.handle_pre_tool(sub_write_scratch)
+        self.assertEqual(res_scratch.get("decision"), "allow")
+
+        workspace_file = str(orchestrator_guard.PROJECT_ROOT / "src.py")
+        sub_write_workspace = dict(
+            sub_payload,
+            toolCall={
+                "name": "write_to_file",
+                "args": {
+                    "TargetFile": workspace_file,
+                    "CodeContent": "x = 42\n",
+                },
+            },
+        )
+        res_workspace = orchestrator_guard.handle_pre_tool(sub_write_workspace)
+        self.assertEqual(res_workspace.get("decision"), "deny")
+        self.assertIn(
+            "Research subagents may only write markdown reports",
+            res_workspace.get("reason", ""),
+        )
+
+        # 3. When the root orchestrator has receipt["dirty"] = True and completes a successful
+        # invoke_subagent in handle_post_tool, receipt["dirty"] is cleared to False and receipt["verified"] is True.
+        root_state = orchestrator_guard._load_state(self.base_payload)
+        receipt = orchestrator_guard._get_test_receipt(root_state, self.base_payload)
+        receipt["dirty"] = True
+        receipt["verified"] = False
+        orchestrator_guard._save_state(self.base_payload, root_state)
+
+        invoke_post_payload = dict(
+            self.base_payload,
+            toolCall={
+                "id": "call_invoke_sub_success",
+                "name": "invoke_subagent",
+                "args": {},
+            },
+            error="",
+        )
+        orchestrator_guard.handle_post_tool(invoke_post_payload)
+
+        updated_state = orchestrator_guard._load_state(self.base_payload)
+        updated_receipt = orchestrator_guard._get_test_receipt(updated_state, self.base_payload)
+        self.assertFalse(updated_receipt.get("dirty"))
+        self.assertTrue(updated_receipt.get("verified"))
+        self.assertEqual(updated_receipt.get("last_test_cmd"), "invoke_subagent")
 
 
 if __name__ == "__main__":

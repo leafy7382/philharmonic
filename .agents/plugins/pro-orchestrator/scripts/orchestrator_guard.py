@@ -31,6 +31,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -58,6 +59,8 @@ CONVERSATION_ID_RE = re.compile(
     r'\\*"conversationId\\*"\s*:\s*\\*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\*"',
     re.I,
 )
+
+PENDING_SPAWN_TTL_SECONDS = 120
 
 MAX_DIRECT_MUTATION_FILES = 2
 MAX_DIRECT_COMMANDS = 2
@@ -132,6 +135,13 @@ def _state_file_path(payload: Dict[str, Any]) -> Path:
     return base / "orchestrator_state.json"
 
 
+def _current_invocation_key(payload: Dict[str, Any], state: Dict[str, Any]) -> str:
+    """Return invocation key from payload or persisted state from PreInvocation."""
+    if "invocationNum" in payload and payload["invocationNum"] is not None:
+        return str(payload["invocationNum"])
+    return str(state.get("current_invocation_num", 0))
+
+
 def _load_state(payload: Dict[str, Any]) -> Dict[str, Any]:
     path = _state_file_path(payload)
     if path.exists():
@@ -156,6 +166,7 @@ def _load_state(payload: Dict[str, Any]) -> Dict[str, Any]:
         "direct_budget": {},
         "test_receipt": {},
         "circuit_breaker": {},
+        "current_invocation_num": 0,
     }
 
 
@@ -183,7 +194,7 @@ def _sync_subagents_from_transcript(
     try:
         with open(transcript_path, encoding="utf-8") as fh:
             for raw_line in fh:
-                if "invoke_subagent" not in raw_line and not pending:
+                if "invoke_subagent" not in raw_line or "File Path: `file://" in raw_line:
                     continue
                 try:
                     step = json.loads(raw_line)
@@ -302,8 +313,6 @@ def _is_known_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
         return True
     if _is_parent_orchestrator(cid, state):
         return False
-    if state.get("root_conversation_id") == cid:
-        return False
     for wp in payload.get("workspacePaths") or []:
         if "/worktrees/" in str(wp).replace("\\", "/"):
             return True
@@ -322,7 +331,12 @@ def _is_known_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
                     if cid and cid in (sib_data.get("subagents") or {}):
                         return True
                     if sib_data.get("pending_spawns"):
-                        return True
+                        try:
+                            age = time.time() - sibling_state_path.stat().st_mtime
+                            if age < PENDING_SPAWN_TTL_SECONDS:
+                                return True
+                        except OSError:
+                            pass
         except OSError:
             pass
     return False
@@ -333,12 +347,19 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
     cid = (payload.get("conversationId") or "").strip().lower()
 
     if not _is_known_subagent(payload, state):
+        changed = False
         if cid and not state.get("root_conversation_id"):
             state["root_conversation_id"] = cid
+            changed = True
+        if "invocationNum" in payload and payload["invocationNum"] is not None:
+            if state.get("current_invocation_num") != payload["invocationNum"]:
+                state["current_invocation_num"] = payload["invocationNum"]
+                changed = True
+        if changed:
             _save_state(payload, state)
         return {}
 
-    dedup_key = f"{cid}:{payload.get('invocationNum', 0)}"
+    dedup_key = f"{cid}:{_current_invocation_key(payload, state)}"
     reminded: List[str] = state.setdefault("isolation_reminded_invocations", [])
     if dedup_key in reminded:
         return {}
@@ -362,16 +383,31 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
 def _is_research_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
     """Return True if the active caller is a research subagent."""
     cid = (payload.get("conversationId") or "").strip().lower()
-    sub_info = state.get("subagents", {}).get(cid, {})
-    return sub_info.get("type") in {"research", "researcher"}
+    if cid and cid in state.get("subagents", {}):
+        return state["subagents"][cid].get("type") in {"research", "researcher"}
+    if _is_parent_orchestrator(cid, state):
+        return False
+    artifact_dir = payload.get("artifactDirectoryPath")
+    if artifact_dir:
+        try:
+            resolved_art = Path(artifact_dir).resolve()
+            if resolved_art.parent.name == "brain":
+                for sibling_state_path in resolved_art.parent.glob("*/orchestrator_state.json"):
+                    if sibling_state_path.parent == resolved_art:
+                        continue
+                    try:
+                        sib_data = json.loads(sibling_state_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    sub_map = sib_data.get("subagents") or {}
+                    if cid and cid in sub_map:
+                        return sub_map[cid].get("type") in {"research", "researcher"}
+        except OSError:
+            pass
+    return False
 
 
 def _handle_define_subagent(args: Dict[str, Any]) -> Dict[str, Any]:
-    if args.get("name") in {"research", "researcher"} and args.get("enable_write_tools") is True:
-        return {
-            "decision": "allow",
-            "overwrite": {"enable_subagent_tools": False},
-        }
     if args.get("enable_subagent_tools") is True:
         return {
             "decision": "allow",
@@ -514,6 +550,7 @@ def _handle_manage_subagents(
             meta["active_branch"] = False
         for pending in state.get("pending_spawns", []):
             pending["active_branch"] = False
+        state["pending_spawns"] = []
         _save_state(payload, state)
     elif action == "kill":
         target_ids = {
@@ -571,6 +608,17 @@ def _is_artifact_or_worktree_path(target: str, payload: Dict[str, Any]) -> bool:
     return False
 
 
+def _is_allowed_research_scratch_write(target: str, payload: Dict[str, Any]) -> bool:
+    """Return True if target is a .md or .txt file inside a scratch directory under brain/."""
+    if not target or not _is_artifact_or_worktree_path(target, payload):
+        return False
+    try:
+        resolved = Path(os.path.expanduser(target)).resolve()
+    except OSError:
+        return False
+    return resolved.suffix.lower() in {".md", ".txt"} and "scratch" in resolved.parts
+
+
 def _check_and_record_direct_budget(
     payload: Dict[str, Any], tool_name: str, args: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
@@ -579,7 +627,7 @@ def _check_and_record_direct_budget(
     if not _is_orchestrator_caller(payload, state):
         return None
 
-    inv_key = str(payload.get("invocationNum", 0))
+    inv_key = _current_invocation_key(payload, state)
     budget = state.setdefault("direct_budget", {}).setdefault(
         inv_key,
         {"mutated_files": [], "read_files": [], "commands": [], "seen_calls": []},
@@ -847,7 +895,7 @@ def audit_diff_text(diff_text: str) -> Optional[str]:
 
 
 def _get_circuit_breaker(state: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
-    inv_key = str(payload.get("invocationNum", 0))
+    inv_key = _current_invocation_key(payload, state)
     return state.setdefault("circuit_breaker", {}).setdefault(
         inv_key,
         {"failure_streak": 0, "tripped": False, "seen_failures": [], "last_error": ""},
@@ -855,7 +903,7 @@ def _get_circuit_breaker(state: Dict[str, Any], payload: Dict[str, Any]) -> Dict
 
 
 def _get_test_receipt(state: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
-    inv_key = str(payload.get("invocationNum", 0))
+    inv_key = _current_invocation_key(payload, state)
     return state.setdefault("test_receipt", {}).setdefault(
         inv_key,
         {
@@ -928,16 +976,7 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
     if tool_name in MUTATION_TOOLS:
         if _is_research_subagent(payload, state):
             target = args.get("TargetFile") or args.get("AbsolutePath") or ""
-            artifact_dir = payload.get("artifactDirectoryPath") or ""
-            norm_target = str(Path(os.path.expanduser(target)).resolve()) if target else ""
-            scratch_dir = str(Path(os.path.expanduser(artifact_dir)).resolve() / "scratch") if artifact_dir else ""
-
-            is_scratch_md = (
-                scratch_dir
-                and norm_target.startswith(scratch_dir)
-                and norm_target.endswith((".md", ".txt"))
-            )
-            if not is_scratch_md:
+            if not _is_allowed_research_scratch_write(target, payload):
                 return {
                     "decision": "deny",
                     "reason": (
@@ -1035,10 +1074,10 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
             if tool_name == "invoke_subagent" or is_test_cmd or (tool_name == "run_command" and not GIT_COMMAND_RE.match(cmd)):
                 cb["failure_streak"] = 0
                 cb["tripped"] = False
-            if is_test_cmd:
+            if is_test_cmd or (tool_name == "invoke_subagent" and receipt.get("dirty")):
                 receipt["dirty"] = False
                 receipt["verified"] = True
-                receipt["last_test_cmd"] = cmd
+                receipt["last_test_cmd"] = cmd or "invoke_subagent"
 
     _save_state(payload, state)
     return {}
@@ -1207,7 +1246,16 @@ def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
     if cb.get("tripped"):
         return {"decision": "allow"}
 
-    diff_text = _get_workspace_git_diff(payload)
+    inv_key = _current_invocation_key(payload, state)
+    mutated_in_turn = bool(
+        state.get("direct_budget", {}).get(inv_key, {}).get("mutated_files")
+    )
+    receipt = _get_test_receipt(state, payload)
+    diff_text = (
+        _get_workspace_git_diff(payload)
+        if (payload.get("gitDiff") or receipt.get("dirty") or mutated_in_turn)
+        else ""
+    )
     if diff_text:
         tamper_finding = audit_diff_text(diff_text)
         if tamper_finding:
@@ -1218,7 +1266,6 @@ def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
                 _save_state(payload, state)
                 return {"decision": "continue", "reason": tamper_finding}
 
-    receipt = _get_test_receipt(state, payload)
     if receipt.get("dirty") and not receipt.get("verified"):
         exec_key = f"receipt:{payload.get('conversationId', '')}:{payload.get('executionNum', 0)}"
         reminded = state.setdefault("stop_reminded_executions", [])
