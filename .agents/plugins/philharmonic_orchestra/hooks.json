@@ -1,5 +1,5 @@
 {
-  "pro-orchestrator-guard": {
+  "philharmonic_orchestra-guard": {
     "enabled": true,
     "PreInvocation": [
       {

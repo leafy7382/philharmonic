@@ -1,4 +1,4 @@
-# Philharmonic (`pro-orchestrator`)
+# Philharmonic (`philharmonic_orchestra`)
 
 A zero-dependency **Antigravity (`agy`) plugin** that enforces a Central Orchestrator workflow (any model can run this role) with `flash` and `flash_lite` worker subagents and deterministic structured prompt and report contracts.
 
@@ -6,6 +6,7 @@ A zero-dependency **Antigravity (`agy`) plugin** that enforces a Central Orchest
 
 ## Features
 
+- **On-Demand Activation & Session Gating**: Inactive by default in normal chats. Automatically activates for the current conversation when you invoke `/philharmonic` (loading `.agents/plugins/philharmonic_orchestra/skills/philharmonic/SKILL.md`) or manually via CLI `activate`/`deactivate`.
 - **Strict Tiered Delegation**: Allows any model to run as the Central Orchestrator, delegating file discovery, research, and bounded code changes to `flash_lite` (`scout`) and `flash` (`research`, `implementer`) subagents.
 - **Native Antigravity Tool Enforcement**: Enforces Antigravity's native tool schemas (`read_file`, `write_file`, `edit_file`, `list_dir`, `grep_search`, `find_by_name`, `run_command`), PascalCase `define_subagent` arguments (`Name`, `EnableWriteTools`, `EnableMCPTools`, `EnableSubagentTools`, `SystemPrompt`), and flat `invoke_subagent` arguments (`TypeName`, `Role`, `Prompt`, `Model`, `Workspace`).
 - **Context Separation & Direct Fast-Path Budget**:
@@ -27,9 +28,9 @@ A zero-dependency **Antigravity (`agy`) plugin** that enforces a Central Orchest
 - **CLI Diagnostic Commands**:
   - Terminal status, reset, and health recovery commands:
     ```bash
-    python3 .agents/plugins/pro-orchestrator/scripts/orchestrator_guard.py status
-    python3 .agents/plugins/pro-orchestrator/scripts/orchestrator_guard.py reset
-    python3 .agents/plugins/pro-orchestrator/scripts/orchestrator_guard.py doctor
+    python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py status
+    python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py reset
+    python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py doctor
     ```
 - **Zero External Dependencies**: Uses only the Python 3 standard library.
 
@@ -54,16 +55,19 @@ cd philharmonic
 agy
 ```
 
-Antigravity automatically discovers [AGENTS.md](AGENTS.md) and loads [.agents/plugins/pro-orchestrator/plugin.json](.agents/plugins/pro-orchestrator/plugin.json).
+Philharmonic is an on-demand workflow. Activate it in any conversation by typing:
+```text
+/philharmonic
+```
+This loads [.agents/plugins/philharmonic_orchestra/skills/philharmonic/SKILL.md](.agents/plugins/philharmonic_orchestra/skills/philharmonic/SKILL.md) and automatically activates the session guard for the conversation. Regular chat sessions without `/philharmonic` remain ungated.
 
 ### 2. Install into another project workspace
 
-Copy the plugin and operating protocol into your target repository:
+Copy the plugin into your target repository:
 
 ```bash
 mkdir -p /path/to/your-project/.agents/plugins
-cp -r .agents/plugins/pro-orchestrator /path/to/your-project/.agents/plugins/
-cp AGENTS.md /path/to/your-project/AGENTS.md
+cp -r .agents/plugins/philharmonic_orchestra /path/to/your-project/.agents/plugins/
 ```
 
 ### 3. Install globally for all projects
@@ -72,7 +76,7 @@ Symlink or copy the plugin into your user-level Antigravity plugins directory:
 
 ```bash
 mkdir -p ~/.gemini/config/plugins
-ln -s "$(pwd)/.agents/plugins/pro-orchestrator" ~/.gemini/config/plugins/pro-orchestrator
+ln -s "$(pwd)/.agents/plugins/philharmonic_orchestra" ~/.gemini/config/plugins/philharmonic_orchestra
 ```
 
 ---
@@ -134,7 +138,7 @@ For complex tasks requiring technical requirements, schema definitions, or test 
 
 ## Lifecycle Hooks
 
-Configured in [hooks.json](.agents/plugins/pro-orchestrator/hooks.json) and executed by [orchestrator_guard.py](.agents/plugins/pro-orchestrator/scripts/orchestrator_guard.py):
+Configured in [hooks.json](.agents/plugins/philharmonic_orchestra/hooks.json) and executed by [orchestrator_guard.py](.agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py):
 
 1. **`pre-invocation`**: Records the root orchestrator conversation ID, injects a subagent context isolation reminder into worker subagents, and deduplicates warnings per invocation.
 2. **`pre-tool`**:
@@ -167,13 +171,19 @@ Inspect, verify, or recover the orchestrator guard state from the command line:
 
 ```bash
 # View active subagents, pending spawns, direct budget, receipts, and circuit breaker
-python3 .agents/plugins/pro-orchestrator/scripts/orchestrator_guard.py status
+python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py status
+
+# Activate guard enforcement for the current session
+python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py activate
+
+# Deactivate guard enforcement for the current session
+python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py deactivate
 
 # Reset session guard state to clean defaults
-python3 .agents/plugins/pro-orchestrator/scripts/orchestrator_guard.py reset
+python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py reset
 
 # Run diagnostic checks on hooks configuration and protocol rules
-python3 .agents/plugins/pro-orchestrator/scripts/orchestrator_guard.py doctor
+python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py doctor
 ```
 
 ---
@@ -194,15 +204,15 @@ This runs the unit test suite covering the lifecycle guard hooks (`tests/test_or
 
 ```text
 .
-├── AGENTS.md
 ├── README.md
 └── .agents/
     └── plugins/
-        └── pro-orchestrator/
+        └── philharmonic_orchestra/
             ├── hooks.json
             ├── plugin.json
-            ├── rules/
-            │   └── AGENTS.md
-            └── scripts/
-                └── orchestrator_guard.py
+            ├── scripts/
+            │   └── orchestrator_guard.py
+            └── skills/
+                └── philharmonic/
+                    └── SKILL.md
 ```

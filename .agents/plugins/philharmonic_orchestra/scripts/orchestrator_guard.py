@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic enforcement and workspace permission hook for Philharmonic (pro-orchestrator).
+"""Deterministic enforcement and workspace permission hook for Philharmonic (philharmonic_orchestra).
 
 Responsibilities:
 1. PreInvocation:
@@ -54,8 +54,6 @@ DEFAULT_MODEL_BY_TYPE = {
     "research": "flash",
     "researcher": "flash",
     "implementer": "flash",
-    "self": "flash",
-    "image-generator": "flash",
 }
 
 MUTATION_VERBS_RE = re.compile(
@@ -98,7 +96,6 @@ MUTATION_TOOLS = {"write_file", "edit_file"}
 FORBIDDEN_DIRECT_READ_RE = re.compile(
     r"(?:^|/)transcript(?:_full|[0-9a-zA-Z_\-]*)?\.jsonl$|\.log$", re.I
 )
-RAW_LOG_OR_TRANSCRIPT_RE = FORBIDDEN_DIRECT_READ_RE
 
 GIT_COMMAND_RE = re.compile(r"^\s*git\b")
 TEST_CMD_START_RE = re.compile(
@@ -265,6 +262,8 @@ def _current_invocation_key(payload: Dict[str, Any], state: Dict[str, Any]) -> s
 
 def _default_state() -> Dict[str, Any]:
     return {
+        "active": False,
+        "session_evaluated": False,
         "isolation_reminded_invocations": [],
         "recorded_spawn_calls": [],
         "pending_spawns": [],
@@ -277,8 +276,13 @@ def _default_state() -> Dict[str, Any]:
     }
 
 
-def _load_state(payload: Dict[str, Any]) -> Dict[str, Any]:
-    path = _state_file_path(payload)
+def _load_state(payload_or_path: Any) -> Dict[str, Any]:
+    if isinstance(payload_or_path, Path):
+        path = payload_or_path
+    elif isinstance(payload_or_path, str):
+        path = Path(payload_or_path)
+    else:
+        path = _state_file_path(payload_or_path)
     if path.exists():
         try:
             with open(path, encoding="utf-8") as fh:
@@ -288,10 +292,11 @@ def _load_state(payload: Dict[str, Any]) -> Dict[str, Any]:
                 finally:
                     fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
                 if isinstance(data, dict):
+                    defaults = _default_state()
+                    for k, v in defaults.items():
+                        data.setdefault(k, v)
                     data["isolation_reminded_invocations"] = (
-                        data.get("isolation_reminded_invocations")
-                        or data.get("warned_invocations")
-                        or []
+                        data.get("isolation_reminded_invocations") or []
                     )
                     return data
         except (OSError, json.JSONDecodeError):
@@ -311,8 +316,13 @@ def _prune_state(state: Dict[str, Any]) -> None:
             bucket.pop(old_key, None)
 
 
-def _save_state(payload: Dict[str, Any], state: Dict[str, Any]) -> None:
-    path = _state_file_path(payload)
+def _save_state(payload_or_path: Any, state: Dict[str, Any]) -> None:
+    if isinstance(payload_or_path, Path):
+        path = payload_or_path
+    elif isinstance(payload_or_path, str):
+        path = Path(payload_or_path)
+    else:
+        path = _state_file_path(payload_or_path)
     _prune_state(state)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -539,8 +549,68 @@ def _is_known_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
     return False
 
 
+SLASH_COMMAND_RE = re.compile(r"(?:^|[\s`'\"])/philharmonic(?:\b|$)", re.I)
+
+
+def _is_slash_command_triggered(payload: Dict[str, Any]) -> bool:
+    user_input = payload.get("lastUserInput")
+    if isinstance(user_input, str):
+        if SLASH_COMMAND_RE.search(user_input) or "skills/philharmonic/SKILL.md" in user_input:
+            return True
+
+    tool_call = payload.get("toolCall")
+    if isinstance(tool_call, dict):
+        tool_name = (tool_call.get("name") or "").lower()
+        if tool_name in {"read_file", "view_file"}:
+            args = tool_call.get("args") or {}
+            for key in ("Path", "FilePath", "file_path", "path", "AbsolutePath"):
+                val = args.get(key)
+                if isinstance(val, str) and val.replace("\\", "/").endswith("skills/philharmonic/SKILL.md"):
+                    return True
+    return False
+
+
+def _ensure_session_active(
+    payload: Dict[str, Any],
+    state: Dict[str, Any],
+    state_path: Optional[Path] = None,
+) -> bool:
+    if _is_slash_command_triggered(payload):
+        state["active"] = True
+        state["session_evaluated"] = True
+        if state_path is not None:
+            _save_state(state_path, state)
+        return True
+
+    if state.get("active") is True:
+        return True
+
+    if _is_known_subagent(payload, state):
+        state["active"] = True
+        state["session_evaluated"] = True
+        if state_path is not None:
+            _save_state(state_path, state)
+        return True
+
+    if "lastUserInput" in payload and payload.get("lastUserInput") is not None:
+        if not state.get("session_evaluated"):
+            state["session_evaluated"] = True
+            state["active"] = False
+            if state_path is not None:
+                _save_state(state_path, state)
+        return False
+
+    if state.get("session_evaluated") is True:
+        return bool(state.get("active", False))
+
+    return True
+
+
 def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
+    state_path = _state_file_path(payload)
     state = _load_state(payload)
+    if not _ensure_session_active(payload, state, state_path):
+        return {}
     cid = (payload.get("conversationId") or "").strip().lower()
 
     if not _is_known_subagent(payload, state):
@@ -592,7 +662,7 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
             {
                 "ephemeralMessage": (
                     "[ORCHESTRATOR GUARD] Subagent context isolation active: ignore root orchestrator "
-                    "delegation rules in AGENTS.md. Execute only your assigned TASK and RULES, and return "
+                    "delegation rules in SKILL.md. Execute only your assigned TASK and RULES, and return "
                     "strictly the 4-header REPORT FORMAT (STATUS, FILES_CHANGED, VERIFICATION, NOTES; "
                     "allowing up to 10 '-' bullet lines under NOTES and requiring inline error cause plus "
                     "file:// .log URI when BLOCKED or FAILED)."
@@ -797,9 +867,6 @@ def _is_root_orchestrator(
     return True
 
 
-_is_orchestrator_caller = _is_root_orchestrator
-
-
 def _is_artifact_or_worktree_path(target: str, payload: Dict[str, Any]) -> bool:
     """Return True if target is inside the conversation artifact/brain directory or a subagent worktree."""
     artifact_dir = payload.get("artifactDirectoryPath")
@@ -850,13 +917,7 @@ def _extract_target_path(tool_name: str, args: Dict[str, Any]) -> str:
         return str(args.get("Path") or args.get("DirectoryPath") or "")
     if tool_name in MUTATION_TOOLS:
         return str(args.get("Path") or "")
-    return str(
-        args.get("Path")
-        or args.get("SearchPath")
-        or args.get("SearchDirectory")
-        or args.get("DirectoryPath")
-        or ""
-    )
+    return ""
 
 
 def _check_and_record_direct_budget(
@@ -1210,11 +1271,15 @@ def _get_test_receipt(
 
 
 def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
+    state_path = _state_file_path(payload)
+    state = _load_state(payload)
+    if not _ensure_session_active(payload, state, state_path):
+        return {"decision": "allow"}
+
     tool_call = payload.get("toolCall", {})
     tool_name = tool_call.get("name", "")
     args = tool_call.get("args", {}) or {}
 
-    state = _load_state(payload)
     cb = _get_circuit_breaker(state, payload)
     if cb.get("tripped"):
         if tool_name in MUTATION_TOOLS:
@@ -1346,7 +1411,10 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
+    state_path = _state_file_path(payload)
     state = _load_state(payload)
+    if not _ensure_session_active(payload, state, state_path):
+        return {}
     tool_call = payload.get("toolCall", {})
     tool_name = tool_call.get("name", "")
     if tool_name == "invoke_subagent" and payload.get("error"):
@@ -1513,6 +1581,11 @@ def _get_workspace_git_diff(payload: Dict[str, Any]) -> str:
 
 
 def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
+    state_path = _state_file_path(payload)
+    state = _load_state(payload)
+    if not _ensure_session_active(payload, state, state_path):
+        return {}
+
     termination_reason = payload.get("terminationReason", "")
     if termination_reason in {
         "USER_CANCELED",
@@ -1526,7 +1599,6 @@ def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not payload.get("fullyIdle", True):
         return {"decision": "allow"}
 
-    state = _load_state(payload)
     _sync_subagents_from_transcript(payload, state)
 
     active_branches = [
@@ -1555,7 +1627,7 @@ def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
                 ),
             }
 
-    if not _is_orchestrator_caller(payload, state):
+    if not _is_root_orchestrator(payload, state):
         last_msg = _extract_last_model_response(payload)
         if last_msg is not None:
             report_err = validate_subagent_report(last_msg)
@@ -1646,6 +1718,7 @@ def _cli_status(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "projectRoot": str(PROJECT_ROOT),
         "stateFile": str(_state_file_path(payload)),
+        "active": bool(state.get("active", False)),
         "rootConversationId": state.get("root_conversation_id"),
         "currentInvocation": inv_key,
         "activeSubagents": state.get("subagents", {}),
@@ -1656,6 +1729,27 @@ def _cli_status(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _cli_toggle_active(payload: Dict[str, Any], active: bool) -> Dict[str, Any]:
+    state = _load_state(payload)
+    state_path = _state_file_path(payload)
+    state["active"] = active
+    state["session_evaluated"] = True
+    _save_state(state_path, state)
+    return {
+        "status": "activated" if active else "deactivated",
+        "active": active,
+        "state_path": str(state_path),
+    }
+
+
+def _cli_activate(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _cli_toggle_active(payload, True)
+
+
+def _cli_deactivate(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _cli_toggle_active(payload, False)
+
+
 def _cli_reset(payload: Dict[str, Any]) -> Dict[str, Any]:
     fresh = _default_state()
     _save_state(payload, fresh)
@@ -1664,41 +1758,43 @@ def _cli_reset(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _cli_doctor() -> Dict[str, Any]:
     plugin_hooks = (
-        PROJECT_ROOT / ".agents" / "plugins" / "pro-orchestrator" / "hooks.json"
+        PROJECT_ROOT / ".agents" / "plugins" / "philharmonic_orchestra" / "hooks.json"
     )
     workspace_hooks = PROJECT_ROOT / ".agents" / "hooks.json"
-    root_agents = PROJECT_ROOT / "AGENTS.md"
-    plugin_agents = (
+    skill_file = (
         PROJECT_ROOT
         / ".agents"
         / "plugins"
-        / "pro-orchestrator"
-        / "rules"
-        / "AGENTS.md"
+        / "philharmonic_orchestra"
+        / "skills"
+        / "philharmonic"
+        / "SKILL.md"
     )
     issues: List[str] = []
     if workspace_hooks.exists():
         try:
             wh_data = json.loads(workspace_hooks.read_text(encoding="utf-8"))
-            if wh_data.get("pro-orchestrator-guard", {}).get("enabled", True) is not False:
+            if wh_data.get("philharmonic_orchestra-guard", {}).get("enabled", True) is not False:
                 issues.append(
                     "Duplicate .agents/hooks.json is enabled alongside plugin hooks.json."
                 )
         except (OSError, json.JSONDecodeError):
             issues.append("Unreadable .agents/hooks.json.")
-    if root_agents.exists() and plugin_agents.exists():
+    if not skill_file.exists():
+        issues.append(
+            "Missing .agents/plugins/philharmonic_orchestra/skills/philharmonic/SKILL.md."
+        )
+    else:
         try:
-            if (
-                root_agents.read_text(encoding="utf-8")
-                != plugin_agents.read_text(encoding="utf-8")
-            ):
+            skill_content = skill_file.read_text(encoding="utf-8")
+            if "name: philharmonic" not in skill_content:
                 issues.append(
-                    "Root AGENTS.md content diverges from .agents/plugins/pro-orchestrator/rules/AGENTS.md."
+                    "Skill SKILL.md does not contain 'name: philharmonic'."
                 )
         except OSError:
-            issues.append("Unable to compare AGENTS.md files.")
+            issues.append("Unable to read SKILL.md.")
     return {
-        "healthy": len(issues) == 0 and plugin_hooks.exists(),
+        "healthy": len(issues) == 0 and plugin_hooks.exists() and skill_file.exists(),
         "pluginHooksPresent": plugin_hooks.exists(),
         "issues": issues,
     }
@@ -1720,6 +1816,12 @@ def main() -> None:
         return
     if mode == "reset":
         json.dump(_cli_reset(payload), sys.stdout, indent=2)
+        return
+    if mode == "activate":
+        json.dump(_cli_activate(payload), sys.stdout, indent=2)
+        return
+    if mode == "deactivate":
+        json.dump(_cli_deactivate(payload), sys.stdout, indent=2)
         return
 
     if mode == "pre-invocation":

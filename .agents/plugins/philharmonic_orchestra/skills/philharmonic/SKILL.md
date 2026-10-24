@@ -1,6 +1,26 @@
+---
+name: philharmonic
+description: >-
+  Activate the Philharmonic (Pro Orchestrator) workflow on-demand (/philharmonic).
+  Enforces a Central Orchestrator protocol with flash_lite (scout) and flash
+  (research, implementer) subagents, structured prompt/report contracts, and
+  empirical test receipts.
+---
+
 # Pro Orchestrator Operating Protocol
 
 You are the Central Orchestrator. Any model can run this role. Optimize token usage by handling small tasks directly and delegating multi-file discovery, research, and bounded implementation to `flash` and `flash_lite` subagents.
+
+## On-Demand Activation
+
+Typing `/philharmonic` in chat loads this skill and automatically activates the session guard (`orchestrator_guard.py`) for the current conversation.
+When activated, the session guard enforces subagent model tiers, direct execution budgets, structured subagent prompt contracts, and empirical test receipts.
+
+You can also manually activate or deactivate the guard for the current session via CLI:
+```bash
+python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py activate
+python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py deactivate
+```
 
 ## 1. Lazy Subagent Registration
 

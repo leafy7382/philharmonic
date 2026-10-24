@@ -12,7 +12,7 @@ SCRIPT_DIR = (
     Path(__file__).resolve().parent.parent
     / ".agents"
     / "plugins"
-    / "pro-orchestrator"
+    / "philharmonic_orchestra"
     / "scripts"
 )
 if str(SCRIPT_DIR) not in sys.path:
@@ -2055,6 +2055,7 @@ NOTES: <one sentence summarizing findings>
         status_res = orchestrator_guard._cli_status(self.base_payload)
         self.assertIn("projectRoot", status_res)
         self.assertIn("stateFile", status_res)
+        self.assertIn("active", status_res)
         self.assertIn("currentInvocation", status_res)
         self.assertIn("directBudget", status_res)
         self.assertIn("testReceipt", status_res)
@@ -2066,6 +2067,150 @@ NOTES: <one sentence summarizing findings>
         self.assertIn("issues", doctor_res)
         self.assertTrue(doctor_res["pluginHooksPresent"])
         self.assertIsInstance(doctor_res["issues"], list)
+
+    def test_inactive_session_on_normal_chat(self) -> None:
+        normal_payload = dict(
+            self.base_payload,
+            lastUserInput="normal chat message",
+            toolCall={
+                "name": "read_file",
+                "args": {"Path": str(orchestrator_guard.PROJECT_ROOT / "README.md")},
+            },
+        )
+        # handle_pre_invocation returns {}
+        res_pre_inv = orchestrator_guard.handle_pre_invocation(normal_payload)
+        self.assertEqual(res_pre_inv, {})
+
+        state = orchestrator_guard._load_state(normal_payload)
+        self.assertFalse(state.get("active"))
+        self.assertTrue(state.get("session_evaluated"))
+
+        # handle_pre_tool returns {"decision": "allow"}
+        res_pre_tool = orchestrator_guard.handle_pre_tool(normal_payload)
+        self.assertEqual(res_pre_tool, {"decision": "allow"})
+
+        # handle_post_tool returns {}
+        res_post_tool = orchestrator_guard.handle_post_tool(normal_payload)
+        self.assertEqual(res_post_tool, {})
+
+        # handle_stop returns {}
+        stop_payload = dict(
+            normal_payload,
+            fullyIdle=True,
+            terminationReason="NO_TOOL_CALL",
+        )
+        res_stop = orchestrator_guard.handle_stop(stop_payload)
+        self.assertEqual(res_stop, {})
+
+    def test_slash_command_activation_and_persistence_across_turns(self) -> None:
+        slash_payload = dict(
+            self.base_payload,
+            lastUserInput="/philharmonic implement feature X",
+            invocationNum=1,
+        )
+        res_inv1 = orchestrator_guard.handle_pre_invocation(slash_payload)
+        self.assertEqual(res_inv1, {})
+
+        state = orchestrator_guard._load_state(slash_payload)
+        self.assertTrue(state.get("active"))
+        self.assertTrue(state.get("session_evaluated"))
+
+        # Subsequent turn with normal message preserves activation
+        turn2_payload = dict(
+            self.base_payload,
+            lastUserInput="now run the tests",
+            invocationNum=2,
+        )
+        res_inv2 = orchestrator_guard.handle_pre_invocation(turn2_payload)
+        self.assertEqual(res_inv2, {})
+
+        state2 = orchestrator_guard._load_state(turn2_payload)
+        self.assertTrue(state2.get("active"))
+
+        # In active session, pre_tool allows valid tool calls and enforces limits
+        tool_payload = dict(
+            turn2_payload,
+            toolCall={
+                "name": "read_file",
+                "args": {"Path": str(orchestrator_guard.PROJECT_ROOT / "README.md")},
+            },
+        )
+        res_tool = orchestrator_guard.handle_pre_tool(tool_payload)
+        self.assertEqual(res_tool, {"decision": "allow"})
+
+    def test_reading_skill_file_activates_inactive_session(self) -> None:
+        normal_payload = dict(
+            self.base_payload,
+            lastUserInput="please look up some instructions",
+        )
+        orchestrator_guard.handle_pre_invocation(normal_payload)
+        state_before = orchestrator_guard._load_state(normal_payload)
+        self.assertFalse(state_before.get("active"))
+
+        # Agent reads the philharmonic SKILL.md file
+        read_skill_payload = dict(
+            self.base_payload,
+            toolCall={
+                "name": "read_file",
+                "args": {
+                    "Path": str(
+                        orchestrator_guard.PROJECT_ROOT
+                        / ".agents"
+                        / "plugins"
+                        / "philharmonic_orchestra"
+                        / "skills"
+                        / "philharmonic"
+                        / "SKILL.md"
+                    )
+                },
+            },
+        )
+        res_pre_tool = orchestrator_guard.handle_pre_tool(read_skill_payload)
+        self.assertEqual(res_pre_tool, {"decision": "allow"})
+
+        state_after = orchestrator_guard._load_state(self.base_payload)
+        self.assertTrue(state_after.get("active"))
+        self.assertTrue(state_after.get("session_evaluated"))
+
+    def test_cli_activate_and_deactivate_modes(self) -> None:
+        # CLI activate
+        act_res = orchestrator_guard._cli_activate(self.base_payload)
+        self.assertEqual(act_res["status"], "activated")
+        self.assertTrue(act_res["active"])
+        self.assertIn("state_path", act_res)
+
+        status_res = orchestrator_guard._cli_status(self.base_payload)
+        self.assertTrue(status_res["active"])
+
+        # CLI deactivate
+        deact_res = orchestrator_guard._cli_deactivate(self.base_payload)
+        self.assertEqual(deact_res["status"], "deactivated")
+        self.assertFalse(deact_res["active"])
+
+        status_res2 = orchestrator_guard._cli_status(self.base_payload)
+        self.assertFalse(status_res2["active"])
+
+    def test_philharmonic_skill_file_exists_and_valid_frontmatter(self) -> None:
+        skill_path = (
+            orchestrator_guard.PROJECT_ROOT
+            / ".agents"
+            / "plugins"
+            / "philharmonic_orchestra"
+            / "skills"
+            / "philharmonic"
+            / "SKILL.md"
+        )
+        self.assertTrue(skill_path.exists())
+        content = skill_path.read_text(encoding="utf-8")
+        self.assertTrue(content.startswith("---"))
+        self.assertIn("name: philharmonic", content)
+        self.assertIn("description:", content)
+        self.assertIn("## On-Demand Activation", content)
+        self.assertIn("## 1. Lazy Subagent Registration", content)
+        self.assertIn("## 2. Token-Optimal Dispatch and Model Selection Rules", content)
+        self.assertIn("## 3. Structured Subagent Prompt Contract", content)
+        self.assertIn("## 4. Reactive Coordination and Context Hygiene", content)
+        self.assertIn("## 5. Empirical Test Receipts, Circuit Breaker, and Diff Audit", content)
 
 
 if __name__ == "__main__":

@@ -1,1 +1,0 @@
-.agents/plugins/pro-orchestrator/rules/AGENTS.md
