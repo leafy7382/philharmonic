@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for orchestrator_guard.py and ste_lint.py."""
+"""Unit tests for orchestrator_guard.py."""
 
 import json
 from pathlib import Path
@@ -19,7 +19,6 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import orchestrator_guard  # noqa: E402
-import ste_lint  # noqa: E402
 
 
 VALID_PROMPT = """TASK: Add input length check to `parse_token` in `src/auth/parser.py`.
@@ -173,30 +172,30 @@ class TestOrchestratorGuard(unittest.TestCase):
             toolCall={
                 "name": "define_subagent",
                 "args": {
-                    "name": "scout",
-                    "enable_subagent_tools": True,
+                    "Name": "scout",
+                    "EnableSubagentTools": True,
                 },
             },
         )
         res = orchestrator_guard.handle_pre_tool(payload)
         self.assertEqual(res["decision"], "allow")
-        self.assertEqual(res["overwrite"], {"enable_subagent_tools": False})
+        self.assertEqual(res["overwrite"], {"EnableSubagentTools": False})
 
-        # Research subagent with enable_subagent_tools: True is allowed with enable_subagent_tools: False
+        # Research subagent with EnableSubagentTools: True is allowed with EnableSubagentTools: False
         payload_research = dict(
             self.base_payload,
             toolCall={
                 "name": "define_subagent",
                 "args": {
-                    "name": "research",
-                    "enable_write_tools": True,
-                    "enable_subagent_tools": True,
+                    "Name": "research",
+                    "EnableWriteTools": True,
+                    "EnableSubagentTools": True,
                 },
             },
         )
         res_research = orchestrator_guard.handle_pre_tool(payload_research)
         self.assertEqual(res_research["decision"], "allow")
-        self.assertEqual(res_research["overwrite"], {"enable_subagent_tools": False})
+        self.assertEqual(res_research["overwrite"], {"EnableSubagentTools": False})
 
     def test_invoke_subagent_blocks_pro_model(self) -> None:
         payload = dict(
@@ -204,14 +203,10 @@ class TestOrchestratorGuard(unittest.TestCase):
             toolCall={
                 "name": "invoke_subagent",
                 "args": {
-                    "Subagents": [
-                        {
-                            "TypeName": "implementer",
-                            "Role": "Auth Implementer",
-                            "Model": "pro",
-                            "Prompt": VALID_PROMPT,
-                        }
-                    ]
+                    "TypeName": "implementer",
+                    "Role": "Auth Implementer",
+                    "Model": "pro",
+                    "Prompt": VALID_PROMPT,
                 },
             },
         )
@@ -220,57 +215,86 @@ class TestOrchestratorGuard(unittest.TestCase):
         self.assertIn("Model='pro'", res["reason"])
 
     def test_invoke_subagent_rewrites_inherit_to_tier_defaults(self) -> None:
-        payload = dict(
+        payload_scout = dict(
             self.base_payload,
             toolCall={
                 "name": "invoke_subagent",
                 "args": {
-                    "Subagents": [
-                        {
-                            "TypeName": "scout",
-                            "Role": "Symbol Scout",
-                            "Model": "inherit",
-                            "Prompt": VALID_PROMPT,
-                        },
-                        {
-                            "TypeName": "implementer",
-                            "Role": "Code Worker",
-                            "Prompt": VALID_PROMPT,
-                        },
-                    ]
+                    "TypeName": "scout",
+                    "Role": "Symbol Scout",
+                    "Model": "inherit",
+                    "Prompt": VALID_PROMPT,
                 },
             },
         )
-        res = orchestrator_guard.handle_pre_tool(payload)
-        self.assertEqual(res["decision"], "allow")
-        rewritten = res["overwrite"]["Subagents"]
-        self.assertEqual(rewritten[0]["Model"], "flash_lite")
-        self.assertEqual(rewritten[1]["Model"], "flash")
+        res_scout = orchestrator_guard.handle_pre_tool(payload_scout)
+        self.assertEqual(res_scout["decision"], "allow")
+        self.assertEqual(res_scout["overwrite"]["Model"], "flash_lite")
 
-    def test_ste100_lint_gate_blocks_violations(self) -> None:
-        bad_prompt = (
-            "TASK: Spin up the parser; perform an analysis of the seamless token.\n"
-        )
-        payload = dict(
+        payload_impl = dict(
             self.base_payload,
             toolCall={
                 "name": "invoke_subagent",
                 "args": {
-                    "Subagents": [
-                        {
-                            "TypeName": "scout",
-                            "Role": "Bad Scout",
-                            "Model": "flash_lite",
-                            "Prompt": bad_prompt,
-                        }
-                    ]
+                    "TypeName": "implementer",
+                    "Role": "Code Worker",
+                    "Prompt": VALID_PROMPT,
                 },
             },
         )
-        res = orchestrator_guard.handle_pre_tool(payload)
-        self.assertEqual(res["decision"], "deny")
-        self.assertIn("[STE-100 LINT GATE]", res["reason"])
-        self.assertIn("semicolon", res["reason"])
+        res_impl = orchestrator_guard.handle_pre_tool(payload_impl)
+        self.assertEqual(res_impl["decision"], "allow")
+        self.assertEqual(res_impl["overwrite"]["Model"], "flash")
+
+    def test_invoke_subagent_and_send_message_reject_empty_prompts(self) -> None:
+        # Empty Prompt in invoke_subagent is blocked
+        empty_prompt_payload = dict(
+            self.base_payload,
+            toolCall={
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "scout",
+                    "Role": "Empty Scout",
+                    "Model": "flash_lite",
+                    "Prompt": "   ",
+                },
+            },
+        )
+        res_empty_prompt = orchestrator_guard.handle_pre_tool(empty_prompt_payload)
+        self.assertEqual(res_empty_prompt["decision"], "deny")
+        self.assertIn("non-empty 'Prompt'", res_empty_prompt["reason"])
+
+        # Empty TypeName in invoke_subagent is blocked
+        empty_type_payload = dict(
+            self.base_payload,
+            toolCall={
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "",
+                    "Role": "No Type",
+                    "Model": "flash_lite",
+                    "Prompt": VALID_PROMPT,
+                },
+            },
+        )
+        res_empty_type = orchestrator_guard.handle_pre_tool(empty_type_payload)
+        self.assertEqual(res_empty_type["decision"], "deny")
+        self.assertIn("non-empty 'TypeName'", res_empty_type["reason"])
+
+        # Empty Message in send_message is blocked
+        empty_msg_payload = dict(
+            self.base_payload,
+            toolCall={
+                "name": "send_message",
+                "args": {
+                    "Recipient": "worker-1",
+                    "Message": "   ",
+                },
+            },
+        )
+        res_empty_msg = orchestrator_guard.handle_pre_tool(empty_msg_payload)
+        self.assertEqual(res_empty_msg["decision"], "deny")
+        self.assertIn("Message cannot be empty", res_empty_msg["reason"])
 
     def test_send_message_tier_bypass_blocked_for_flash_lite(self) -> None:
         scout_cid = "11111111-2222-3333-4444-555555555555"
@@ -409,15 +433,11 @@ class TestOrchestratorGuard(unittest.TestCase):
             toolCall={
                 "name": "invoke_subagent",
                 "args": {
-                    "Subagents": [
-                        {
-                            "TypeName": "implementer",
-                            "Role": "Failed Branch Worker",
-                            "Model": "flash",
-                            "Workspace": "branch",
-                            "Prompt": VALID_PROMPT,
-                        }
-                    ]
+                    "TypeName": "implementer",
+                    "Role": "Failed Branch Worker",
+                    "Model": "flash",
+                    "Workspace": "branch",
+                    "Prompt": VALID_PROMPT,
                 },
             },
         )
@@ -449,14 +469,10 @@ class TestOrchestratorGuard(unittest.TestCase):
             toolCall={
                 "name": "invoke_subagent",
                 "args": {
-                    "Subagents": [
-                        {
-                            "TypeName": "scout",
-                            "Role": "Symbol Scout",
-                            "Model": "flash_lite",
-                            "Prompt": VALID_PROMPT,
-                        }
-                    ]
+                    "TypeName": "scout",
+                    "Role": "Symbol Scout",
+                    "Model": "flash_lite",
+                    "Prompt": VALID_PROMPT,
                 },
             },
         )
@@ -528,34 +544,39 @@ FILES_CHANGED: NONE
 VERIFICATION: Inspected all three authentication modules.
 NOTES: <one sentence summarizing findings>
 """
-        payload = dict(
+        payload_simple = dict(
             self.base_payload,
             toolCall={
-                "id": "call_downgrade_test",
+                "id": "call_downgrade_1",
                 "name": "invoke_subagent",
                 "args": {
-                    "Subagents": [
-                        {
-                            "TypeName": "research",
-                            "Role": "Quick Reader",
-                            "Model": "flash",
-                            "Prompt": simple_read_prompt,
-                        },
-                        {
-                            "TypeName": "research",
-                            "Role": "Deep Researcher",
-                            "Model": "flash",
-                            "Prompt": multi_step_read_prompt,
-                        },
-                    ]
+                    "TypeName": "research",
+                    "Role": "Quick Reader",
+                    "Model": "flash",
+                    "Prompt": simple_read_prompt,
                 },
             },
         )
-        res = orchestrator_guard.handle_pre_tool(payload)
-        self.assertEqual(res["decision"], "allow")
-        rewritten = res["overwrite"]["Subagents"]
-        self.assertEqual(rewritten[0]["Model"], "flash_lite")
-        self.assertEqual(rewritten[1]["Model"], "flash")
+        res_simple = orchestrator_guard.handle_pre_tool(payload_simple)
+        self.assertEqual(res_simple["decision"], "allow")
+        self.assertEqual(res_simple["overwrite"]["Model"], "flash_lite")
+
+        payload_deep = dict(
+            self.base_payload,
+            toolCall={
+                "id": "call_downgrade_2",
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "research",
+                    "Role": "Deep Researcher",
+                    "Model": "flash",
+                    "Prompt": multi_step_read_prompt,
+                },
+            },
+        )
+        res_deep = orchestrator_guard.handle_pre_tool(payload_deep)
+        self.assertEqual(res_deep["decision"], "allow")
+        self.assertIsNone(res_deep.get("overwrite"))
 
     def test_pending_spawns_deduplicated_across_duplicate_pre_tool_hooks(self) -> None:
         payload = dict(
@@ -564,14 +585,10 @@ NOTES: <one sentence summarizing findings>
                 "id": "call_dedup_1",
                 "name": "invoke_subagent",
                 "args": {
-                    "Subagents": [
-                        {
-                            "TypeName": "scout",
-                            "Role": "Dedup Scout",
-                            "Model": "flash_lite",
-                            "Prompt": VALID_PROMPT,
-                        }
-                    ]
+                    "TypeName": "scout",
+                    "Role": "Dedup Scout",
+                    "Model": "flash_lite",
+                    "Prompt": VALID_PROMPT,
                 },
             },
         )
@@ -595,8 +612,8 @@ NOTES: <one sentence summarizing findings>
             self.base_payload,
             artifactDirectoryPath=str(subagent_brain),
             toolCall={
-                "name": "write_to_file",
-                "args": {"TargetFile": str(parent_scratch)},
+                "name": "write_file",
+                "args": {"Path": str(parent_scratch)},
             },
         )
         self.assertEqual(
@@ -607,8 +624,8 @@ NOTES: <one sentence summarizing findings>
             self.base_payload,
             artifactDirectoryPath=str(subagent_brain),
             toolCall={
-                "name": "write_to_file",
-                "args": {"TargetFile": str(worktree_file)},
+                "name": "write_file",
+                "args": {"Path": str(worktree_file)},
             },
         )
         self.assertEqual(
@@ -623,8 +640,8 @@ NOTES: <one sentence summarizing findings>
         payload1 = dict(
             self.base_payload,
             toolCall={
-                "name": "write_to_file",
-                "args": {"TargetFile": file1},
+                "name": "write_file",
+                "args": {"Path": file1},
             },
         )
         self.assertEqual(orchestrator_guard.handle_pre_tool(payload1)["decision"], "allow")
@@ -632,8 +649,8 @@ NOTES: <one sentence summarizing findings>
         payload1_repeat = dict(
             self.base_payload,
             toolCall={
-                "name": "replace_file_content",
-                "args": {"TargetFile": file1},
+                "name": "edit_file",
+                "args": {"Path": file1},
             },
         )
         self.assertEqual(
@@ -643,8 +660,8 @@ NOTES: <one sentence summarizing findings>
         payload2 = dict(
             self.base_payload,
             toolCall={
-                "name": "write_to_file",
-                "args": {"TargetFile": file2},
+                "name": "write_file",
+                "args": {"Path": file2},
             },
         )
         self.assertEqual(orchestrator_guard.handle_pre_tool(payload2)["decision"], "allow")
@@ -652,8 +669,8 @@ NOTES: <one sentence summarizing findings>
         payload2_repeat = dict(
             self.base_payload,
             toolCall={
-                "name": "replace_file_content",
-                "args": {"TargetFile": file2},
+                "name": "edit_file",
+                "args": {"Path": file2},
             },
         )
         self.assertEqual(
@@ -663,8 +680,8 @@ NOTES: <one sentence summarizing findings>
         payload3 = dict(
             self.base_payload,
             toolCall={
-                "name": "write_to_file",
-                "args": {"TargetFile": file3},
+                "name": "write_file",
+                "args": {"Path": file3},
             },
         )
         res3 = orchestrator_guard.handle_pre_tool(payload3)
@@ -683,8 +700,8 @@ NOTES: <one sentence summarizing findings>
             conversationId=subagent_cid,
             modelName="gemini-3-flash",
             toolCall={
-                "name": "write_to_file",
-                "args": {"TargetFile": file3},
+                "name": "write_file",
+                "args": {"Path": file3},
             },
         )
         res_sub = orchestrator_guard.handle_pre_tool(subagent_payload)
@@ -695,8 +712,8 @@ NOTES: <one sentence summarizing findings>
         payload_write = dict(
             self.base_payload,
             toolCall={
-                "name": "write_to_file",
-                "args": {"TargetFile": file1},
+                "name": "write_file",
+                "args": {"Path": file1},
             },
         )
         self.assertEqual(
@@ -717,9 +734,10 @@ NOTES: <one sentence summarizing findings>
             orchestrator_guard.handle_pre_tool(git_payload)["decision"], "allow"
         )
 
-        test_payload = dict(
+        test_payload_1 = dict(
             self.base_payload,
             toolCall={
+                "id": "test_1",
                 "name": "run_command",
                 "args": {
                     "CommandLine": "python3 -m unittest discover -s tests",
@@ -727,9 +745,34 @@ NOTES: <one sentence summarizing findings>
                 },
             },
         )
-        res_test = orchestrator_guard.handle_pre_tool(test_payload)
-        self.assertEqual(res_test["decision"], "deny")
-        self.assertIn("[ORCHESTRATOR GUARD]", res_test["reason"])
+        res_test_1 = orchestrator_guard.handle_pre_tool(test_payload_1)
+        self.assertEqual(res_test_1["decision"], "allow")
+
+        test_payload_2 = dict(
+            self.base_payload,
+            toolCall={
+                "id": "test_2",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "python3 -m unittest discover -s tests",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+        )
+        res_test_2 = orchestrator_guard.handle_pre_tool(test_payload_2)
+        self.assertEqual(res_test_2["decision"], "deny")
+        self.assertIn("[ORCHESTRATOR GUARD]", res_test_2["reason"])
+
+        subsequent_write = dict(
+            self.base_payload,
+            toolCall={
+                "name": "write_file",
+                "args": {"Path": file1},
+            },
+        )
+        res_subsequent_write = orchestrator_guard.handle_pre_tool(subsequent_write)
+        self.assertEqual(res_subsequent_write["decision"], "deny")
+        self.assertIn("[ORCHESTRATOR GUARD]", res_subsequent_write["reason"])
 
     def test_direct_command_budget_blocks_third_command_and_deduplicates(self) -> None:
         payload_cmd1 = dict(
@@ -804,8 +847,8 @@ NOTES: <one sentence summarizing findings>
         edit_payload = dict(
             self.base_payload,
             toolCall={
-                "name": "write_to_file",
-                "args": {"TargetFile": code_file, "CodeContent": "print('hello')"},
+                "name": "write_file",
+                "args": {"Path": code_file, "Content": "print('hello')"},
             },
         )
         self.assertEqual(
@@ -919,10 +962,10 @@ NOTES: <one sentence summarizing findings>
         edit_code = dict(
             self.base_payload,
             toolCall={
-                "name": "write_to_file",
+                "name": "write_file",
                 "args": {
-                    "TargetFile": str(orchestrator_guard.PROJECT_ROOT / "src" / "app.py"),
-                    "CodeContent": "print('retry')",
+                    "Path": str(orchestrator_guard.PROJECT_ROOT / "src" / "app.py"),
+                    "Content": "print('retry')",
                 },
             },
         )
@@ -935,10 +978,10 @@ NOTES: <one sentence summarizing findings>
         scratch_write = dict(
             self.base_payload,
             toolCall={
-                "name": "write_to_file",
+                "name": "write_file",
                 "args": {
-                    "TargetFile": scratch_log,
-                    "CodeContent": "Traceback: test failed twice",
+                    "Path": scratch_log,
+                    "Content": "Traceback: test failed twice",
                 },
             },
         )
@@ -961,13 +1004,11 @@ NOTES: <one sentence summarizing findings>
         payload_del_assert = dict(
             self.base_payload,
             toolCall={
-                "name": "replace_file_content",
+                "name": "edit_file",
                 "args": {
-                    "TargetFile": test_file,
-                    "TargetContent": "        self.assertEqual(a, b)\n",
-                    "ReplacementContent": "",
-                    "StartLine": 10,
-                    "EndLine": 11,
+                    "Path": test_file,
+                    "Target": "        self.assertEqual(a, b)\n",
+                    "Replacement": "",
                 },
             },
         )
@@ -979,13 +1020,11 @@ NOTES: <one sentence summarizing findings>
         payload_del_test = dict(
             self.base_payload,
             toolCall={
-                "name": "replace_file_content",
+                "name": "edit_file",
                 "args": {
-                    "TargetFile": test_file,
-                    "TargetContent": "    def test_login(self):\n        pass\n",
-                    "ReplacementContent": "",
-                    "StartLine": 5,
-                    "EndLine": 7,
+                    "Path": test_file,
+                    "Target": "    def test_login(self):\n        pass\n",
+                    "Replacement": "",
                 },
             },
         )
@@ -998,13 +1037,11 @@ NOTES: <one sentence summarizing findings>
         payload_add_skip = dict(
             self.base_payload,
             toolCall={
-                "name": "replace_file_content",
+                "name": "edit_file",
                 "args": {
-                    "TargetFile": test_file,
-                    "TargetContent": "    def test_login(self):",
-                    "ReplacementContent": f"    {skip_marker}\n    def test_login(self):",
-                    "StartLine": 5,
-                    "EndLine": 6,
+                    "Path": test_file,
+                    "Target": "    def test_login(self):",
+                    "Replacement": f"    {skip_marker}\n    def test_login(self):",
                 },
             },
         )
@@ -1017,13 +1054,11 @@ NOTES: <one sentence summarizing findings>
         payload_trivial = dict(
             self.base_payload,
             toolCall={
-                "name": "replace_file_content",
+                "name": "edit_file",
                 "args": {
-                    "TargetFile": test_file,
-                    "TargetContent": "        self.assertEqual(a, b)",
-                    "ReplacementContent": f"        {trivial_assert}",
-                    "StartLine": 10,
-                    "EndLine": 11,
+                    "Path": test_file,
+                    "Target": "        self.assertEqual(a, b)",
+                    "Replacement": f"        {trivial_assert}",
                 },
             },
         )
@@ -1035,18 +1070,16 @@ NOTES: <one sentence summarizing findings>
         payload_add_test = dict(
             self.base_payload,
             toolCall={
-                "name": "replace_file_content",
+                "name": "edit_file",
                 "args": {
-                    "TargetFile": test_file,
-                    "TargetContent": "    def test_existing(self):\n        self.assertEqual(1, 1)",
-                    "ReplacementContent": (
+                    "Path": test_file,
+                    "Target": "    def test_existing(self):\n        self.assertEqual(1, 1)",
+                    "Replacement": (
                         "    def test_existing(self):\n"
                         "        self.assertEqual(1, 1)\n\n"
                         "    def test_new(self):\n"
                         "        self.assertEqual(2, 2)"
                     ),
-                    "StartLine": 15,
-                    "EndLine": 17,
                 },
             },
         )
@@ -1265,8 +1298,8 @@ NOTES: <one sentence summarizing findings>
                 self.base_payload,
                 modelName=model,
                 toolCall={
-                    "name": "view_file",
-                    "args": {"AbsolutePath": path},
+                    "name": "read_file",
+                    "args": {"Path": path},
                 },
             )
             if cid:
@@ -1327,13 +1360,13 @@ NOTES: <one sentence summarizing findings>
         f2 = str(orchestrator_guard.PROJECT_ROOT / "root_f2.txt")
         f3 = str(orchestrator_guard.PROJECT_ROOT / "root_f3.txt")
 
-        p1 = dict(payload, toolCall={"name": "write_to_file", "args": {"TargetFile": f1}})
+        p1 = dict(payload, toolCall={"name": "write_file", "args": {"Path": f1}})
         self.assertEqual(orchestrator_guard.handle_pre_tool(p1)["decision"], "allow")
 
-        p2 = dict(payload, toolCall={"name": "write_to_file", "args": {"TargetFile": f2}})
+        p2 = dict(payload, toolCall={"name": "write_file", "args": {"Path": f2}})
         self.assertEqual(orchestrator_guard.handle_pre_tool(p2)["decision"], "allow")
 
-        p3 = dict(payload, toolCall={"name": "write_to_file", "args": {"TargetFile": f3}})
+        p3 = dict(payload, toolCall={"name": "write_file", "args": {"Path": f3}})
         res3 = orchestrator_guard.handle_pre_tool(p3)
         self.assertEqual(res3["decision"], "deny")
         self.assertIn("[ORCHESTRATOR GUARD]", res3["reason"])
@@ -1360,10 +1393,10 @@ NOTES: <one sentence summarizing findings>
             self.base_payload,
             conversationId=sub_cid,
             toolCall={
-                "name": "write_to_file",
+                "name": "write_file",
                 "args": {
-                    "TargetFile": scratch_file,
-                    "CodeContent": "# Research Findings\nAnalysis summary.",
+                    "Path": scratch_file,
+                    "Content": "# Research Findings\nAnalysis summary.",
                 },
             },
         )
@@ -1375,10 +1408,10 @@ NOTES: <one sentence summarizing findings>
             self.base_payload,
             conversationId=sub_cid,
             toolCall={
-                "name": "write_to_file",
+                "name": "write_file",
                 "args": {
-                    "TargetFile": workspace_file,
-                    "CodeContent": "# Workspace mutation",
+                    "Path": workspace_file,
+                    "Content": "# Workspace mutation",
                 },
             },
         )
@@ -1453,10 +1486,10 @@ NOTES: <one sentence summarizing findings>
         sub_write_scratch = dict(
             sub_payload,
             toolCall={
-                "name": "write_to_file",
+                "name": "write_file",
                 "args": {
-                    "TargetFile": brief_file,
-                    "CodeContent": "# Sibling Research Brief\nContent here.",
+                    "Path": brief_file,
+                    "Content": "# Sibling Research Brief\nContent here.",
                 },
             },
         )
@@ -1467,10 +1500,10 @@ NOTES: <one sentence summarizing findings>
         sub_write_workspace = dict(
             sub_payload,
             toolCall={
-                "name": "write_to_file",
+                "name": "write_file",
                 "args": {
-                    "TargetFile": workspace_file,
-                    "CodeContent": "x = 42\n",
+                    "Path": workspace_file,
+                    "Content": "x = 42\n",
                 },
             },
         )
@@ -1583,6 +1616,113 @@ NOTES: <one sentence summarizing findings>
         self.assertIn("4", state_after.get("direct_budget", {}))
         self.assertEqual(len(state_after["direct_budget"]["4"]["commands"]), 1)
 
+        # Verify protojson zero (0, "0") is treated as unpopulated in _current_invocation_key
+        # and falls back to persisted current_invocation_num (which is 4)
+        self.assertEqual(
+            orchestrator_guard._current_invocation_key({"invocationNum": 0}, state_after),
+            "4",
+        )
+        self.assertEqual(
+            orchestrator_guard._current_invocation_key({"invocationNum": "0"}, state_after),
+            "4",
+        )
+        self.assertEqual(
+            orchestrator_guard._current_invocation_key({"invocationNum": 0}, {"current_invocation_num": 5}),
+            "5",
+        )
+        self.assertEqual(
+            orchestrator_guard._current_invocation_key({"invocationNum": None}, state_after),
+            "4",
+        )
+        self.assertEqual(
+            orchestrator_guard._current_invocation_key({}, state_after),
+            "4",
+        )
+        self.assertEqual(
+            orchestrator_guard._current_invocation_key({"invocationNum": 7}, state_after),
+            "7",
+        )
+        self.assertEqual(
+            orchestrator_guard._current_invocation_key({"invocationNum": "7"}, state_after),
+            "7",
+        )
+        self.assertEqual(
+            orchestrator_guard._current_invocation_key({"invocationNum": 0}, {"current_invocation_num": 0}),
+            "0",
+        )
+        self.assertEqual(
+            orchestrator_guard._current_invocation_key({"invocationNum": "0"}, {"current_invocation_num": 0}),
+            "0",
+        )
+
+        # Tool call with protojson zero (0 or "0") uses current invocation bucket (4)
+        cmd_payload_proto0 = dict(
+            self.base_payload,
+            invocationNum=0,
+            toolCall={
+                "id": "cmd_proto0",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "echo 'proto0 cmd'",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+        )
+        res_proto0 = orchestrator_guard.handle_pre_tool(cmd_payload_proto0)
+        self.assertEqual(res_proto0.get("decision"), "allow")
+        state_after_proto0 = orchestrator_guard._load_state(self.base_payload)
+        self.assertEqual(len(state_after_proto0["direct_budget"]["4"]["commands"]), 2)
+        self.assertNotIn("0", state_after_proto0.get("direct_budget", {}))
+
+        # Calling handle_pre_invocation resets direct_budget for that invocation and "0"
+        state_pre_reset = orchestrator_guard._load_state(self.base_payload)
+        state_pre_reset["direct_budget"]["5"] = {"commands": ["old_cmd_5"]}
+        state_pre_reset["direct_budget"]["0"] = {"commands": ["old_cmd_0"]}
+        orchestrator_guard._save_state(self.base_payload, state_pre_reset)
+
+        payload_inv5 = dict(self.base_payload, invocationNum=5)
+        orchestrator_guard.handle_pre_invocation(payload_inv5)
+
+        state_after_inv5 = orchestrator_guard._load_state(self.base_payload)
+        self.assertEqual(state_after_inv5.get("current_invocation_num"), 5)
+        self.assertNotIn("5", state_after_inv5.get("direct_budget", {}))
+        self.assertNotIn("0", state_after_inv5.get("direct_budget", {}))
+
+        # Calling handle_pre_invocation with protojson zero (0 or "0") preserves current_invocation_num
+        # and resets direct_budget key "0"
+        state_after_inv5["direct_budget"]["0"] = {"commands": ["old_cmd_0"]}
+        state_after_inv5["direct_budget"]["6"] = {"commands": ["preserved_cmd_6"]}
+        orchestrator_guard._save_state(self.base_payload, state_after_inv5)
+
+        payload_proto_zero = dict(self.base_payload, invocationNum=0)
+        orchestrator_guard.handle_pre_invocation(payload_proto_zero)
+
+        state_proto_cleared = orchestrator_guard._load_state(self.base_payload)
+        self.assertEqual(state_proto_cleared.get("current_invocation_num"), 5)
+        self.assertNotIn("0", state_proto_cleared.get("direct_budget", {}))
+        self.assertIn("6", state_proto_cleared.get("direct_budget", {}))
+
+        # Also test with protojson string "0"
+        state_proto_cleared["direct_budget"]["0"] = {"commands": ["old_cmd_0"]}
+        orchestrator_guard._save_state(self.base_payload, state_proto_cleared)
+        payload_proto_str_zero = dict(self.base_payload, invocationNum="0")
+        orchestrator_guard.handle_pre_invocation(payload_proto_str_zero)
+        state_str_cleared = orchestrator_guard._load_state(self.base_payload)
+        self.assertEqual(state_str_cleared.get("current_invocation_num"), 5)
+        self.assertNotIn("0", state_str_cleared.get("direct_budget", {}))
+
+        # Calling handle_pre_invocation with invocationNum omitted resets current_invocation_num to 0
+        # and clears direct_budget key "0"
+        state_after["direct_budget"]["0"] = {"commands": ["old_cmd"]}
+        orchestrator_guard._save_state(self.base_payload, state_after)
+
+        payload_omit_inv = dict(self.base_payload)
+        payload_omit_inv.pop("invocationNum", None)
+        orchestrator_guard.handle_pre_invocation(payload_omit_inv)
+
+        state_cleared = orchestrator_guard._load_state(self.base_payload)
+        self.assertNotIn("0", state_cleared.get("direct_budget", {}))
+
     def test_compound_git_and_pytest_command_not_exempt(self) -> None:
         orchestrator_guard.handle_pre_invocation(self.base_payload)
 
@@ -1591,19 +1731,20 @@ NOTES: <one sentence summarizing findings>
             write_payload = dict(
                 self.base_payload,
                 toolCall={
-                    "name": "write_to_file",
+                    "name": "write_file",
                     "args": {
-                        "TargetFile": str(dummy_file),
-                        "CodeContent": "x = 1\n",
+                        "Path": str(dummy_file),
+                        "Content": "x = 1\n",
                     },
                 },
             )
             res_write = orchestrator_guard.handle_pre_tool(write_payload)
             self.assertEqual(res_write.get("decision"), "allow")
 
-            compound_payload = dict(
+            compound_payload_1 = dict(
                 self.base_payload,
                 toolCall={
+                    "id": "compound_1",
                     "name": "run_command",
                     "args": {
                         "CommandLine": "git status && pytest",
@@ -1611,11 +1752,25 @@ NOTES: <one sentence summarizing findings>
                     },
                 },
             )
-            res_cmd = orchestrator_guard.handle_pre_tool(compound_payload)
-            self.assertEqual(res_cmd.get("decision"), "deny")
+            res_cmd_1 = orchestrator_guard.handle_pre_tool(compound_payload_1)
+            self.assertEqual(res_cmd_1.get("decision"), "allow")
+
+            compound_payload_2 = dict(
+                self.base_payload,
+                toolCall={
+                    "id": "compound_2",
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": "git status && pytest",
+                        "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                    },
+                },
+            )
+            res_cmd_2 = orchestrator_guard.handle_pre_tool(compound_payload_2)
+            self.assertEqual(res_cmd_2.get("decision"), "deny")
             self.assertIn(
-                "Direct workspace edit followed by test execution detected",
-                res_cmd.get("reason", ""),
+                "Direct workspace edit followed by iterative test execution detected",
+                res_cmd_2.get("reason", ""),
             )
         finally:
             if dummy_file.exists():
@@ -1735,6 +1890,21 @@ NOTES: <one sentence summarizing findings>
         self.assertFalse(changed_third)
         self.assertEqual(state.get("transcript_offset"), offset_after_second)
 
+        # Test singular "Created the following subagent:" transcript line pairs pending spawn
+        singular_cid = "cccc3333-cccc-3333-cccc-3333cccc3333"
+        state["pending_spawns"] = [
+            {"role": "Worker 2", "type": "scout", "model": "flash_lite"}
+        ]
+        line_singular = f"Created the following subagent: conversationId: {singular_cid}\n"
+        with open(transcript_file, "a", encoding="utf-8") as fh:
+            fh.write(line_singular)
+
+        changed_singular = orchestrator_guard._sync_subagents_from_transcript(payload, state)
+        self.assertTrue(changed_singular)
+        self.assertIn(singular_cid, state.get("subagents", {}))
+        self.assertEqual(state.get("subagents", {})[singular_cid]["model"], "flash_lite")
+        self.assertEqual(len(state.get("pending_spawns", [])), 0)
+
     def test_self_subagent_meta_cached_from_sibling_brain(self) -> None:
         app_data = Path(self.artifact_dir) / "appdata"
         parent_brain = app_data / "brain" / "parent-orch-cid"
@@ -1780,6 +1950,122 @@ NOTES: <one sentence summarizing findings>
         self.assertTrue(
             orchestrator_guard._is_research_subagent(sub_payload, persisted_sub_state)
         )
+
+    def test_commented_out_assertion_tampering_blocked_in_edit_and_diff(self) -> None:
+        test_file = str(orchestrator_guard.PROJECT_ROOT / "tests" / "test_sample.py")
+        commented_assert_edit = dict(
+            self.base_payload,
+            toolCall={
+                "name": "edit_file",
+                "args": {
+                    "Path": test_file,
+                    "Target": "        self.assertEqual(a, b)\n",
+                    "Replacement": "        # self.assertEqual(a, b)\n",
+                },
+            },
+        )
+        res_edit = orchestrator_guard.handle_pre_tool(commented_assert_edit)
+        self.assertEqual(res_edit["decision"], "deny")
+        self.assertIn("reduces assertion count", res_edit["reason"])
+
+        diff_commented_assert = (
+            "--- a/tests/test_auth.py\n"
+            "+++ b/tests/test_auth.py\n"
+            "@@ -10,1 +10,1 @@\n"
+            "-    self.assertEqual(token, 'abc')\n"
+            "+    # self.assertEqual(token, 'abc')\n"
+        )
+        res_diff = orchestrator_guard.audit_diff_text(diff_commented_assert)
+        self.assertIsNotNone(res_diff)
+        self.assertIn("Diff audit detected net removal of 1 assertion(s)", res_diff)
+
+    def test_step_idx_deduplication_and_scout_does_not_clear_dirty_receipt(self) -> None:
+        orchestrator_guard.handle_pre_invocation(self.base_payload)
+
+        # 1. Duplicate PreToolUse calls with same stepIdx (and no toolCall.id) count once
+        step_payload = dict(
+            self.base_payload,
+            stepIdx=42,
+            toolCall={
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "echo 'step test'",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+        )
+        res1 = orchestrator_guard.handle_pre_tool(step_payload)
+        self.assertEqual(res1["decision"], "allow")
+        res2 = orchestrator_guard.handle_pre_tool(step_payload)
+        self.assertEqual(res2["decision"], "allow")
+
+        state = orchestrator_guard._load_state(self.base_payload)
+        self.assertEqual(len(state["direct_budget"]["1"]["commands"]), 1)
+
+        # 2. handle_post_tool for a scout invoke_subagent does NOT clear a dirty test_receipt
+        receipt = orchestrator_guard._get_test_receipt(state, self.base_payload)
+        receipt["dirty"] = True
+        receipt["verified"] = False
+        orchestrator_guard._save_state(self.base_payload, state)
+
+        scout_post_payload = dict(
+            self.base_payload,
+            toolCall={
+                "id": "scout_post_call",
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "scout",
+                    "Role": "Read Scout",
+                },
+            },
+            error="",
+        )
+        orchestrator_guard.handle_post_tool(scout_post_payload)
+
+        state_after_scout = orchestrator_guard._load_state(self.base_payload)
+        receipt_after_scout = orchestrator_guard._get_test_receipt(
+            state_after_scout, self.base_payload
+        )
+        self.assertTrue(receipt_after_scout["dirty"])
+        self.assertFalse(receipt_after_scout["verified"])
+
+        # 3. echo pytest does not clear a dirty test_receipt
+        echo_post_payload = dict(
+            self.base_payload,
+            toolCall={
+                "id": "echo_post_call",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "echo pytest",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+            error="",
+        )
+        orchestrator_guard.handle_post_tool(echo_post_payload)
+
+        state_after_echo = orchestrator_guard._load_state(self.base_payload)
+        receipt_after_echo = orchestrator_guard._get_test_receipt(
+            state_after_echo, self.base_payload
+        )
+        self.assertTrue(receipt_after_echo["dirty"])
+        self.assertFalse(receipt_after_echo["verified"])
+
+    def test_cli_doctor_and_status_modes(self) -> None:
+        status_res = orchestrator_guard._cli_status(self.base_payload)
+        self.assertIn("projectRoot", status_res)
+        self.assertIn("stateFile", status_res)
+        self.assertIn("currentInvocation", status_res)
+        self.assertIn("directBudget", status_res)
+        self.assertIn("testReceipt", status_res)
+        self.assertIn("circuitBreaker", status_res)
+
+        doctor_res = orchestrator_guard._cli_doctor()
+        self.assertIn("healthy", doctor_res)
+        self.assertIn("pluginHooksPresent", doctor_res)
+        self.assertIn("issues", doctor_res)
+        self.assertTrue(doctor_res["pluginHooksPresent"])
+        self.assertIsInstance(doctor_res["issues"], list)
 
 
 if __name__ == "__main__":
