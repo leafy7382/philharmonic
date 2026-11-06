@@ -2212,6 +2212,237 @@ NOTES: <one sentence summarizing findings>
         self.assertIn("## 4. Reactive Coordination and Context Hygiene", content)
         self.assertIn("## 5. Empirical Test Receipts, Circuit Breaker, and Diff Audit", content)
 
+    def test_remote_vm_tool_schemas_support(self) -> None:
+        # 1. lookup_skill(skill_name="philharmonic") activates an inactive session
+        normal_payload = dict(
+            self.base_payload,
+            lastUserInput="hello remote vm",
+        )
+        orchestrator_guard.handle_pre_invocation(normal_payload)
+        self.assertFalse(orchestrator_guard._load_state(normal_payload).get("active"))
+
+        lookup_payload = dict(
+            self.base_payload,
+            toolCall={
+                "name": "lookup_skill",
+                "args": {"skill_name": "philharmonic"},
+            },
+        )
+        res_lookup = orchestrator_guard.handle_pre_tool(lookup_payload)
+        self.assertEqual(res_lookup["decision"], "allow")
+        self.assertTrue(orchestrator_guard._load_state(self.base_payload).get("active"))
+
+        # 1b. lookup_skills(skill_names=["philharmonic"]) also activates an inactive session
+        orchestrator_guard._cli_deactivate(self.base_payload)
+        self.assertFalse(orchestrator_guard._load_state(self.base_payload).get("active"))
+        lookup_multi_payload = dict(
+            self.base_payload,
+            toolCall={
+                "name": "lookup_skills",
+                "args": {"skill_names": ["other_skill", "philharmonic"]},
+            },
+        )
+        res_lookup_multi = orchestrator_guard.handle_pre_tool(lookup_multi_payload)
+        self.assertEqual(res_lookup_multi["decision"], "allow")
+        self.assertTrue(orchestrator_guard._load_state(self.base_payload).get("active"))
+
+        # 2. snake_case define_subagent forces enable_subagent_tools=False
+        define_payload = dict(
+            self.base_payload,
+            toolCall={
+                "name": "define_subagent",
+                "args": {
+                    "name": "scout",
+                    "enable_write_tools": False,
+                    "enable_subagent_tools": True,
+                },
+            },
+        )
+        res_define = orchestrator_guard.handle_pre_tool(define_payload)
+        self.assertEqual(res_define["decision"], "allow")
+        self.assertEqual(res_define["overwrite"], {"enable_subagent_tools": False})
+
+        # 3. Subagents array in invoke_subagent rewrites inherit models and blocks pro
+        subagents_pro_payload = dict(
+            self.base_payload,
+            toolCall={
+                "id": "remote_sub_pro",
+                "name": "invoke_subagent",
+                "args": {
+                    "Subagents": [
+                        {
+                            "TypeName": "implementer",
+                            "Role": "Pro Worker",
+                            "Model": "pro",
+                            "Prompt": VALID_PROMPT,
+                        }
+                    ]
+                },
+            },
+        )
+        res_pro = orchestrator_guard.handle_pre_tool(subagents_pro_payload)
+        self.assertEqual(res_pro["decision"], "deny")
+        self.assertIn("Model='pro'", res_pro["reason"])
+
+        subagents_inherit_payload = dict(
+            self.base_payload,
+            toolCall={
+                "id": "remote_sub_inherit",
+                "name": "invoke_subagent",
+                "args": {
+                    "Subagents": [
+                        {
+                            "TypeName": "scout",
+                            "Role": "Remote Scout",
+                            "Model": "inherit",
+                            "Prompt": VALID_PROMPT,
+                        },
+                        {
+                            "TypeName": "implementer",
+                            "Role": "Remote Implementer",
+                            "Model": "inherit",
+                            "Prompt": VALID_PROMPT,
+                        },
+                    ]
+                },
+            },
+        )
+        res_inherit = orchestrator_guard.handle_pre_tool(subagents_inherit_payload)
+        self.assertEqual(res_inherit["decision"], "allow")
+        self.assertEqual(
+            res_inherit["overwrite"]["Subagents"][0]["Model"], "flash_lite"
+        )
+        self.assertEqual(
+            res_inherit["overwrite"]["Subagents"][1]["Model"], "flash"
+        )
+        state_after_spawn = orchestrator_guard._load_state(self.base_payload)
+        self.assertEqual(len(state_after_spawn.get("pending_spawns", [])), 2)
+
+        # 3b. handle_post_tool with Subagents list rolls back all pending spawns on error
+        post_err_payload = dict(
+            subagents_inherit_payload,
+            error="remote subagent spawn failed",
+        )
+        orchestrator_guard.handle_post_tool(post_err_payload)
+        state_after_rollback = orchestrator_guard._load_state(self.base_payload)
+        self.assertEqual(len(state_after_rollback.get("pending_spawns", [])), 0)
+
+        # 4. view_file, write_to_file, and replace_file_content enforce budget, dirty receipt, and tamper checks
+        test_file = str(orchestrator_guard.PROJECT_ROOT / "tests" / "test_remote.py")
+        tamper_replace = dict(
+            self.base_payload,
+            toolCall={
+                "name": "replace_file_content",
+                "args": {
+                    "TargetFile": test_file,
+                    "TargetContent": "    assert x == 1\n",
+                    "ReplacementContent": "    # assert x == 1\n",
+                },
+            },
+        )
+        res_tamper = orchestrator_guard.handle_pre_tool(tamper_replace)
+        self.assertEqual(res_tamper["decision"], "deny")
+        self.assertIn("reduces assertion count", res_tamper["reason"])
+
+        tamper_write_to_file = dict(
+            self.base_payload,
+            toolCall={
+                "name": "write_to_file",
+                "args": {
+                    "TargetFile": test_file,
+                    "CodeContent": "def test_x():\n    assert True\n",
+                },
+            },
+        )
+        res_tamper_wtf = orchestrator_guard.handle_pre_tool(tamper_write_to_file)
+        self.assertEqual(res_tamper_wtf["decision"], "deny")
+        self.assertIn("assert True", res_tamper_wtf["reason"])
+
+        code_file = str(orchestrator_guard.PROJECT_ROOT / "remote_code.py")
+        res_write_code = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "write_to_file",
+                    "args": {
+                        "TargetFile": code_file,
+                        "CodeContent": "val = 123\n",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_write_code["decision"], "allow")
+        state_dirty = orchestrator_guard._load_state(self.base_payload)
+        self.assertTrue(
+            orchestrator_guard._get_test_receipt(state_dirty, self.base_payload).get("dirty")
+        )
+
+        # 4b. handle_post_tool with Subagents list keeps dirty=True for scout/research only,
+        # and clears dirty=False when an implementer entry succeeds
+        orchestrator_guard.handle_post_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "remote_post_readonly",
+                    "name": "invoke_subagent",
+                    "args": {
+                        "Subagents": [
+                            {"TypeName": "scout", "Role": "Read Scout"},
+                            {"TypeName": "research", "Role": "Doc Researcher"},
+                        ]
+                    },
+                },
+                error="",
+            )
+        )
+        state_still_dirty = orchestrator_guard._load_state(self.base_payload)
+        self.assertTrue(
+            orchestrator_guard._get_test_receipt(state_still_dirty, self.base_payload).get("dirty")
+        )
+
+        orchestrator_guard.handle_post_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "remote_post_impl",
+                    "name": "invoke_subagent",
+                    "args": {
+                        "Subagents": [
+                            {"TypeName": "scout", "Role": "Read Scout"},
+                            {"TypeName": "implementer", "Role": "Code Implementer"},
+                        ]
+                    },
+                },
+                error="",
+            )
+        )
+        state_verified = orchestrator_guard._load_state(self.base_payload)
+        receipt_verified = orchestrator_guard._get_test_receipt(
+            state_verified, self.base_payload
+        )
+        self.assertFalse(receipt_verified.get("dirty"))
+        self.assertTrue(receipt_verified.get("verified"))
+
+        f1 = str(orchestrator_guard.PROJECT_ROOT / "remote_a.py")
+        f2 = str(orchestrator_guard.PROJECT_ROOT / "remote_b.py")
+        f3 = str(orchestrator_guard.PROJECT_ROOT / "remote_c.py")
+        for f in (f1, f2):
+            r = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={"name": "view_file", "args": {"AbsolutePath": f}},
+                )
+            )
+            self.assertEqual(r["decision"], "allow")
+        r3 = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={"name": "view_file", "args": {"AbsolutePath": f3}},
+            )
+        )
+        self.assertEqual(r3["decision"], "deny")
+        self.assertIn("read limit (2 workspace files) exceeded", r3["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

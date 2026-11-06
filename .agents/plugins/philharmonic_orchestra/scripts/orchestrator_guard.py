@@ -7,10 +7,14 @@ Responsibilities:
    - Injects a subagent context isolation reminder into worker subagents, deduplicated per
      (conversationId, invocationNum).
 2. PreToolUse:
-   - Enforces native Antigravity tool schemas (`read_file`, `write_file`, `edit_file`,
-     `grep_search`, `find_by_name`, `run_command`, `define_subagent`, `invoke_subagent`,
-     `send_message`, `manage_subagents`).
-   - Forces `EnableSubagentTools=False` on custom subagent definitions (`define_subagent`).
+   - Enforces native Antigravity tool schemas across both local `agy` CLI (`read_file`,
+     `write_file`, `edit_file`, `list_dir`, `grep_search`, `find_by_name`, `run_command`,
+     PascalCase `define_subagent`, flat `invoke_subagent`, `send_message`, `manage_subagents`)
+     and Remote VM (`view_file`, `write_to_file`, `replace_file_content`, `lookup_skill`,
+     `lookup_skills`, `snake_case` `enable_subagent_tools` in `define_subagent`, and
+     `Subagents` list in `invoke_subagent`) environments.
+   - Forces `EnableSubagentTools=False` / `enable_subagent_tools=False` on custom subagent
+     definitions (`define_subagent`).
    - Blocks `Model='pro'`, rewrites `Model='inherit'` to `'flash'` or `'flash_lite'`, and
      auto-downgrades simple read-only tasks (<= 3 rules) to `'flash_lite'` on `invoke_subagent`.
    - Enforces the Direct Execution Fast-Path budget on the root orchestrator:
@@ -89,9 +93,9 @@ REPORT_LINE_PATTERNS = (
     re.compile(r"^NOTES:\s*\S+"),
 )
 
-READ_TOOLS = {"read_file", "list_dir"}
+READ_TOOLS = {"read_file", "list_dir", "view_file"}
 SEARCH_TOOLS = {"grep_search", "find_by_name"}
-MUTATION_TOOLS = {"write_file", "edit_file"}
+MUTATION_TOOLS = {"write_file", "edit_file", "write_to_file", "replace_file_content"}
 
 FORBIDDEN_DIRECT_READ_RE = re.compile(
     r"(?:^|/)transcript(?:_full|[0-9a-zA-Z_\-]*)?\.jsonl$|\.log$", re.I
@@ -561,12 +565,22 @@ def _is_slash_command_triggered(payload: Dict[str, Any]) -> bool:
     tool_call = payload.get("toolCall")
     if isinstance(tool_call, dict):
         tool_name = (tool_call.get("name") or "").lower()
+        args = tool_call.get("args") or {}
         if tool_name in {"read_file", "view_file"}:
-            args = tool_call.get("args") or {}
             for key in ("Path", "FilePath", "file_path", "path", "AbsolutePath"):
                 val = args.get(key)
                 if isinstance(val, str) and val.replace("\\", "/").endswith("skills/philharmonic/SKILL.md"):
                     return True
+        elif tool_name == "lookup_skill":
+            skill_name = str(args.get("skill_name") or args.get("SkillName") or "").strip().lower()
+            if skill_name == "philharmonic":
+                return True
+        elif tool_name == "lookup_skills":
+            skill_names = args.get("skill_names") or args.get("SkillNames") or []
+            if isinstance(skill_names, list) and any(
+                str(s).strip().lower() == "philharmonic" for s in skill_names
+            ):
+                return True
     return False
 
 
@@ -689,10 +703,15 @@ def _is_research_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> boo
 
 
 def _handle_define_subagent(args: Dict[str, Any]) -> Dict[str, Any]:
+    overwrite: Dict[str, Any] = {}
     if args.get("EnableSubagentTools") is True:
+        overwrite["EnableSubagentTools"] = False
+    if args.get("enable_subagent_tools") is True:
+        overwrite["enable_subagent_tools"] = False
+    if overwrite:
         return {
             "decision": "allow",
-            "overwrite": {"EnableSubagentTools": False},
+            "overwrite": overwrite,
         }
     return {"decision": "allow"}
 
@@ -706,35 +725,46 @@ def _is_simple_readonly_task(type_name: str, prompt_text: str) -> bool:
     return not has_mutation and rule_count <= 3
 
 
-def _handle_invoke_subagent(
-    payload: Dict[str, Any],
-    args: Dict[str, Any],
-    state: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    type_name = (args.get("TypeName") or "").strip()
-    prompt_text = args.get("Prompt") or ""
+def _validate_and_prepare_subagent_entry(
+    entry: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[str]]:
+    """Validate a single subagent spec and return (denial, spawn_record, target_model)."""
+    type_name = (entry.get("TypeName") or "").strip()
+    prompt_text = entry.get("Prompt") or ""
     if not type_name:
-        return {
-            "decision": "deny",
-            "reason": "invoke_subagent requires a non-empty 'TypeName'.",
-        }
+        return (
+            {
+                "decision": "deny",
+                "reason": "invoke_subagent requires a non-empty 'TypeName'.",
+            },
+            None,
+            None,
+        )
     if not prompt_text or not prompt_text.strip():
-        return {
-            "decision": "deny",
-            "reason": "invoke_subagent requires a non-empty 'Prompt'.",
-        }
+        return (
+            {
+                "decision": "deny",
+                "reason": "invoke_subagent requires a non-empty 'Prompt'.",
+            },
+            None,
+            None,
+        )
 
-    requested_model = (args.get("Model") or "inherit").strip()
-    role_label = (args.get("Role") or type_name or "subagent").strip()
+    requested_model = (entry.get("Model") or "inherit").strip()
+    role_label = (entry.get("Role") or type_name or "subagent").strip()
 
     if requested_model == "pro":
-        return {
-            "decision": "deny",
-            "reason": (
-                f"Subagent '{role_label}' requested Model='pro'. "
-                "Subagents must use 'flash' or 'flash_lite'."
-            ),
-        }
+        return (
+            {
+                "decision": "deny",
+                "reason": (
+                    f"Subagent '{role_label}' requested Model='pro'. "
+                    "Subagents must use 'flash' or 'flash_lite'."
+                ),
+            },
+            None,
+            None,
+        )
 
     target_model = requested_model
     if target_model not in ALLOWED_SUBAGENT_MODELS:
@@ -743,7 +773,7 @@ def _handle_invoke_subagent(
     if target_model == "flash" and _is_simple_readonly_task(type_name, prompt_text):
         target_model = "flash_lite"
 
-    workspace_mode = (args.get("Workspace") or "inherit").strip()
+    workspace_mode = (entry.get("Workspace") or "inherit").strip()
     spawn_record = {
         "role": role_label,
         "type": type_name,
@@ -752,23 +782,85 @@ def _handle_invoke_subagent(
         "workspace": workspace_mode,
         "active_branch": workspace_mode == "branch",
     }
+    return None, spawn_record, target_model
 
+
+def _handle_invoke_subagent(
+    payload: Dict[str, Any],
+    args: Dict[str, Any],
+    state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     if state is None:
         state = _load_state(payload)
     call_id = _extract_call_id(payload)
+    recorded_calls: List[str] = state.setdefault("recorded_spawn_calls", [])
+
+    if "Subagents" in args and isinstance(args.get("Subagents"), list):
+        subagents_list = args["Subagents"]
+        if not subagents_list:
+            return {
+                "decision": "deny",
+                "reason": "invoke_subagent requires a non-empty 'Subagents' list.",
+            }
+        validated_items: List[Tuple[int, Dict[str, Any], Dict[str, Any], str]] = []
+        for idx, raw_item in enumerate(subagents_list):
+            item = raw_item if isinstance(raw_item, dict) else {}
+            denial, spawn_record, target_model = _validate_and_prepare_subagent_entry(item)
+            if denial is not None or spawn_record is None or target_model is None:
+                return denial or {"decision": "deny", "reason": "Invalid subagent entry."}
+            validated_items.append((idx, item, spawn_record, target_model))
+
+        updated_list: List[Dict[str, Any]] = []
+        any_model_overwritten = False
+        state_changed = False
+        for idx, item, spawn_record, target_model in validated_items:
+            call_sig = json.dumps(
+                [
+                    payload.get("conversationId", ""),
+                    _current_invocation_key(payload, state),
+                    payload.get("executionNum", 0),
+                    f"{call_id}:{idx}",
+                    spawn_record["type_name"],
+                    spawn_record["role"],
+                    spawn_record["workspace"],
+                ],
+                sort_keys=True,
+            )
+            if call_sig not in recorded_calls:
+                recorded_calls.append(call_sig)
+                state.setdefault("pending_spawns", []).append(spawn_record)
+                state_changed = True
+            new_item = dict(item)
+            if item.get("Model") != target_model:
+                new_item["Model"] = target_model
+                any_model_overwritten = True
+            updated_list.append(new_item)
+
+        if state_changed:
+            _save_state(payload, state)
+        if any_model_overwritten:
+            return {
+                "decision": "allow",
+                "overwrite": {"Subagents": updated_list},
+            }
+        return {"decision": "allow"}
+
+    denial, spawn_record, target_model = _validate_and_prepare_subagent_entry(args)
+    if denial is not None or spawn_record is None or target_model is None:
+        return denial or {"decision": "deny", "reason": "Invalid invoke_subagent arguments."}
+
     call_sig = json.dumps(
         [
             payload.get("conversationId", ""),
             _current_invocation_key(payload, state),
             payload.get("executionNum", 0),
             call_id,
-            type_name,
-            role_label,
-            workspace_mode,
+            spawn_record["type_name"],
+            spawn_record["role"],
+            spawn_record["workspace"],
         ],
         sort_keys=True,
     )
-    recorded_calls: List[str] = state.setdefault("recorded_spawn_calls", [])
     if call_sig not in recorded_calls:
         recorded_calls.append(call_sig)
         state.setdefault("pending_spawns", []).append(spawn_record)
@@ -911,12 +1003,20 @@ def _extract_target_path(tool_name: str, args: Dict[str, Any]) -> str:
             or args.get("SearchDirectory")
             or args.get("DirectoryPath")
             or args.get("Path")
+            or args.get("AbsolutePath")
             or ""
         )
     if tool_name in READ_TOOLS:
-        return str(args.get("Path") or args.get("DirectoryPath") or "")
+        return str(
+            args.get("Path")
+            or args.get("DirectoryPath")
+            or args.get("AbsolutePath")
+            or args.get("FilePath")
+            or args.get("file_path")
+            or ""
+        )
     if tool_name in MUTATION_TOOLS:
-        return str(args.get("Path") or "")
+        return str(args.get("Path") or args.get("TargetFile") or "")
     return ""
 
 
@@ -1099,10 +1199,12 @@ def _check_test_tampering_in_edit(
         return None
 
     chunks: List[Tuple[str, str]] = []
-    if tool_name == "edit_file":
-        chunks.append((args.get("Target") or "", args.get("Replacement") or ""))
-    elif tool_name == "write_file":
-        new_code = args.get("Content") or ""
+    if tool_name in {"edit_file", "replace_file_content"}:
+        old_chunk = args.get("Target") or args.get("TargetContent") or ""
+        new_chunk = args.get("Replacement") or args.get("ReplacementContent") or ""
+        chunks.append((old_chunk, new_chunk))
+    elif tool_name in {"write_file", "write_to_file"}:
+        new_code = args.get("Content") or args.get("CodeContent") or ""
         old_code = ""
         try:
             resolved = Path(os.path.expanduser(target)).resolve()
@@ -1377,6 +1479,10 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     for path_key in (
         "Path",
+        "TargetFile",
+        "AbsolutePath",
+        "FilePath",
+        "file_path",
         "SearchPath",
         "SearchDirectory",
         "DirectoryPath",
@@ -1417,9 +1523,15 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {}
     tool_call = payload.get("toolCall", {})
     tool_name = tool_call.get("name", "")
+    args = tool_call.get("args") or {}
     if tool_name == "invoke_subagent" and payload.get("error"):
         pending = state.get("pending_spawns", [])
-        if pending:
+        pop_count = (
+            len(args["Subagents"])
+            if isinstance(args.get("Subagents"), list) and args["Subagents"]
+            else 1
+        )
+        for _ in range(min(pop_count, len(pending))):
             pending.pop()
     else:
         _sync_subagents_from_transcript(payload, state)
@@ -1430,7 +1542,7 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
     call_id = _extract_call_id(payload)
 
     if tool_name in {"run_command", "invoke_subagent"}:
-        cmd = ((tool_call.get("args") or {}).get("CommandLine") or "").strip()
+        cmd = (args.get("CommandLine") or "").strip()
         is_test_cmd = tool_name == "run_command" and _is_test_command(cmd)
         if error_text:
             seen_failures: List[str] = cb.setdefault("seen_failures", [])
@@ -1453,13 +1565,21 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
             ):
                 cb["failure_streak"] = 0
                 cb["tripped"] = False
-            invoked_type = (
-                ((tool_call.get("args") or {}).get("TypeName") or "").strip().lower()
-            )
-            is_verification_subagent = (
-                tool_name == "invoke_subagent"
-                and invoked_type not in {"scout", "research", "researcher"}
-            )
+            if isinstance(args.get("Subagents"), list) and args["Subagents"]:
+                invoked_types = [
+                    str((item or {}).get("TypeName") or "").strip().lower()
+                    for item in args["Subagents"]
+                    if isinstance(item, dict)
+                ]
+                is_verification_subagent = tool_name == "invoke_subagent" and any(
+                    t not in {"scout", "research", "researcher"} for t in invoked_types
+                )
+            else:
+                invoked_type = (args.get("TypeName") or "").strip().lower()
+                is_verification_subagent = (
+                    tool_name == "invoke_subagent"
+                    and invoked_type not in {"scout", "research", "researcher"}
+                )
             if is_test_cmd or (is_verification_subagent and receipt.get("dirty")):
                 receipt["dirty"] = False
                 receipt["verified"] = True

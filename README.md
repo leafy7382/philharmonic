@@ -48,12 +48,22 @@ mkdir -p /path/to/your-project/.agents/plugins
 cp -r .agents/plugins/philharmonic_orchestra /path/to/your-project/.agents/plugins/
 ```
 
-### 3. Install globally for all projects
+### 3. Install globally for all projects (Local CLI)
 
 ```bash
 mkdir -p ~/.gemini/config/plugins
 ln -s "$(pwd)/.agents/plugins/philharmonic_orchestra" ~/.gemini/config/plugins/philharmonic_orchestra
 ```
+
+### 4. Install on Remote Projects (Antigravity Cloud VM)
+
+- **Persistent Custom Skill (recommended)**: Ask Antigravity to register `.agents/plugins/philharmonic_orchestra/skills/philharmonic` via `save_skill` so `philharmonic` persists across all remote conversations and projects.
+- **Persistent `~/.gemini` copy**: Since `~/.gemini` (`/shared/user/.gemini`) persists across remote VMs while project directories are ephemeral, copy (do not symlink) the plugin:
+  ```bash
+  mkdir -p ~/.gemini/config/plugins
+  cp -r .agents/plugins/philharmonic_orchestra ~/.gemini/config/plugins/
+  ```
+- **Remote VM Dual-Schema Support**: Both `SKILL.md` and `orchestrator_guard.py` support local `agy` CLI and Remote VM tool schemas. On Remote VMs, `invoke_subagent` uses `Subagents: [...]` with `Model: "inherit"` and `Workspace: "inherit"` (since the remote VM harness does not initialize `PlatformClient` for tiered model resolution or branched workspaces).
 
 ---
 
@@ -105,7 +115,7 @@ Configured in [hooks.json](.agents/plugins/philharmonic_orchestra/hooks.json) an
 
 1. **`pre-invocation`**: Records the root orchestrator conversation ID, caches subagent identity across isolated brain directories, and injects a context-isolation reminder into worker subagents.
 2. **`pre-tool`**:
-   - Enforces Antigravity native tool names (`read_file`, `write_file`, `edit_file`, `list_dir`, `grep_search`, `find_by_name`, `run_command`), PascalCase `define_subagent` parameters, and flat `invoke_subagent` parameters.
+   - Supports both local `agy` CLI (`read_file`, `write_file`, `edit_file`, `list_dir`, `grep_search`, `find_by_name`, `run_command`, flat `invoke_subagent`, PascalCase `define_subagent`) and Remote VM (`view_file`, `write_to_file`, `replace_file_content`, `lookup_skill`, `lookup_skills`, `Subagents` list `invoke_subagent`, `snake_case` `define_subagent`) tool schemas.
    - Enforces the root orchestrator fast-path budget (<= 2 file reads, <= 2 file edits, <= 2 non-git commands, and 1 verification test run after edits). Compound shell commands (`&&`, `||`, `;`) are split and checked per sub-command.
    - Blocks root orchestrator reads and searches on `.log` and `transcript*.jsonl` files.
    - Restricts `research` subagents to writing markdown files under `<artifactDirectoryPath>/scratch/*.md`.
