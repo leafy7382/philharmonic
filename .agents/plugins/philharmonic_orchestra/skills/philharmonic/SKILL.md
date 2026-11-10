@@ -61,6 +61,7 @@ Do not call `define_subagent` upfront at session start. Register `scout` or `imp
 Write all `invoke_subagent` prompts and `send_message` instructions using the structured contract below:
 
 - Specify a clear single-sentence `TASK:` objective.
+- Specify `ALLOWED_FILES: <comma-separated paths or NONE>` to enforce a deterministic `PreToolUse` write allowlist for the subagent.
 - List numbered `RULES:` with an explicit file allowlist and verification command.
 - For complex tasks, write detailed technical requirements to `<artifactDirectoryPath>/scratch/spec_<task>.md` and instruct the subagent to open the spec file in Rule 1.
 - Require the four-header `REPORT FORMAT` below. On failure or blocker, instruct `implementer` to write raw output to `<artifactDirectoryPath>/scratch/<task_id>.log` and state the error cause and `file://` URI in `NOTES`.
@@ -68,11 +69,12 @@ Write all `invoke_subagent` prompts and `send_message` instructions using the st
 
 ```markdown
 TASK: <single-sentence objective>
+ALLOWED_FILES: <comma-separated file paths or NONE>
 
 RULES:
 1. Open `<file_path>`.
 2. <concise instruction>.
-3. Do not change any file outside `<allowed_files>`.
+3. Do not change any file outside `ALLOWED_FILES`.
 4. Run `<test_command>` to check the result.
 5. On failure, write raw output to `<artifactDirectoryPath>/scratch/<task_id>.log`.
 

@@ -2792,8 +2792,210 @@ NOTES: <one sentence summarizing findings>
         self.assertFalse(cb_3["tripped"])
         self.assertEqual(cb_3["failure_streak"], 0)
 
+    def test_allowed_files_header_enforces_subagent_file_allowlist(self) -> None:
+        app_data = Path(self.artifact_dir) / "appdata_allowed_files"
+        parent_brain = app_data / "brain" / "parent-allow-cid"
+        sub1_brain = app_data / "brain" / "sub-allow-1"
+        sub2_brain = app_data / "brain" / "sub-allow-2"
+        parent_brain.mkdir(parents=True, exist_ok=True)
+        sub1_brain.mkdir(parents=True, exist_ok=True)
+        sub2_brain.mkdir(parents=True, exist_ok=True)
+
+        prompt_1 = (
+            "TASK: Implement feature A.\n"
+            "ALLOWED_FILES: module_a.py, tests/test_a.py\n\n"
+            "RULES:\n"
+            "1. Open `module_a.py`.\n"
+            "2. Do not change any file outside `ALLOWED_FILES`.\n\n"
+            "REPORT FORMAT:\n"
+            "STATUS: COMPLETED | BLOCKED | FAILED\n"
+            "FILES_CHANGED: module_a.py\n"
+            "VERIFICATION: pytest\n"
+            "NOTES: done\n"
+        )
+        prompt_2 = (
+            "TASK: Implement feature B.\n"
+            "ALLOWED_FILES: module_b.py\n\n"
+            "RULES:\n"
+            "1. Open `module_b.py`.\n"
+            "2. Do not change any file outside `ALLOWED_FILES`.\n\n"
+            "REPORT FORMAT:\n"
+            "STATUS: COMPLETED | BLOCKED | FAILED\n"
+            "FILES_CHANGED: module_b.py\n"
+            "VERIFICATION: pytest\n"
+            "NOTES: done\n"
+        )
+
+        parent_payload = dict(
+            self.base_payload,
+            conversationId="parent-allow-cid",
+            artifactDirectoryPath=str(parent_brain),
+            toolCall={
+                "id": "spawn_allow_pair",
+                "name": "invoke_subagent",
+                "args": {
+                    "Subagents": [
+                        {
+                            "TypeName": "implementer",
+                            "Role": "Worker A",
+                            "Model": "flash",
+                            "Prompt": prompt_1,
+                        },
+                        {
+                            "TypeName": "implementer",
+                            "Role": "Worker B",
+                            "Model": "flash",
+                            "Prompt": prompt_2,
+                        },
+                    ]
+                },
+            },
+        )
+        self.assertEqual(
+            orchestrator_guard.handle_pre_tool(parent_payload)["decision"], "allow"
+        )
+
+        mod_a = str(orchestrator_guard.PROJECT_ROOT / "module_a.py")
+        mod_b = str(orchestrator_guard.PROJECT_ROOT / "module_b.py")
+        mod_c = str(orchestrator_guard.PROJECT_ROOT / "module_c.py")
+        scratch_log = str(sub1_brain / "scratch" / "fail.log")
+
+        # Subagent 1 is allowed to edit module_a.py and write scratch/fail.log, but denied on module_b.py
+        res_sub1_ok = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                conversationId="sub-allow-1",
+                artifactDirectoryPath=str(sub1_brain),
+                toolCall={
+                    "name": "write_file",
+                    "args": {"Path": mod_a, "Content": "a = 1\n"},
+                },
+            )
+        )
+        self.assertEqual(res_sub1_ok["decision"], "allow")
+
+        res_sub1_scratch = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                conversationId="sub-allow-1",
+                artifactDirectoryPath=str(sub1_brain),
+                toolCall={
+                    "name": "write_to_file",
+                    "args": {"TargetFile": scratch_log, "CodeContent": "error\n"},
+                },
+            )
+        )
+        self.assertEqual(res_sub1_scratch["decision"], "allow")
+
+        res_sub1_deny = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                conversationId="sub-allow-1",
+                artifactDirectoryPath=str(sub1_brain),
+                toolCall={
+                    "name": "replace_file_content",
+                    "args": {"TargetFile": mod_b},
+                },
+            )
+        )
+        self.assertEqual(res_sub1_deny["decision"], "deny")
+        self.assertIn("File allowlist violation", res_sub1_deny["reason"])
+
+        # Subagent 2 is allowed to edit module_b.py, but denied on module_a.py
+        res_sub2_ok = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                conversationId="sub-allow-2",
+                artifactDirectoryPath=str(sub2_brain),
+                toolCall={
+                    "name": "write_file",
+                    "args": {"Path": mod_b, "Content": "b = 2\n"},
+                },
+            )
+        )
+        self.assertEqual(res_sub2_ok["decision"], "allow")
+
+        res_sub2_deny = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                conversationId="sub-allow-2",
+                artifactDirectoryPath=str(sub2_brain),
+                toolCall={
+                    "name": "write_file",
+                    "args": {"Path": mod_a, "Content": "a = 2\n"},
+                },
+            )
+        )
+        self.assertEqual(res_sub2_deny["decision"], "deny")
+        self.assertIn("File allowlist violation", res_sub2_deny["reason"])
+
+        # send_message updates sub-allow-1's ALLOWED_FILES to include module_c.py
+        send_update = dict(
+            self.base_payload,
+            conversationId="parent-allow-cid",
+            artifactDirectoryPath=str(parent_brain),
+            toolCall={
+                "name": "send_message",
+                "args": {
+                    "Recipient": "sub-allow-1",
+                    "Message": (
+                        "TASK: Also update module_c.py.\n"
+                        "ALLOWED_FILES: module_a.py, module_c.py\n"
+                    ),
+                },
+            },
+        )
+        self.assertEqual(
+            orchestrator_guard.handle_pre_tool(send_update)["decision"], "allow"
+        )
+
+        res_sub1_mod_c = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                conversationId="sub-allow-1",
+                artifactDirectoryPath=str(sub1_brain),
+                toolCall={
+                    "name": "write_file",
+                    "args": {"Path": mod_c, "Content": "c = 3\n"},
+                },
+            )
+        )
+        self.assertEqual(res_sub1_mod_c["decision"], "allow")
+
+        # ALLOWED_FILES: NONE blocks all workspace edits while allowing scratch writes
+        send_none = dict(
+            self.base_payload,
+            conversationId="parent-allow-cid",
+            artifactDirectoryPath=str(parent_brain),
+            toolCall={
+                "name": "send_message",
+                "args": {
+                    "Recipient": "sub-allow-1",
+                    "Message": "TASK: Read-only check.\nALLOWED_FILES: NONE\n",
+                },
+            },
+        )
+        self.assertEqual(
+            orchestrator_guard.handle_pre_tool(send_none)["decision"], "allow"
+        )
+
+        res_sub1_none_deny = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                conversationId="sub-allow-1",
+                artifactDirectoryPath=str(sub1_brain),
+                toolCall={
+                    "name": "write_file",
+                    "args": {"Path": mod_a, "Content": "a = 99\n"},
+                },
+            )
+        )
+        self.assertEqual(res_sub1_none_deny["decision"], "deny")
+        self.assertIn("NONE", res_sub1_none_deny["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

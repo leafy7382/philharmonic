@@ -85,11 +85,12 @@ All subagent prompts (`invoke_subagent` and `send_message`) must use the followi
 
 ```markdown
 TASK: <single-sentence objective>
+ALLOWED_FILES: <comma-separated file paths or NONE>
 
 RULES:
 1. Open `<file_path>`.
 2. <concise instruction>.
-3. Do not change any file outside `<allowed_files>`.
+3. Do not change any file outside `ALLOWED_FILES`.
 4. Run `<test_command>` to check the result.
 5. On failure, write raw output to `<artifactDirectoryPath>/scratch/<task_id>.log`.
 
@@ -103,6 +104,7 @@ NOTES: <summary (and up to 10 `- ` bullets), or inline error cause plus file://.
 
 ### Report Validation Rules
 
+- **Deterministic File Allowlist (`ALLOWED_FILES:`)**: When `ALLOWED_FILES:` is specified in `invoke_subagent` or `send_message`, `PreToolUse` deterministically blocks the subagent from mutating any workspace file outside that allowlist (while still allowing `<artifactDirectoryPath>/scratch/*.log` failure logs).
 - **Bounded `NOTES`**: Reports may include up to 10 bullet lines (`- ` or `* `) under `NOTES:`, with total report length capped at 1,600 characters.
 - **Failure Diagnosis**: When `STATUS` is `BLOCKED` or `FAILED`, `NOTES:` must include both an inline error summary (at least 3 words) and a `file://.../*.log` URI pointing to the raw failure output in `<artifactDirectoryPath>/scratch/`.
 - **Scratch Specification Relay**: For tasks with detailed specifications or schemas, write the spec to `<artifactDirectoryPath>/scratch/spec_<task>.md` and reference it in Rule 1 of `RULES:`.
@@ -118,9 +120,9 @@ Configured in [hooks.json](.agents/plugins/philharmonic_orchestra/hooks.json) an
    - Supports both local `agy` CLI (`read_file`, `write_file`, `edit_file`, `list_dir`, `grep_search`, `find_by_name`, `run_command`, flat `invoke_subagent`, PascalCase `define_subagent`) and Remote VM (`view_file`, `write_to_file`, `replace_file_content`, `lookup_skill`, `lookup_skills`, `Subagents` list `invoke_subagent`, `snake_case` `define_subagent`) tool schemas.
    - Enforces the root orchestrator fast-path budget (<= 2 file reads, <= 2 file edits, <= 2 non-git commands, and 1 verification test run after edits). Compound shell commands (`&&`, `||`, `;`) are split and checked per sub-command.
    - Blocks root orchestrator reads and searches on `.log` and `transcript*.jsonl` files.
-   - Restricts `research` subagents to writing markdown files under `<artifactDirectoryPath>/scratch/*.md`.
+   - Restricts `research` subagents to writing markdown files under `<artifactDirectoryPath>/scratch/*.md` and enforces per-subagent `ALLOWED_FILES:` workspace write allowlists on `implementer` subagents.
    - Blocks `Model: "pro"`, rewrites `Model: "inherit"`, and downgrades read-only subagent tasks with <= 3 rules and no mutation verbs to `Model: "flash_lite"`.
-   - Validates `invoke_subagent` and `send_message` prompts against the structured prompt contract.
+   - Validates `invoke_subagent` and `send_message` prompts against the structured prompt contract and tracks `ALLOWED_FILES:` headers.
    - Inspects edits to test files and blocks test deletion, assertion reduction, commented-out assertions, skip/xfail additions, or `assert True`.
    - Blocks retries when the 2-turn circuit breaker is tripped (while still allowing scratch log writes).
 3. **`post-tool`**:

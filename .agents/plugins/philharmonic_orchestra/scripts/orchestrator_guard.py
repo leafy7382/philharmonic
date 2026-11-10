@@ -65,6 +65,7 @@ MUTATION_VERBS_RE = re.compile(
     re.I,
 )
 NUMBERED_RULE_RE = re.compile(r"(?m)^\s*[0-9]+[.)]\s+")
+ALLOWED_FILES_HEADER_RE = re.compile(r"(?m)^\s*ALLOWED_FILES:\s*(.+)$", re.I)
 UUID_RE = re.compile(
     r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b",
     re.I,
@@ -765,6 +766,103 @@ def _is_scout_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
     return _get_subagent_type(payload, state) == "scout"
 
 
+def _parse_allowed_files_header(prompt_text: str) -> Optional[List[str]]:
+    """Parse ALLOWED_FILES: header from a subagent prompt, returning None if omitted."""
+    if not prompt_text:
+        return None
+    match = ALLOWED_FILES_HEADER_RE.search(prompt_text)
+    if not match:
+        return None
+    raw_val = match.group(1).strip()
+    tokens = [
+        tok.strip().strip("`'\"")
+        for tok in raw_val.split(",")
+        if tok.strip().strip("`'\"")
+    ]
+    if len(tokens) == 1 and tokens[0].upper() == "NONE":
+        return []
+    return tokens
+
+
+def _get_subagent_allowed_files(
+    payload: Dict[str, Any], state: Dict[str, Any]
+) -> Optional[List[str]]:
+    """Return the per-subagent ALLOWED_FILES list if configured, or None if unrestricted."""
+    if not _is_known_subagent(payload, state):
+        return None
+    cid = (payload.get("conversationId") or "").strip().lower()
+    sub_info = state.get("subagents", {}).get(cid)
+    if isinstance(sub_info, dict) and sub_info.get("allowed_files") is not None:
+        return list(sub_info["allowed_files"])
+    artifact_dir = payload.get("artifactDirectoryPath")
+    if artifact_dir and cid:
+        try:
+            resolved_art = Path(artifact_dir).resolve()
+            if resolved_art.parent.name == "brain":
+                for sibling_state_path in resolved_art.parent.glob(
+                    "*/orchestrator_state.json"
+                ):
+                    if sibling_state_path.parent == resolved_art:
+                        continue
+                    try:
+                        sib_data = json.loads(
+                            sibling_state_path.read_text(encoding="utf-8")
+                        )
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    sib_subagents = sib_data.get("subagents") or {}
+                    if (
+                        cid in sib_subagents
+                        and sib_subagents[cid].get("allowed_files") is not None
+                    ):
+                        updated_meta = _normalize_subagent_meta(sib_subagents[cid])
+                        if state.get("self_subagent_meta") != updated_meta:
+                            state["self_subagent_meta"] = updated_meta
+                            _save_state(payload, state)
+                        return list(sib_subagents[cid]["allowed_files"])
+        except OSError:
+            pass
+    meta = state.get("self_subagent_meta")
+    if isinstance(meta, dict) and meta.get("allowed_files") is not None:
+        return list(meta["allowed_files"])
+    return None
+
+
+def _is_target_in_allowed_files(target: str, allowed_files: List[str]) -> bool:
+    """Return True if target matches any file, directory, or basename entry in allowed_files."""
+    if not allowed_files or not target:
+        return False
+    try:
+        raw_target = Path(os.path.expanduser(target))
+        target_path = (
+            raw_target if raw_target.is_absolute() else (PROJECT_ROOT / raw_target)
+        ).resolve()
+    except OSError:
+        return False
+
+    for raw_entry in allowed_files:
+        entry = str(raw_entry).strip().strip("`'\"")
+        if not entry or entry.upper() == "NONE":
+            continue
+        try:
+            raw_ep = Path(os.path.expanduser(entry))
+            entry_path = (
+                raw_ep if raw_ep.is_absolute() else (PROJECT_ROOT / raw_ep)
+            ).resolve()
+        except OSError:
+            continue
+        if target_path == entry_path:
+            return True
+        try:
+            target_path.relative_to(entry_path)
+            return True
+        except ValueError:
+            pass
+        if "/" not in entry.replace("\\", "/") and target_path.name == entry:
+            return True
+    return False
+
+
 def _handle_define_subagent(args: Dict[str, Any]) -> Dict[str, Any]:
     overwrite: Dict[str, Any] = {}
     if args.get("EnableSubagentTools") is True:
@@ -843,7 +941,7 @@ def _validate_and_prepare_subagent_entry(
         target_model = "flash_lite"
 
     workspace_mode = (entry.get("Workspace") or "inherit").strip()
-    spawn_record = {
+    spawn_record: Dict[str, Any] = {
         "role": role_label,
         "type": type_name,
         "type_name": type_name,
@@ -851,6 +949,9 @@ def _validate_and_prepare_subagent_entry(
         "workspace": workspace_mode,
         "active_branch": workspace_mode == "branch",
     }
+    allowed_files = _parse_allowed_files_header(prompt_text)
+    if allowed_files is not None:
+        spawn_record["allowed_files"] = allowed_files
     return None, spawn_record, target_model
 
 
@@ -940,18 +1041,23 @@ def _handle_send_message(
     _save_state(payload, state)
 
     subagent_info = state.get("subagents", {}).get(recipient)
-    if subagent_info and subagent_info.get("model") == "flash_lite":
-        rule_count = len(NUMBERED_RULE_RE.findall(message))
-        has_mutation = bool(MUTATION_VERBS_RE.search(message))
-        if has_mutation or rule_count > 3:
-            return {
-                "decision": "deny",
-                "reason": (
-                    f"Recipient '{recipient}' is a 'flash_lite' ({subagent_info.get('type', 'scout')}) "
-                    "subagent. Do not send code mutation or multi-step (>3 rules) tasks to 'flash_lite'. "
-                    "Invoke a 'flash' subagent ('research' or 'implementer') instead."
-                ),
-            }
+    if subagent_info:
+        if subagent_info.get("model") == "flash_lite":
+            rule_count = len(NUMBERED_RULE_RE.findall(message))
+            has_mutation = bool(MUTATION_VERBS_RE.search(message))
+            if has_mutation or rule_count > 3:
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"Recipient '{recipient}' is a 'flash_lite' ({subagent_info.get('type', 'scout')}) "
+                        "subagent. Do not send code mutation or multi-step (>3 rules) tasks to 'flash_lite'. "
+                        "Invoke a 'flash' subagent ('research' or 'implementer') instead."
+                    ),
+                }
+        updated_allowed = _parse_allowed_files_header(message)
+        if updated_allowed is not None:
+            subagent_info["allowed_files"] = updated_allowed
+            _save_state(payload, state)
 
     return {"decision": "allow"}
 
@@ -1524,6 +1630,23 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                     ),
                 }
 
+        allowed_files = _get_subagent_allowed_files(payload, state)
+        target = _extract_target_path(tool_name, args)
+        if (
+            allowed_files is not None
+            and target
+            and not _is_artifact_or_worktree_path(target, payload)
+        ):
+            if not _is_target_in_allowed_files(target, allowed_files):
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"[ORCHESTRATOR GUARD] File allowlist violation: subagent attempted to mutate "
+                        f"'{Path(target).name}', which is outside ALLOWED_FILES "
+                        f"({', '.join(allowed_files) if allowed_files else 'NONE'})."
+                    ),
+                }
+
         tamper_denial = _check_test_tampering_in_edit(tool_name, args, payload)
         if tamper_denial is not None:
             return tamper_denial
@@ -1913,19 +2036,21 @@ def register_subagent(
     model: str,
     workspace: str = "inherit",
     role: str = "",
+    allowed_files: Optional[List[str]] = None,
 ) -> None:
     """Helper for explicitly registering a subagent conversationId -> tier mapping."""
     state = _load_state(payload)
     cid = conversation_id.strip().lower()
-    state.setdefault("subagents", {})[cid] = _normalize_subagent_meta(
-        {
-            "role": role or type_name,
-            "type": type_name,
-            "model": model,
-            "workspace": workspace,
-            "active_branch": workspace == "branch",
-        }
-    )
+    record: Dict[str, Any] = {
+        "role": role or type_name,
+        "type": type_name,
+        "model": model,
+        "workspace": workspace,
+        "active_branch": workspace == "branch",
+    }
+    if allowed_files is not None:
+        record["allowed_files"] = list(allowed_files)
+    state.setdefault("subagents", {})[cid] = _normalize_subagent_meta(record)
     _save_state(payload, state)
 
 
