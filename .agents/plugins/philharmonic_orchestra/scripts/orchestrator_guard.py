@@ -76,6 +76,7 @@ SUBAGENT_SPAWN_RE = re.compile(
 
 PENDING_SPAWN_TTL_SECONDS = 120
 MAX_STATE_INVOCATION_HISTORY = 25
+MAX_STATE_LIST_ENTRIES = 100
 
 MAX_DIRECT_MUTATION_FILES = 2
 MAX_DIRECT_COMMANDS = 2
@@ -96,6 +97,16 @@ REPORT_LINE_PATTERNS = (
 READ_TOOLS = {"read_file", "list_dir", "view_file"}
 SEARCH_TOOLS = {"grep_search", "find_by_name"}
 MUTATION_TOOLS = {"write_file", "edit_file", "write_to_file", "replace_file_content"}
+PATH_ARG_KEYS = (
+    "Path",
+    "TargetFile",
+    "AbsolutePath",
+    "FilePath",
+    "file_path",
+    "SearchPath",
+    "SearchDirectory",
+    "DirectoryPath",
+)
 
 FORBIDDEN_DIRECT_READ_RE = re.compile(
     r"(?:^|/)transcript(?:_full|[0-9a-zA-Z_\-]*)?\.jsonl$|\.log$", re.I
@@ -192,6 +203,13 @@ def _split_shell_commands(cmd: str) -> List[str]:
                 current = []
                 i += 2
                 continue
+            if ch == "&" and (
+                (i > 0 and cmd[i - 1] in (">", "<"))
+                or (i + 1 < n and cmd[i + 1] == ">")
+            ):
+                current.append(ch)
+                i += 1
+                continue
             if ch in (";", "|", "&", "\n"):
                 part = "".join(current).strip()
                 if part:
@@ -280,13 +298,16 @@ def _default_state() -> Dict[str, Any]:
     }
 
 
-def _load_state(payload_or_path: Any) -> Dict[str, Any]:
+def _resolve_state_path(payload_or_path: Any) -> Path:
     if isinstance(payload_or_path, Path):
-        path = payload_or_path
-    elif isinstance(payload_or_path, str):
-        path = Path(payload_or_path)
-    else:
-        path = _state_file_path(payload_or_path)
+        return payload_or_path
+    if isinstance(payload_or_path, str):
+        return Path(payload_or_path)
+    return _state_file_path(payload_or_path)
+
+
+def _load_state(payload_or_path: Any) -> Dict[str, Any]:
+    path = _resolve_state_path(payload_or_path)
     if path.exists():
         try:
             with open(path, encoding="utf-8") as fh:
@@ -309,7 +330,7 @@ def _load_state(payload_or_path: Any) -> Dict[str, Any]:
 
 
 def _prune_state(state: Dict[str, Any]) -> None:
-    """Bound per-invocation dictionaries so state files cannot grow without limit."""
+    """Bound per-invocation dictionaries and deduplication lists so state files cannot grow without limit."""
     bucket = state.get("direct_budget")
     if isinstance(bucket, dict) and len(bucket) > MAX_STATE_INVOCATION_HISTORY:
         sorted_keys = sorted(
@@ -319,14 +340,24 @@ def _prune_state(state: Dict[str, Any]) -> None:
         for old_key in sorted_keys[:-MAX_STATE_INVOCATION_HISTORY]:
             bucket.pop(old_key, None)
 
+    for list_key in (
+        "isolation_reminded_invocations",
+        "recorded_spawn_calls",
+        "stop_reminded_executions",
+    ):
+        items = state.get(list_key)
+        if isinstance(items, list) and len(items) > MAX_STATE_LIST_ENTRIES:
+            state[list_key] = items[-MAX_STATE_LIST_ENTRIES:]
+
+    cb = state.get("circuit_breaker")
+    if isinstance(cb, dict):
+        seen_failures = cb.get("seen_failures")
+        if isinstance(seen_failures, list) and len(seen_failures) > MAX_STATE_LIST_ENTRIES:
+            cb["seen_failures"] = seen_failures[-MAX_STATE_LIST_ENTRIES:]
+
 
 def _save_state(payload_or_path: Any, state: Dict[str, Any]) -> None:
-    if isinstance(payload_or_path, Path):
-        path = payload_or_path
-    elif isinstance(payload_or_path, str):
-        path = Path(payload_or_path)
-    else:
-        path = _state_file_path(payload_or_path)
+    path = _resolve_state_path(payload_or_path)
     _prune_state(state)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -460,6 +491,15 @@ def _command_stays_in_workspace(
     base_dir = Path(os.path.expanduser(cwd)).resolve() if cwd else PROJECT_ROOT
     for match in re.finditer(r"(?:^|[\s=\"'])(/[A-Za-z0-9._/\-]+)", command_line):
         abs_path = match.group(1)
+        start_idx, end_idx = match.span(1)
+        if (
+            start_idx > 0
+            and command_line[start_idx - 1] in ("'", '"')
+            and end_idx < len(command_line)
+            and command_line[end_idx] in ("'", '"', " ")
+            and re.fullmatch(r"/[^/]+/[dgip]?", abs_path)
+        ):
+            continue
         if abs_path == "/tmp" or abs_path.startswith(ALLOWED_SYSTEM_PATH_PREFIXES):
             continue
         if not _is_within_allowed_roots(abs_path, roots):
@@ -541,9 +581,16 @@ def _is_known_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
                         try:
                             age = time.time() - sibling_state_path.stat().st_mtime
                             if age < PENDING_SPAWN_TTL_SECONDS:
-                                state["self_subagent_meta"] = _normalize_subagent_meta(
-                                    pending_list[0]
-                                )
+                                if cid:
+                                    claimed = _normalize_subagent_meta(
+                                        pending_list.pop(0)
+                                    )
+                                    sib_data["pending_spawns"] = pending_list
+                                    sib_data.setdefault("subagents", {})[cid] = claimed
+                                    _save_state(sibling_state_path, sib_data)
+                                else:
+                                    claimed = _normalize_subagent_meta(pending_list[0])
+                                state["self_subagent_meta"] = claimed
                                 _save_state(payload, state)
                                 return True
                         except OSError:
@@ -635,7 +682,8 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
         inv_num = payload.get("invocationNum")
         budget_map = state.get("direct_budget")
         if inv_num is not None and inv_num != 0 and inv_num != "0":
-            if state.get("current_invocation_num") != inv_num:
+            prev_inv = state.get("current_invocation_num")
+            if prev_inv != inv_num:
                 state["current_invocation_num"] = inv_num
                 changed = True
             if isinstance(budget_map, dict):
@@ -645,7 +693,11 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
                 if "0" in budget_map:
                     budget_map.pop("0", None)
                     changed = True
-            if inv_num == 1 or inv_num == "1":
+            if (
+                inv_num == 1
+                or inv_num == "1"
+                or (prev_inv is not None and str(prev_inv) != str(inv_num))
+            ):
                 cb = _get_circuit_breaker(state, payload)
                 if cb.get("failure_streak") or cb.get("tripped"):
                     cb.update(
@@ -686,20 +738,31 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _is_research_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
-    """Return True if the active caller is a research subagent."""
-    _is_known_subagent(payload, state)
+def _get_subagent_type(payload: Dict[str, Any], state: Dict[str, Any]) -> str:
+    if not _is_known_subagent(payload, state):
+        return ""
     meta = state.get("self_subagent_meta")
     if isinstance(meta, dict):
         t = meta.get("type_name") or meta.get("type")
         if t is not None:
-            return t in {"research", "researcher"}
+            return str(t).strip().lower()
     cid = (payload.get("conversationId") or "").strip().lower()
-    if cid and cid in state.get("subagents", {}):
-        sub_info = state["subagents"][cid]
+    sub_info = state.get("subagents", {}).get(cid)
+    if isinstance(sub_info, dict):
         t = sub_info.get("type_name") or sub_info.get("type")
-        return t in {"research", "researcher"}
-    return False
+        if t is not None:
+            return str(t).strip().lower()
+    return ""
+
+
+def _is_research_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
+    """Return True if the active caller is a research subagent."""
+    return _get_subagent_type(payload, state) in {"research", "researcher"}
+
+
+def _is_scout_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
+    """Return True if the active caller is a scout subagent."""
+    return _get_subagent_type(payload, state) == "scout"
 
 
 def _handle_define_subagent(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -708,6 +771,12 @@ def _handle_define_subagent(args: Dict[str, Any]) -> Dict[str, Any]:
         overwrite["EnableSubagentTools"] = False
     if args.get("enable_subagent_tools") is True:
         overwrite["enable_subagent_tools"] = False
+    sub_name = str(args.get("Name") or args.get("name") or "").strip().lower()
+    if sub_name == "scout":
+        if args.get("EnableWriteTools") is True:
+            overwrite["EnableWriteTools"] = False
+        if args.get("enable_write_tools") is True:
+            overwrite["enable_write_tools"] = False
     if overwrite:
         return {
             "decision": "allow",
@@ -794,82 +863,62 @@ def _handle_invoke_subagent(
         state = _load_state(payload)
     call_id = _extract_call_id(payload)
     recorded_calls: List[str] = state.setdefault("recorded_spawn_calls", [])
+    is_list_schema = "Subagents" in args and isinstance(args.get("Subagents"), list)
+    if is_list_schema and not args["Subagents"]:
+        return {
+            "decision": "deny",
+            "reason": "invoke_subagent requires a non-empty 'Subagents' list.",
+        }
 
-    if "Subagents" in args and isinstance(args.get("Subagents"), list):
-        subagents_list = args["Subagents"]
-        if not subagents_list:
-            return {
+    entries = args["Subagents"] if is_list_schema else [args]
+    validated_items: List[Tuple[int, Dict[str, Any], Dict[str, Any], str]] = []
+    for idx, raw_item in enumerate(entries):
+        item = raw_item if isinstance(raw_item, dict) else {}
+        denial, spawn_record, target_model = _validate_and_prepare_subagent_entry(item)
+        if denial is not None or spawn_record is None or target_model is None:
+            return denial or {
                 "decision": "deny",
-                "reason": "invoke_subagent requires a non-empty 'Subagents' list.",
+                "reason": "Invalid subagent entry."
+                if is_list_schema
+                else "Invalid invoke_subagent arguments.",
             }
-        validated_items: List[Tuple[int, Dict[str, Any], Dict[str, Any], str]] = []
-        for idx, raw_item in enumerate(subagents_list):
-            item = raw_item if isinstance(raw_item, dict) else {}
-            denial, spawn_record, target_model = _validate_and_prepare_subagent_entry(item)
-            if denial is not None or spawn_record is None or target_model is None:
-                return denial or {"decision": "deny", "reason": "Invalid subagent entry."}
-            validated_items.append((idx, item, spawn_record, target_model))
+        validated_items.append((idx, item, spawn_record, target_model))
 
-        updated_list: List[Dict[str, Any]] = []
-        any_model_overwritten = False
-        state_changed = False
-        for idx, item, spawn_record, target_model in validated_items:
-            call_sig = json.dumps(
-                [
-                    payload.get("conversationId", ""),
-                    _current_invocation_key(payload, state),
-                    payload.get("executionNum", 0),
-                    f"{call_id}:{idx}",
-                    spawn_record["type_name"],
-                    spawn_record["role"],
-                    spawn_record["workspace"],
-                ],
-                sort_keys=True,
-            )
-            if call_sig not in recorded_calls:
-                recorded_calls.append(call_sig)
-                state.setdefault("pending_spawns", []).append(spawn_record)
-                state_changed = True
-            new_item = dict(item)
-            if item.get("Model") != target_model:
-                new_item["Model"] = target_model
-                any_model_overwritten = True
-            updated_list.append(new_item)
+    updated_list: List[Dict[str, Any]] = []
+    any_model_overwritten = False
+    state_changed = False
+    for idx, item, spawn_record, target_model in validated_items:
+        sig_call_id = f"{call_id}:{idx}" if is_list_schema else call_id
+        call_sig = json.dumps(
+            [
+                payload.get("conversationId", ""),
+                _current_invocation_key(payload, state),
+                payload.get("executionNum", 0),
+                sig_call_id,
+                spawn_record["type_name"],
+                spawn_record["role"],
+                spawn_record["workspace"],
+            ],
+            sort_keys=True,
+        )
+        if call_sig not in recorded_calls:
+            recorded_calls.append(call_sig)
+            state.setdefault("pending_spawns", []).append(spawn_record)
+            state_changed = True
+        new_item = dict(item)
+        if item.get("Model") != target_model:
+            new_item["Model"] = target_model
+            any_model_overwritten = True
+        updated_list.append(new_item)
 
-        if state_changed:
-            _save_state(payload, state)
-        if any_model_overwritten:
-            return {
-                "decision": "allow",
-                "overwrite": {"Subagents": updated_list},
-            }
-        return {"decision": "allow"}
-
-    denial, spawn_record, target_model = _validate_and_prepare_subagent_entry(args)
-    if denial is not None or spawn_record is None or target_model is None:
-        return denial or {"decision": "deny", "reason": "Invalid invoke_subagent arguments."}
-
-    call_sig = json.dumps(
-        [
-            payload.get("conversationId", ""),
-            _current_invocation_key(payload, state),
-            payload.get("executionNum", 0),
-            call_id,
-            spawn_record["type_name"],
-            spawn_record["role"],
-            spawn_record["workspace"],
-        ],
-        sort_keys=True,
-    )
-    if call_sig not in recorded_calls:
-        recorded_calls.append(call_sig)
-        state.setdefault("pending_spawns", []).append(spawn_record)
+    if state_changed:
         _save_state(payload, state)
-
-    if args.get("Model") != target_model:
+    if any_model_overwritten:
         return {
             "decision": "allow",
-            "overwrite": {"Model": target_model},
+            "overwrite": {"Subagents": updated_list}
+            if is_list_schema
+            else {"Model": updated_list[0]["Model"]},
         }
     return {"decision": "allow"}
 
@@ -951,12 +1000,7 @@ def _is_root_orchestrator(
     """Return True when the caller is the root orchestrator."""
     if state is None:
         state = _load_state(payload)
-    cid = (payload.get("conversationId") or "").strip().lower()
-    if cid and cid in state.get("subagents", {}):
-        return False
-    if _is_known_subagent(payload, state):
-        return False
-    return True
+    return not _is_known_subagent(payload, state)
 
 
 def _is_artifact_or_worktree_path(target: str, payload: Dict[str, Any]) -> bool:
@@ -995,28 +1039,18 @@ def _is_allowed_research_scratch_write(target: str, payload: Dict[str, Any]) -> 
     return resolved.suffix.lower() in {".md", ".txt"} and "scratch" in resolved.parts
 
 
+def _extract_any_path_arg(tool_name: str, args: Dict[str, Any]) -> Optional[str]:
+    """Return the first present path argument value from PATH_ARG_KEYS, or None."""
+    for key in PATH_ARG_KEYS:
+        if key in args and args.get(key) is not None:
+            return str(args.get(key))
+    return None
+
+
 def _extract_target_path(tool_name: str, args: Dict[str, Any]) -> str:
     """Extract the target file or directory path for native Antigravity tools."""
-    if tool_name in SEARCH_TOOLS:
-        return str(
-            args.get("SearchPath")
-            or args.get("SearchDirectory")
-            or args.get("DirectoryPath")
-            or args.get("Path")
-            or args.get("AbsolutePath")
-            or ""
-        )
-    if tool_name in READ_TOOLS:
-        return str(
-            args.get("Path")
-            or args.get("DirectoryPath")
-            or args.get("AbsolutePath")
-            or args.get("FilePath")
-            or args.get("file_path")
-            or ""
-        )
-    if tool_name in MUTATION_TOOLS:
-        return str(args.get("Path") or args.get("TargetFile") or "")
+    if tool_name in (SEARCH_TOOLS | READ_TOOLS | MUTATION_TOOLS):
+        return _extract_any_path_arg(tool_name, args) or ""
     return ""
 
 
@@ -1188,6 +1222,60 @@ def _is_code_file(path_str: str) -> bool:
     return ext not in DOC_EXTENSIONS
 
 
+def _compare_test_blobs(
+    old_text: str, new_text: str, file_name: str, is_diff: bool = False
+) -> Optional[str]:
+    """Compare old and new test content for tampering (skip markers, trivial asserts, or net removals)."""
+    if len(TAMPER_SKIP_RE.findall(new_text)) > len(TAMPER_SKIP_RE.findall(old_text)):
+        if is_diff:
+            return f"[ORCHESTRATOR GUARD] Diff audit detected test skip/xfail marker added in '{file_name}'."
+        return (
+            f"[ORCHESTRATOR GUARD] Test tampering blocked in '{file_name}': "
+            "adding skip/xfail decorators or disabling tests is prohibited."
+        )
+
+    if len(TRIVIAL_ASSERT_RE.findall(new_text)) > len(
+        TRIVIAL_ASSERT_RE.findall(old_text)
+    ):
+        if is_diff:
+            return f"[ORCHESTRATOR GUARD] Diff audit detected trivial 'assert True' added in '{file_name}'."
+        return (
+            f"[ORCHESTRATOR GUARD] Test tampering blocked in '{file_name}': "
+            "replacing checks with trivial 'assert True' is prohibited."
+        )
+
+    if is_diff or old_text:
+        old_clean = _strip_comments(old_text)
+        new_clean = _strip_comments(new_text)
+        old_tests = len(TEST_DEF_RE.findall(old_clean))
+        new_tests = len(TEST_DEF_RE.findall(new_clean))
+        if new_tests < old_tests:
+            if is_diff:
+                return (
+                    f"[ORCHESTRATOR GUARD] Diff audit detected net removal of {old_tests - new_tests} "
+                    f"test definition(s) in '{file_name}'."
+                )
+            return (
+                f"[ORCHESTRATOR GUARD] Test tampering blocked in '{file_name}': "
+                f"edit reduces test count from {old_tests} to {new_tests}."
+            )
+
+        old_asserts = len(ASSERTION_RE.findall(old_clean))
+        new_asserts = len(ASSERTION_RE.findall(new_clean))
+        if new_asserts < old_asserts:
+            if is_diff:
+                return (
+                    f"[ORCHESTRATOR GUARD] Diff audit detected net removal of {old_asserts - new_asserts} "
+                    f"assertion(s) in '{file_name}'."
+                )
+            return (
+                f"[ORCHESTRATOR GUARD] Test tampering blocked in '{file_name}': "
+                f"edit reduces assertion count from {old_asserts} to {new_asserts}."
+            )
+
+    return None
+
+
 def _check_test_tampering_in_edit(
     tool_name: str, args: Dict[str, Any], payload: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
@@ -1219,52 +1307,9 @@ def _check_test_tampering_in_edit(
 
     file_name = Path(target).name
     for old_text, new_text in chunks:
-        old_skips = len(TAMPER_SKIP_RE.findall(old_text))
-        new_skips = len(TAMPER_SKIP_RE.findall(new_text))
-        if new_skips > old_skips:
-            return {
-                "decision": "deny",
-                "reason": (
-                    f"[ORCHESTRATOR GUARD] Test tampering blocked in '{file_name}': "
-                    "adding skip/xfail decorators or disabling tests is prohibited."
-                ),
-            }
-
-        old_trivial = len(TRIVIAL_ASSERT_RE.findall(old_text))
-        new_trivial = len(TRIVIAL_ASSERT_RE.findall(new_text))
-        if new_trivial > old_trivial:
-            return {
-                "decision": "deny",
-                "reason": (
-                    f"[ORCHESTRATOR GUARD] Test tampering blocked in '{file_name}': "
-                    "replacing checks with trivial 'assert True' is prohibited."
-                ),
-            }
-
-        if old_text:
-            old_clean = _strip_comments(old_text)
-            new_clean = _strip_comments(new_text)
-            old_tests = len(TEST_DEF_RE.findall(old_clean))
-            new_tests = len(TEST_DEF_RE.findall(new_clean))
-            if new_tests < old_tests:
-                return {
-                    "decision": "deny",
-                    "reason": (
-                        f"[ORCHESTRATOR GUARD] Test tampering blocked in '{file_name}': "
-                        f"edit reduces test count from {old_tests} to {new_tests}."
-                    ),
-                }
-
-            old_asserts = len(ASSERTION_RE.findall(old_clean))
-            new_asserts = len(ASSERTION_RE.findall(new_clean))
-            if new_asserts < old_asserts:
-                return {
-                    "decision": "deny",
-                    "reason": (
-                        f"[ORCHESTRATOR GUARD] Test tampering blocked in '{file_name}': "
-                        f"edit reduces assertion count from {old_asserts} to {new_asserts}."
-                    ),
-                }
+        reason = _compare_test_blobs(old_text, new_text, file_name, is_diff=False)
+        if reason:
+            return {"decision": "deny", "reason": reason}
 
     return None
 
@@ -1283,35 +1328,9 @@ def audit_diff_text(diff_text: str) -> Optional[str]:
     ) -> Optional[str]:
         if not fname or not _is_test_file(fname):
             return None
-        rem_blob = "\n".join(rem)
-        add_blob = "\n".join(add)
-        short_name = Path(fname).name
-
-        if len(TAMPER_SKIP_RE.findall(add_blob)) > len(
-            TAMPER_SKIP_RE.findall(rem_blob)
-        ):
-            return f"[ORCHESTRATOR GUARD] Diff audit detected test skip/xfail marker added in '{short_name}'."
-        if len(TRIVIAL_ASSERT_RE.findall(add_blob)) > len(
-            TRIVIAL_ASSERT_RE.findall(rem_blob)
-        ):
-            return f"[ORCHESTRATOR GUARD] Diff audit detected trivial 'assert True' added in '{short_name}'."
-        rem_clean = _strip_comments(rem_blob)
-        add_clean = _strip_comments(add_blob)
-        rem_tests = len(TEST_DEF_RE.findall(rem_clean))
-        add_tests = len(TEST_DEF_RE.findall(add_clean))
-        if rem_tests > add_tests:
-            return (
-                f"[ORCHESTRATOR GUARD] Diff audit detected net removal of {rem_tests - add_tests} "
-                f"test definition(s) in '{short_name}'."
-            )
-        rem_asserts = len(ASSERTION_RE.findall(rem_clean))
-        add_asserts = len(ASSERTION_RE.findall(add_clean))
-        if rem_asserts > add_asserts:
-            return (
-                f"[ORCHESTRATOR GUARD] Diff audit detected net removal of {rem_asserts - add_asserts} "
-                f"assertion(s) in '{short_name}'."
-            )
-        return None
+        return _compare_test_blobs(
+            "\n".join(rem), "\n".join(add), Path(fname).name, is_diff=True
+        )
 
     for raw_line in diff_text.splitlines():
         if raw_line.startswith("+++ "):
@@ -1339,7 +1358,7 @@ def audit_diff_text(diff_text: str) -> Optional[str]:
 
 
 def _get_circuit_breaker(
-    state: Dict[str, Any], payload: Dict[str, Any]
+    state: Dict[str, Any], payload: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     cb_root = state.setdefault("circuit_breaker", {})
     if "failure_streak" not in cb_root:
@@ -1356,7 +1375,7 @@ def _get_circuit_breaker(
 
 
 def _get_test_receipt(
-    state: Dict[str, Any], payload: Dict[str, Any]
+    state: Dict[str, Any], payload: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     receipt_root = state.setdefault("test_receipt", {})
     if "dirty" not in receipt_root:
@@ -1370,6 +1389,43 @@ def _get_test_receipt(
             }
         )
     return receipt_root
+
+
+def _propagate_receipt_to_parent_brain(
+    payload: Dict[str, Any],
+    dirty: bool,
+    verified: bool,
+    last_mutated_file: Optional[str] = None,
+    last_test_cmd: Optional[str] = None,
+) -> None:
+    """Propagate subagent workspace code mutation / test verification receipts to parent brain state."""
+    artifact_dir = payload.get("artifactDirectoryPath")
+    if not artifact_dir:
+        return
+    try:
+        resolved_art = Path(artifact_dir).resolve()
+        if resolved_art.parent.name != "brain":
+            return
+        cid = (payload.get("conversationId") or "").strip().lower()
+        for sibling_state_path in resolved_art.parent.glob("*/orchestrator_state.json"):
+            if sibling_state_path.parent == resolved_art:
+                continue
+            sib_data = _load_state(sibling_state_path)
+            sib_subagents = sib_data.get("subagents") or {}
+            root_cid = sib_data.get("root_conversation_id")
+            if (cid and cid in sib_subagents) or (
+                root_cid and root_cid != cid and sib_data.get("active") is True
+            ):
+                parent_receipt = _get_test_receipt(sib_data)
+                parent_receipt["dirty"] = dirty
+                parent_receipt["verified"] = verified
+                if last_mutated_file is not None:
+                    parent_receipt["last_mutated_file"] = last_mutated_file
+                if last_test_cmd is not None:
+                    parent_receipt["last_test_cmd"] = last_test_cmd
+                _save_state(sibling_state_path, sib_data)
+    except OSError:
+        pass
 
 
 def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1399,7 +1455,16 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                 }
         elif tool_name == "run_command":
             cmd = (args.get("CommandLine") or "").strip()
-            if not re.match(r"^\s*git\s+(status|diff|log)\b", cmd):
+            sub_cmds = _split_shell_commands(cmd)
+            is_safe_git_inspection = (
+                _is_git_only_command(cmd)
+                and bool(sub_cmds)
+                and all(
+                    bool(re.match(r"^\s*git\s+(status|diff|log)\b", c))
+                    for c in sub_cmds
+                )
+            )
+            if not is_safe_git_inspection:
                 return {
                     "decision": "deny",
                     "reason": (
@@ -1440,6 +1505,14 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
         return _handle_manage_subagents(payload, args, state)
 
     if tool_name in MUTATION_TOOLS:
+        if _is_scout_subagent(payload, state):
+            return {
+                "decision": "deny",
+                "reason": (
+                    "[ORCHESTRATOR GUARD] Scout subagents (Model='flash_lite') are strictly "
+                    "read-only. File mutations are prohibited."
+                ),
+            }
         if _is_research_subagent(payload, state):
             target = _extract_target_path(tool_name, args)
             if not _is_allowed_research_scratch_write(target, payload):
@@ -1477,41 +1550,37 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
             }
         return {"decision": "ask"}
 
-    for path_key in (
-        "Path",
-        "TargetFile",
-        "AbsolutePath",
-        "FilePath",
-        "file_path",
-        "SearchPath",
-        "SearchDirectory",
-        "DirectoryPath",
-    ):
-        if path_key in args:
-            target_path = args.get(path_key)
-            if _is_within_allowed_roots(target_path, roots):
-                budget_denial = _check_and_record_direct_budget(
-                    payload, tool_name, args, state
-                )
-                if budget_denial:
-                    return budget_denial
-                if tool_name in MUTATION_TOOLS:
-                    target = target_path or ""
-                    if not _is_artifact_or_worktree_path(
-                        target, payload
-                    ) and _is_code_file(target):
-                        receipt = _get_test_receipt(state, payload)
-                        receipt["dirty"] = True
-                        receipt["verified"] = False
-                        try:
-                            receipt["last_mutated_file"] = str(
-                                Path(os.path.expanduser(target)).resolve()
-                            )
-                        except OSError:
-                            receipt["last_mutated_file"] = target
-                        _save_state(payload, state)
-                return {"decision": "allow"}
-            return {"decision": "ask"}
+    target_path = _extract_any_path_arg(tool_name, args)
+    if target_path is not None:
+        if _is_within_allowed_roots(target_path, roots):
+            budget_denial = _check_and_record_direct_budget(
+                payload, tool_name, args, state
+            )
+            if budget_denial:
+                return budget_denial
+            if tool_name in MUTATION_TOOLS:
+                if not _is_artifact_or_worktree_path(
+                    target_path, payload
+                ) and _is_code_file(target_path):
+                    receipt = _get_test_receipt(state, payload)
+                    receipt["dirty"] = True
+                    receipt["verified"] = False
+                    try:
+                        receipt["last_mutated_file"] = str(
+                            Path(os.path.expanduser(target_path)).resolve()
+                        )
+                    except OSError:
+                        receipt["last_mutated_file"] = target_path
+                    _save_state(payload, state)
+                    if not _is_root_orchestrator(payload, state):
+                        _propagate_receipt_to_parent_brain(
+                            payload,
+                            dirty=True,
+                            verified=False,
+                            last_mutated_file=receipt["last_mutated_file"],
+                        )
+            return {"decision": "allow"}
+        return {"decision": "ask"}
 
     return {"decision": "allow"}
 
@@ -1557,6 +1626,13 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
             if is_test_cmd:
                 receipt["verified"] = False
                 receipt["last_test_cmd"] = cmd
+                if not _is_root_orchestrator(payload, state):
+                    _propagate_receipt_to_parent_brain(
+                        payload,
+                        dirty=bool(receipt.get("dirty", True)),
+                        verified=False,
+                        last_test_cmd=cmd,
+                    )
         else:
             if (
                 tool_name == "invoke_subagent"
@@ -1565,25 +1641,45 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
             ):
                 cb["failure_streak"] = 0
                 cb["tripped"] = False
-            if isinstance(args.get("Subagents"), list) and args["Subagents"]:
-                invoked_types = [
-                    str((item or {}).get("TypeName") or "").strip().lower()
-                    for item in args["Subagents"]
-                    if isinstance(item, dict)
-                ]
-                is_verification_subagent = tool_name == "invoke_subagent" and any(
+            output_text = str(
+                payload.get("output")
+                or payload.get("result")
+                or tool_call.get("result")
+                or tool_call.get("output")
+                or ""
+            )
+            subagent_blocked_or_failed = bool(
+                tool_name == "invoke_subagent"
+                and re.search(r"(?m)^\s*STATUS:\s*(?:BLOCKED|FAILED)\b", output_text)
+            )
+            entries = (
+                args["Subagents"]
+                if isinstance(args.get("Subagents"), list) and args["Subagents"]
+                else [args]
+            )
+            invoked_types = [
+                str((item or {}).get("TypeName") or "").strip().lower()
+                for item in entries
+                if isinstance(item, dict)
+            ]
+            is_verification_subagent = (
+                tool_name == "invoke_subagent"
+                and not subagent_blocked_or_failed
+                and any(
                     t not in {"scout", "research", "researcher"} for t in invoked_types
                 )
-            else:
-                invoked_type = (args.get("TypeName") or "").strip().lower()
-                is_verification_subagent = (
-                    tool_name == "invoke_subagent"
-                    and invoked_type not in {"scout", "research", "researcher"}
-                )
+            )
             if is_test_cmd or (is_verification_subagent and receipt.get("dirty")):
                 receipt["dirty"] = False
                 receipt["verified"] = True
                 receipt["last_test_cmd"] = cmd or "invoke_subagent"
+                if is_test_cmd and not _is_root_orchestrator(payload, state):
+                    _propagate_receipt_to_parent_brain(
+                        payload,
+                        dirty=False,
+                        verified=True,
+                        last_test_cmd=cmd,
+                    )
 
     _save_state(payload, state)
     return {}
@@ -1821,14 +1917,15 @@ def register_subagent(
     """Helper for explicitly registering a subagent conversationId -> tier mapping."""
     state = _load_state(payload)
     cid = conversation_id.strip().lower()
-    state.setdefault("subagents", {})[cid] = {
-        "role": role or type_name,
-        "type": type_name,
-        "type_name": type_name,
-        "model": model,
-        "workspace": workspace,
-        "active_branch": workspace == "branch",
-    }
+    state.setdefault("subagents", {})[cid] = _normalize_subagent_meta(
+        {
+            "role": role or type_name,
+            "type": type_name,
+            "model": model,
+            "workspace": workspace,
+            "active_branch": workspace == "branch",
+        }
+    )
     _save_state(payload, state)
 
 

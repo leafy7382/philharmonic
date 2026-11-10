@@ -2443,6 +2443,357 @@ NOTES: <one sentence summarizing findings>
         self.assertEqual(r3["decision"], "deny")
         self.assertIn("read limit (2 workspace files) exceeded", r3["reason"])
 
+    def test_redirection_splitting_and_regex_literal_paths_in_workspace(self) -> None:
+        self.assertEqual(
+            orchestrator_guard._split_shell_commands("git diff 2>&1"),
+            ["git diff 2>&1"],
+        )
+        self.assertTrue(orchestrator_guard._is_git_only_command("git diff 2>&1"))
+        self.assertFalse(
+            orchestrator_guard._is_git_only_command("git diff 2>&1 && pytest")
+        )
+
+        roots = orchestrator_guard._allowed_roots(self.base_payload)
+        cwd = str(orchestrator_guard.PROJECT_ROOT)
+        self.assertTrue(
+            orchestrator_guard._command_stays_in_workspace(
+                "awk '/pattern/' README.md", cwd, roots
+            )
+        )
+        self.assertTrue(
+            orchestrator_guard._command_stays_in_workspace(
+                "sed '/foo/d' README.md", cwd, roots
+            )
+        )
+        self.assertFalse(
+            orchestrator_guard._command_stays_in_workspace(
+                "cat /etc/passwd", cwd, roots
+            )
+        )
+
+    def test_tripped_circuit_breaker_blocks_compound_git_command(self) -> None:
+        state = orchestrator_guard._load_state(self.base_payload)
+        cb = orchestrator_guard._get_circuit_breaker(state)
+        cb["failure_streak"] = 2
+        cb["tripped"] = True
+        cb["last_error"] = "exit 1"
+        orchestrator_guard._save_state(self.base_payload, state)
+
+        res_compound = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": "git status && pytest",
+                        "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_compound["decision"], "deny")
+        self.assertIn("2-turn circuit breaker tripped", res_compound["reason"])
+
+        res_git_status = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": "git status",
+                        "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_git_status["decision"], "allow")
+
+        res_git_diff = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": "git diff 2>&1",
+                        "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_git_diff["decision"], "allow")
+
+    def test_parallel_sibling_brain_subagents_claim_distinct_pending_spawns(self) -> None:
+        app_data = Path(self.artifact_dir) / "appdata_parallel"
+        parent_brain = app_data / "brain" / "parent-cid"
+        sub1_brain = app_data / "brain" / "sub-1-cid"
+        sub2_brain = app_data / "brain" / "sub-2-cid"
+        parent_brain.mkdir(parents=True, exist_ok=True)
+        sub1_brain.mkdir(parents=True, exist_ok=True)
+        sub2_brain.mkdir(parents=True, exist_ok=True)
+
+        parent_payload = dict(
+            self.base_payload,
+            conversationId="parent-cid",
+            artifactDirectoryPath=str(parent_brain),
+            toolCall={
+                "id": "parallel_spawn_1",
+                "name": "invoke_subagent",
+                "args": {
+                    "Subagents": [
+                        {
+                            "TypeName": "scout",
+                            "Role": "First Scout",
+                            "Model": "flash_lite",
+                            "Prompt": VALID_PROMPT,
+                        },
+                        {
+                            "TypeName": "implementer",
+                            "Role": "Second Implementer",
+                            "Model": "flash",
+                            "Prompt": VALID_PROMPT,
+                        },
+                    ]
+                },
+            },
+        )
+        self.assertEqual(
+            orchestrator_guard.handle_pre_tool(parent_payload)["decision"], "allow"
+        )
+
+        sub1_payload = dict(
+            self.base_payload,
+            conversationId="sub-1-cid",
+            artifactDirectoryPath=str(sub1_brain),
+        )
+        sub1_state = orchestrator_guard._load_state(sub1_payload)
+        self.assertTrue(orchestrator_guard._is_known_subagent(sub1_payload, sub1_state))
+        self.assertEqual(sub1_state["self_subagent_meta"]["type_name"], "scout")
+
+        sub2_payload = dict(
+            self.base_payload,
+            conversationId="sub-2-cid",
+            artifactDirectoryPath=str(sub2_brain),
+        )
+        sub2_state = orchestrator_guard._load_state(sub2_payload)
+        self.assertTrue(orchestrator_guard._is_known_subagent(sub2_payload, sub2_state))
+        self.assertEqual(sub2_state["self_subagent_meta"]["type_name"], "implementer")
+
+        parent_state_after = orchestrator_guard._load_state(parent_payload)
+        self.assertEqual(len(parent_state_after.get("pending_spawns", [])), 0)
+        self.assertEqual(
+            parent_state_after["subagents"]["sub-1-cid"]["type_name"], "scout"
+        )
+        self.assertEqual(
+            parent_state_after["subagents"]["sub-2-cid"]["type_name"], "implementer"
+        )
+
+    def test_scout_readonly_enforced_in_define_and_pre_tool(self) -> None:
+        define_pascal = dict(
+            self.base_payload,
+            toolCall={
+                "name": "define_subagent",
+                "args": {
+                    "Name": "scout",
+                    "EnableWriteTools": True,
+                    "EnableSubagentTools": True,
+                },
+            },
+        )
+        res_def1 = orchestrator_guard.handle_pre_tool(define_pascal)
+        self.assertEqual(res_def1["decision"], "allow")
+        self.assertEqual(
+            res_def1["overwrite"],
+            {"EnableSubagentTools": False, "EnableWriteTools": False},
+        )
+
+        define_snake = dict(
+            self.base_payload,
+            toolCall={
+                "name": "define_subagent",
+                "args": {
+                    "name": "scout",
+                    "enable_write_tools": True,
+                    "enable_subagent_tools": False,
+                },
+            },
+        )
+        res_def2 = orchestrator_guard.handle_pre_tool(define_snake)
+        self.assertEqual(res_def2["decision"], "allow")
+        self.assertEqual(res_def2["overwrite"], {"enable_write_tools": False})
+
+        scout_cid = "scout-readonly-worker-01"
+        orchestrator_guard.register_subagent(
+            self.base_payload,
+            conversation_id=scout_cid,
+            type_name="scout",
+            model="flash_lite",
+        )
+        scratch_md = str(Path(self.artifact_dir) / "scratch" / "notes.md")
+        res_scout_write = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                conversationId=scout_cid,
+                toolCall={
+                    "name": "write_file",
+                    "args": {"Path": scratch_md, "Content": "hello"},
+                },
+            )
+        )
+        self.assertEqual(res_scout_write["decision"], "deny")
+        self.assertIn("Scout subagents", res_scout_write["reason"])
+
+    def test_blocked_or_failed_subagent_output_does_not_clear_dirty_receipt(self) -> None:
+        state = orchestrator_guard._load_state(self.base_payload)
+        receipt = orchestrator_guard._get_test_receipt(state)
+        receipt["dirty"] = True
+        receipt["verified"] = False
+        orchestrator_guard._save_state(self.base_payload, state)
+
+        blocked_report = (
+            "STATUS: BLOCKED\n"
+            "FILES_CHANGED: NONE\n"
+            "VERIFICATION: pytest failed twice.\n"
+            "NOTES: Failing test in auth module at file:///tmp/scratch/fail.log"
+        )
+        orchestrator_guard.handle_post_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "impl_blocked_call",
+                    "name": "invoke_subagent",
+                    "args": {"TypeName": "implementer"},
+                },
+                output=blocked_report,
+                error="",
+            )
+        )
+        state_after = orchestrator_guard._load_state(self.base_payload)
+        receipt_after = orchestrator_guard._get_test_receipt(state_after)
+        self.assertTrue(receipt_after["dirty"])
+        self.assertFalse(receipt_after["verified"])
+
+    def test_prune_state_bounds_deduplication_lists_and_cli_reset(self) -> None:
+        state = orchestrator_guard._load_state(self.base_payload)
+        limit = orchestrator_guard.MAX_STATE_LIST_ENTRIES
+        state["isolation_reminded_invocations"] = [f"inv:{i}" for i in range(limit + 25)]
+        state["recorded_spawn_calls"] = [f"spawn:{i}" for i in range(limit + 25)]
+        state["stop_reminded_executions"] = [f"stop:{i}" for i in range(limit + 25)]
+        cb = orchestrator_guard._get_circuit_breaker(state)
+        cb["seen_failures"] = [f"fail:{i}" for i in range(limit + 25)]
+        orchestrator_guard._save_state(self.base_payload, state)
+
+        reloaded = orchestrator_guard._load_state(self.base_payload)
+        self.assertEqual(len(reloaded["isolation_reminded_invocations"]), limit)
+        self.assertEqual(len(reloaded["recorded_spawn_calls"]), limit)
+        self.assertEqual(len(reloaded["stop_reminded_executions"]), limit)
+        self.assertEqual(
+            len(orchestrator_guard._get_circuit_breaker(reloaded)["seen_failures"]),
+            limit,
+        )
+        self.assertEqual(
+            reloaded["recorded_spawn_calls"][-1], f"spawn:{limit + 24}"
+        )
+
+        reset_res = orchestrator_guard._cli_reset(self.base_payload)
+        self.assertEqual(reset_res["status"], "reset")
+        after_reset = orchestrator_guard._load_state(self.base_payload)
+        self.assertEqual(after_reset["recorded_spawn_calls"], [])
+
+    def test_cross_brain_subagent_receipt_propagation_and_cb_invocation_reset(
+        self,
+    ) -> None:
+        app_data = Path(self.artifact_dir) / "appdata_receipt_prop"
+        parent_brain = app_data / "brain" / "parent-root-cid"
+        sub_brain = app_data / "brain" / "sub-impl-cid"
+        parent_brain.mkdir(parents=True, exist_ok=True)
+        sub_brain.mkdir(parents=True, exist_ok=True)
+
+        parent_payload = dict(
+            self.base_payload,
+            conversationId="parent-root-cid",
+            artifactDirectoryPath=str(parent_brain),
+            invocationNum=2,
+        )
+        orchestrator_guard.handle_pre_invocation(parent_payload)
+        orchestrator_guard.register_subagent(
+            parent_payload,
+            conversation_id="sub-impl-cid",
+            type_name="implementer",
+            model="flash",
+            role="Cross-Brain Implementer",
+        )
+
+        code_path = str(orchestrator_guard.PROJECT_ROOT / "src_cross_brain.py")
+        sub_edit_payload = dict(
+            self.base_payload,
+            conversationId="sub-impl-cid",
+            artifactDirectoryPath=str(sub_brain),
+            toolCall={
+                "name": "write_file",
+                "args": {"Path": code_path, "Content": "x = 1\n"},
+            },
+        )
+        self.assertEqual(
+            orchestrator_guard.handle_pre_tool(sub_edit_payload)["decision"], "allow"
+        )
+
+        parent_state = orchestrator_guard._load_state(parent_payload)
+        parent_receipt = orchestrator_guard._get_test_receipt(parent_state)
+        self.assertTrue(parent_receipt["dirty"])
+        self.assertFalse(parent_receipt["verified"])
+
+        parent_stop_1 = dict(
+            parent_payload,
+            fullyIdle=True,
+            terminationReason="NO_TOOL_CALL",
+            executionNum=1,
+        )
+        res_stop_1 = orchestrator_guard.handle_stop(parent_stop_1)
+        self.assertEqual(res_stop_1["decision"], "continue")
+        self.assertIn("Empirical test receipt missing", res_stop_1["reason"])
+
+        sub_test_post = dict(
+            self.base_payload,
+            conversationId="sub-impl-cid",
+            artifactDirectoryPath=str(sub_brain),
+            toolCall={
+                "id": "sub_pytest_pass",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "pytest tests/",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+            error="",
+        )
+        orchestrator_guard.handle_post_tool(sub_test_post)
+
+        parent_state_2 = orchestrator_guard._load_state(parent_payload)
+        parent_receipt_2 = orchestrator_guard._get_test_receipt(parent_state_2)
+        self.assertFalse(parent_receipt_2["dirty"])
+        self.assertTrue(parent_receipt_2["verified"])
+
+        parent_stop_2 = dict(parent_stop_1, executionNum=2)
+        self.assertEqual(
+            orchestrator_guard.handle_stop(parent_stop_2)["decision"], "allow"
+        )
+
+        # Trip circuit breaker on invocation 2, then verify advancing to invocation 3 resets it
+        cb = orchestrator_guard._get_circuit_breaker(parent_state_2)
+        cb["failure_streak"] = 2
+        cb["tripped"] = True
+        cb["last_error"] = "failed twice on inv 2"
+        orchestrator_guard._save_state(parent_payload, parent_state_2)
+
+        parent_inv3 = dict(parent_payload, invocationNum=3)
+        orchestrator_guard.handle_pre_invocation(parent_inv3)
+        parent_state_3 = orchestrator_guard._load_state(parent_inv3)
+        cb_3 = orchestrator_guard._get_circuit_breaker(parent_state_3)
+        self.assertFalse(cb_3["tripped"])
+        self.assertEqual(cb_3["failure_streak"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+

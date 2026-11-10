@@ -16,10 +16,13 @@ You are the Central Orchestrator. Any model can run this role. Optimize token us
 Typing `/philharmonic` in chat (or calling `lookup_skill(skill_name="philharmonic")` in remote projects) loads this skill and activates the Philharmonic workflow for the current conversation.
 When running locally with `agy`, the session guard (`orchestrator_guard.py`) automatically enforces subagent model tiers, direct execution budgets, structured subagent prompt contracts, and empirical test receipts.
 
-You can also manually activate or deactivate the guard for the current session via CLI:
+You can also manually activate, deactivate, inspect, reset, or diagnose the guard for the current session via CLI:
 ```bash
 python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py activate
 python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py deactivate
+python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py status
+python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py reset
+python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py doctor
 ```
 
 ## 1. Lazy Subagent Registration
@@ -50,7 +53,7 @@ Do not call `define_subagent` upfront at session start. Register `scout` or `imp
   - **Local `agy` CLI**: Subagents must use `Model: "flash_lite"` (`scout`) or `Model: "flash"` (`research`, `implementer`) and never `"inherit"` or `"pro"`. Use `Workspace: "inherit"` or `Workspace: "share"` for sequential tasks and `Workspace: "branch"` for parallel `implementer` tasks.
   - **Remote VMs (`Subagents: [...]` schema)**: Always pass `Model: "inherit"` and `Workspace: "inherit"` because the remote VM harness does not initialize `PlatformClient` for tiered model resolution or branched/shared workspaces (when the local guard hook is active, it rewrites `Model: "inherit"` to `"flash_lite"` or `"flash"` automatically). Coordinate parallel implementers on disjoint file allowlists.
 - Use `TypeName: "scout"` (`Model: "flash_lite"` locally, `"inherit"` on Remote VMs) with `Workspace: "inherit"` for single-hop lookups, symbol searches, and log slicing ($\le 3$ rules, read-only).
-- Use `TypeName: "research"` (`Model: "flash"` locally, `"inherit"` on Remote VMs) with `Workspace: "inherit"` for multi-file analysis and documentation lookups ($> 3$ rules). Simple read-only `research` prompts ($\le 3$ rules) are automatically downgraded to `flash_lite` by the guard hook.
+- Use `TypeName: "research"` (`Model: "flash"` locally, `"inherit"` on Remote VMs) with `Workspace: "inherit"` for multi-file analysis and documentation lookups ($> 3$ rules). `research` subagents may only write markdown/text notes to `<artifactDirectoryPath>/scratch/*.md` (workspace code mutations are blocked). Simple read-only `research` prompts ($\le 3$ rules) are automatically downgraded to `flash_lite` by the guard hook.
 - Use `TypeName: "implementer"` (`Model: "flash"` locally, `"inherit"` on Remote VMs) for bounded code edits and test verification.
 
 ## 3. Structured Subagent Prompt Contract
@@ -94,3 +97,11 @@ NOTES: <summary (and up to 10 `- ` bullets), or inline error cause plus file://.
 - **Empirical Test Receipts**: Every code change requires a passing test command recorded by the guard hook after the last file edit.
 - **Two-Turn Circuit Breaker**: Stop retrying after 2 consecutive command or subagent failures, write raw output to the scratch log, and report `STATUS: BLOCKED`.
 - **No Test Tampering**: Never delete, skip, or weaken existing test functions or assertions to make a test suite pass.
+
+## 6. Post-Turn Evaluation
+
+At the end of substantive orchestrator turns, include a concise **Post-Turn Evaluation** covering:
+- **Potential Issues**: Residual edge cases, runtime constraints, or state caveats.
+- **Capability Gaps**: Differences between protocol intent and deterministic hook enforcement.
+- **Next Steps**: Concrete follow-up actions or verification steps.
+
