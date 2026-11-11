@@ -113,7 +113,7 @@ NOTES: <summary (and up to 10 `- ` bullets), or inline error cause plus file://.
 
 ## Lifecycle Hooks
 
-Configured in [hooks.json](.agents/plugins/philharmonic_orchestra/hooks.json) and implemented in [orchestrator_guard.py](.agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py), with session state persisted via `flock` in `<artifactDirectoryPath>/orchestrator_state.json`:
+Configured in [hooks.json](.agents/plugins/philharmonic_orchestra/hooks.json) and dispatched via [orchestrator_guard.py](.agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py) (backed by the modular [guard/](.agents/plugins/philharmonic_orchestra/scripts/guard) package: `constants.py`, `identity.py`, `policies.py`, `state_store.py`, `verification.py`, `cli.py`), with session state persisted via `flock` in `<artifactDirectoryPath>/orchestrator_state.json`:
 
 1. **`pre-invocation`**: Records the root orchestrator conversation ID, caches subagent identity across isolated brain directories, and injects a context-isolation reminder into worker subagents.
 2. **`pre-tool`**:
@@ -180,6 +180,13 @@ python3 -m unittest discover -s tests
 │           ├── hooks.json
 │           ├── plugin.json
 │           ├── scripts/
+│           │   ├── guard/
+│           │   │   ├── cli.py
+│           │   │   ├── constants.py
+│           │   │   ├── identity.py
+│           │   │   ├── policies.py
+│           │   │   ├── state_store.py
+│           │   │   └── verification.py
 │           │   └── orchestrator_guard.py
 │           └── skills/
 │               └── philharmonic/

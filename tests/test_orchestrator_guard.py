@@ -2993,6 +2993,826 @@ NOTES: <one sentence summarizing findings>
         self.assertEqual(res_sub1_none_deny["decision"], "deny")
         self.assertIn("NONE", res_sub1_none_deny["reason"])
 
+    def test_thin_entrypoint_line_budget_and_modular_guard_exports(self) -> None:
+        import guard
+        guard_py = SCRIPT_DIR / "orchestrator_guard.py"
+        lines = guard_py.read_text(encoding="utf-8").splitlines()
+        self.assertLess(len(lines), 80)
+        self.assertGreater(len(lines), 10)
+        for sym in guard.__all__:
+            self.assertTrue(
+                hasattr(orchestrator_guard, sym),
+                f"Symbol '{sym}' missing from orchestrator_guard",
+            )
+
+    def test_c1_no_wildcard_command_override_and_redirection_bare_root_symlink_guards(
+        self,
+    ) -> None:
+        import os
+
+        cmd = "git status"
+        res = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={"name": "run_command", "args": {"CommandLine": cmd}},
+            )
+        )
+        self.assertEqual(res.get("decision"), "allow")
+        overrides = res.get("permissionOverrides", [])
+        self.assertNotIn("command(*)", overrides)
+        self.assertIn(f"command({cmd})", overrides)
+        self.assertTrue(any(str(o).startswith("file(") for o in overrides))
+
+        roots = [Path(self.artifact_dir).resolve()]
+        isolated_payload = dict(
+            self.base_payload,
+            workspacePaths=[str(self.artifact_dir)],
+        )
+
+        self.assertFalse(
+            orchestrator_guard._command_stays_in_workspace(
+                "cat >/etc/passwd", cwd=str(self.artifact_dir), roots=roots
+            )
+        )
+        self.assertFalse(
+            orchestrator_guard._command_stays_in_workspace(
+                "echo hi>>/etc/hosts", cwd=str(self.artifact_dir), roots=roots
+            )
+        )
+        res_cat = orchestrator_guard.handle_pre_tool(
+            dict(
+                isolated_payload,
+                toolCall={
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": "cat >/etc/passwd",
+                        "Cwd": str(self.artifact_dir),
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_cat.get("decision"), "ask")
+
+        self.assertFalse(
+            orchestrator_guard._command_stays_in_workspace(
+                "ls /", cwd=str(self.artifact_dir), roots=roots
+            )
+        )
+        res_root = orchestrator_guard.handle_pre_tool(
+            dict(
+                isolated_payload,
+                toolCall={
+                    "name": "run_command",
+                    "args": {"CommandLine": "ls /", "Cwd": str(self.artifact_dir)},
+                },
+            )
+        )
+        self.assertEqual(res_root.get("decision"), "ask")
+
+        self.assertFalse(
+            orchestrator_guard._command_stays_in_workspace(
+                "ls $HOME", cwd=str(self.artifact_dir), roots=roots
+            )
+        )
+        res_home = orchestrator_guard.handle_pre_tool(
+            dict(
+                isolated_payload,
+                toolCall={
+                    "name": "run_command",
+                    "args": {"CommandLine": "ls $HOME", "Cwd": str(self.artifact_dir)},
+                },
+            )
+        )
+        self.assertEqual(res_home.get("decision"), "ask")
+
+        oldpwd_orig = os.environ.get("OLDPWD")
+        try:
+            os.environ["OLDPWD"] = "/var/log"
+            self.assertFalse(
+                orchestrator_guard._command_stays_in_workspace(
+                    "ls $OLDPWD", cwd=str(self.artifact_dir), roots=roots
+                )
+            )
+            res_oldpwd = orchestrator_guard.handle_pre_tool(
+                dict(
+                    isolated_payload,
+                    toolCall={
+                        "name": "run_command",
+                        "args": {
+                            "CommandLine": "ls $OLDPWD",
+                            "Cwd": str(self.artifact_dir),
+                        },
+                    },
+                )
+            )
+            self.assertEqual(res_oldpwd.get("decision"), "ask")
+        finally:
+            if oldpwd_orig is not None:
+                os.environ["OLDPWD"] = oldpwd_orig
+            else:
+                os.environ.pop("OLDPWD", None)
+
+        symlink_path = Path(self.artifact_dir) / "link_to_hosts"
+        if not symlink_path.exists():
+            symlink_path.symlink_to("/etc/hosts")
+        self.assertFalse(
+            orchestrator_guard._command_stays_in_workspace(
+                "cat link_to_hosts", cwd=str(self.artifact_dir), roots=roots
+            )
+        )
+        res_sym = orchestrator_guard.handle_pre_tool(
+            dict(
+                isolated_payload,
+                toolCall={
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": "cat link_to_hosts",
+                        "Cwd": str(self.artifact_dir),
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_sym.get("decision"), "ask")
+
+    def test_c2_allowed_files_blocks_nested_basename_collision_and_shell_writes(
+        self,
+    ) -> None:
+        orchestrator_guard.register_subagent(
+            self.base_payload,
+            conversation_id="imp-c2",
+            type_name="implementer",
+            model="flash",
+            allowed_files=["module_a.py"],
+        )
+        imp_payload = dict(self.base_payload, conversationId="imp-c2")
+
+        res_root_file = orchestrator_guard.handle_pre_tool(
+            dict(
+                imp_payload,
+                toolCall={
+                    "name": "write_file",
+                    "args": {
+                        "Path": str(orchestrator_guard.PROJECT_ROOT / "module_a.py"),
+                        "Content": "x = 1\n",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_root_file.get("decision"), "allow")
+
+        res_nested_file = orchestrator_guard.handle_pre_tool(
+            dict(
+                imp_payload,
+                toolCall={
+                    "name": "write_file",
+                    "args": {
+                        "Path": str(
+                            orchestrator_guard.PROJECT_ROOT
+                            / "nested_dir"
+                            / "module_a.py"
+                        ),
+                        "Content": "x = 1\n",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_nested_file.get("decision"), "deny")
+        self.assertIn("File allowlist violation", res_nested_file.get("reason", ""))
+
+        res_cmd_echo = orchestrator_guard.handle_pre_tool(
+            dict(
+                imp_payload,
+                toolCall={
+                    "name": "run_command",
+                    "args": {"CommandLine": "echo hacked > module_b.py"},
+                },
+            )
+        )
+        self.assertEqual(res_cmd_echo.get("decision"), "deny")
+        self.assertIn("File allowlist violation", res_cmd_echo.get("reason", ""))
+
+        res_cmd_rm = orchestrator_guard.handle_pre_tool(
+            dict(
+                imp_payload,
+                toolCall={
+                    "name": "run_command",
+                    "args": {"CommandLine": "rm module_b.py"},
+                },
+            )
+        )
+        self.assertEqual(res_cmd_rm.get("decision"), "deny")
+        self.assertIn("File allowlist violation", res_cmd_rm.get("reason", ""))
+
+        orchestrator_guard.register_subagent(
+            self.base_payload,
+            conversation_id="scout-c2",
+            type_name="scout",
+            model="flash_lite",
+        )
+        scout_payload = dict(self.base_payload, conversationId="scout-c2")
+
+        res_scout_write = orchestrator_guard.handle_pre_tool(
+            dict(
+                scout_payload,
+                toolCall={
+                    "name": "run_command",
+                    "args": {"CommandLine": "echo x > out.txt"},
+                },
+            )
+        )
+        self.assertEqual(res_scout_write.get("decision"), "deny")
+
+        res_scout_rm = orchestrator_guard.handle_pre_tool(
+            dict(
+                scout_payload,
+                toolCall={
+                    "name": "run_command",
+                    "args": {"CommandLine": "rm README.md"},
+                },
+            )
+        )
+        self.assertEqual(res_scout_rm.get("decision"), "deny")
+
+        res_scout_git = orchestrator_guard.handle_pre_tool(
+            dict(
+                scout_payload,
+                toolCall={
+                    "name": "run_command",
+                    "args": {"CommandLine": "git status"},
+                },
+            )
+        )
+        self.assertEqual(res_scout_git.get("decision"), "allow")
+
+        res_scout_ls = orchestrator_guard.handle_pre_tool(
+            dict(
+                scout_payload,
+                toolCall={
+                    "name": "run_command",
+                    "args": {"CommandLine": "ls"},
+                },
+            )
+        )
+        self.assertEqual(res_scout_ls.get("decision"), "allow")
+
+    def test_c3_nonzero_command_exit_output_fails_receipt_and_trips_cb_while_allowing_subagent_blocked_report(
+        self,
+    ) -> None:
+        orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "write_file",
+                    "args": {
+                        "Path": str(orchestrator_guard.PROJECT_ROOT / "code_c3.py"),
+                        "Content": "val = 42\n",
+                    },
+                },
+            )
+        )
+        state_after_write = orchestrator_guard._load_state(self.base_payload)
+        receipt_after_write = orchestrator_guard._get_test_receipt(state_after_write)
+        self.assertTrue(receipt_after_write.get("dirty"))
+
+        call_id1 = "post-call-c3-1"
+        orchestrator_guard.handle_post_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": call_id1,
+                    "name": "run_command",
+                    "args": {"CommandLine": "pytest tests/"},
+                },
+                error="",
+                output="Command exited with code 1\n1 failed",
+            )
+        )
+        state_post1 = orchestrator_guard._load_state(self.base_payload)
+        rec1 = orchestrator_guard._get_test_receipt(state_post1)
+        cb1 = orchestrator_guard._get_circuit_breaker(state_post1)
+        self.assertTrue(rec1.get("dirty"))
+        self.assertFalse(rec1.get("verified"))
+        self.assertEqual(cb1.get("failure_streak"), 1)
+
+        call_id2 = "post-call-c3-2"
+        orchestrator_guard.handle_post_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": call_id2,
+                    "name": "run_command",
+                    "args": {"CommandLine": "pytest tests/"},
+                },
+                error="",
+                output="Command exited with code 2\nfatal error",
+            )
+        )
+        state_post2 = orchestrator_guard._load_state(self.base_payload)
+        cb2 = orchestrator_guard._get_circuit_breaker(state_post2)
+        self.assertTrue(cb2.get("tripped"))
+
+        res_root_send = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "send_message",
+                    "args": {"Recipient": "sub-worker", "Message": "try again"},
+                },
+            )
+        )
+        self.assertEqual(res_root_send.get("decision"), "deny")
+
+        orchestrator_guard.register_subagent(
+            self.base_payload,
+            conversation_id="sub-c3",
+            type_name="implementer",
+            model="flash",
+        )
+        sub_payload = dict(self.base_payload, conversationId="sub-c3")
+        res_sub_blocked = orchestrator_guard.handle_pre_tool(
+            dict(
+                sub_payload,
+                toolCall={
+                    "name": "send_message",
+                    "args": {
+                        "Recipient": self.base_payload["conversationId"],
+                        "Message": (
+                            "STATUS: BLOCKED\n"
+                            "FILES_CHANGED: NONE\n"
+                            "VERIFICATION: pytest tests/ exited with 1\n"
+                            f"NOTES: Tests failed repeatedly file://{self.artifact_dir}/scratch/fail.log\n"
+                        ),
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_sub_blocked.get("decision"), "allow")
+
+    def test_c4_cross_brain_isolation_preserves_unrelated_active_sessions(
+        self,
+    ) -> None:
+        base_dir = Path(self.artifact_dir)
+        ws_a = base_dir / "ws_a"
+        ws_b = base_dir / "ws_b"
+        ws_a.mkdir(parents=True, exist_ok=True)
+        ws_b.mkdir(parents=True, exist_ok=True)
+
+        brain_dir = base_dir / "brain"
+        brain_a = brain_dir / "session-a"
+        brain_b = brain_dir / "session-b"
+        brain_sub = brain_dir / "sub-a"
+        brain_a.mkdir(parents=True, exist_ok=True)
+        brain_b.mkdir(parents=True, exist_ok=True)
+        brain_sub.mkdir(parents=True, exist_ok=True)
+
+        payload_a = {
+            "conversationId": "session-a",
+            "artifactDirectoryPath": str(brain_a),
+            "workspacePaths": [str(ws_a.resolve())],
+        }
+        payload_b = {
+            "conversationId": "session-b",
+            "artifactDirectoryPath": str(brain_b),
+            "workspacePaths": [str(ws_b.resolve())],
+        }
+
+        st_a = orchestrator_guard._load_state(payload_a)
+        st_a["active"] = True
+        st_a["session_evaluated"] = True
+        st_a["root_conversation_id"] = "session-a"
+        st_a["workspace_roots"] = [str(ws_a.resolve())]
+        st_a["test_receipt"] = {"dirty": True, "verified": False}
+        st_a["pending_spawns"] = [
+            {"call_id": "spawn-a", "type": "implementer", "model": "flash"}
+        ]
+        orchestrator_guard._save_state(payload_a, st_a)
+
+        st_b = orchestrator_guard._load_state(payload_b)
+        st_b["active"] = True
+        st_b["session_evaluated"] = True
+        st_b["root_conversation_id"] = "session-b"
+        st_b["workspace_roots"] = [str(ws_b.resolve())]
+        st_b["test_receipt"] = {"dirty": True, "verified": False}
+        st_b["pending_spawns"] = [
+            {"call_id": "spawn-b", "type": "implementer", "model": "flash"}
+        ]
+        orchestrator_guard._save_state(payload_b, st_b)
+
+        sub_payload = {
+            "conversationId": "sub-a",
+            "workspacePaths": [str(ws_a.resolve())],
+            "artifactDirectoryPath": str(brain_sub),
+            "modelName": "Gemini 4 Flash",
+            "invocationNum": 1,
+        }
+        st_sub = orchestrator_guard._load_state(sub_payload)
+        self.assertTrue(orchestrator_guard._is_known_subagent(sub_payload, st_sub))
+
+        post_passing = dict(
+            sub_payload,
+            toolCall={
+                "name": "run_command",
+                "args": {"CommandLine": "pytest tests/test_feature.py"},
+            },
+            error="",
+            output="1 passed in 0.02s",
+        )
+        orchestrator_guard.handle_post_tool(post_passing)
+
+        st_a_final = orchestrator_guard._load_state(payload_a)
+        rec_a = orchestrator_guard._get_test_receipt(st_a_final)
+        self.assertFalse(rec_a.get("dirty"))
+        self.assertTrue(rec_a.get("verified"))
+
+        st_b_final = orchestrator_guard._load_state(payload_b)
+        rec_b = orchestrator_guard._get_test_receipt(st_b_final)
+        self.assertTrue(rec_b.get("dirty"))
+        self.assertFalse(rec_b.get("verified"))
+        self.assertEqual(len(st_b_final.get("pending_spawns", [])), 1)
+        self.assertEqual(st_b_final["pending_spawns"][0].get("call_id"), "spawn-b")
+
+    def test_h1_multiprocess_concurrent_state_transactions_and_corrupt_recovery(
+        self,
+    ) -> None:
+        import subprocess
+
+        worker_code = """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import orchestrator_guard
+payload = {"artifactDirectoryPath": sys.argv[2], "conversationId": "root-mp"}
+orchestrator_guard.register_subagent(
+    payload,
+    conversation_id=sys.argv[3],
+    type_name="scout",
+    model="flash_lite",
+)
+"""
+        procs = []
+        for i in range(6):
+            p = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    worker_code,
+                    str(SCRIPT_DIR),
+                    self.artifact_dir,
+                    f"worker-{i}",
+                ]
+            )
+            procs.append(p)
+
+        for p in procs:
+            exit_code = p.wait()
+            self.assertEqual(exit_code, 0)
+
+        final_state = orchestrator_guard._load_state(
+            {"artifactDirectoryPath": self.artifact_dir, "conversationId": "root-mp"}
+        )
+        self.assertEqual(len(final_state.get("subagents", {})), 6)
+
+        corrupt_temp = tempfile.TemporaryDirectory()
+        try:
+            corrupt_payload = {
+                "artifactDirectoryPath": corrupt_temp.name,
+                "conversationId": "corrupt-cid",
+            }
+            corrupt_file = orchestrator_guard._state_file_path(corrupt_payload)
+            corrupt_file.write_text("{corrupt", encoding="utf-8")
+            recovered = orchestrator_guard._load_state(corrupt_payload)
+            self.assertTrue(recovered.get("active"))
+            self.assertTrue(recovered.get("session_evaluated"))
+        finally:
+            corrupt_temp.cleanup()
+
+    def test_h2_async_spawn_ack_keeps_dirty_receipt_until_verified(self) -> None:
+        orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "write_file",
+                    "args": {
+                        "Path": str(orchestrator_guard.PROJECT_ROOT / "mut_h2.py"),
+                        "Content": "y = 99\n",
+                    },
+                },
+            )
+        )
+        st_pre = orchestrator_guard._load_state(self.base_payload)
+        rec_pre = orchestrator_guard._get_test_receipt(st_pre)
+        self.assertTrue(rec_pre.get("dirty"))
+
+        ack_output = (
+            'Created the following subagent:\n'
+            '{"conversationId": "12345678-1234-1234-1234-1234567890ab"}'
+        )
+        orchestrator_guard.handle_post_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "invoke_subagent",
+                    "args": {"TypeName": "implementer"},
+                },
+                output=ack_output,
+            )
+        )
+
+        st_post = orchestrator_guard._load_state(self.base_payload)
+        rec_post = orchestrator_guard._get_test_receipt(st_post)
+        self.assertTrue(rec_post.get("dirty"))
+        self.assertFalse(rec_post.get("verified"))
+
+    def test_h3_deleted_test_file_diff_multireplace_and_block_comment_tampering(
+        self,
+    ) -> None:
+        deleted_diff = (
+            "--- a/tests/test_old.py\n"
+            "+++ /dev/null\n"
+            "@@ -1,2 +0,0 @@\n"
+            "-def test_old():\n"
+            "-    assert 1 == 1\n"
+        )
+        verdict = orchestrator_guard.audit_diff_text(deleted_diff)
+        self.assertIsNotNone(verdict)
+        self.assertIn("Diff audit detected", verdict or "")
+
+        res_multi = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "multi_replace_file_content",
+                    "args": {
+                        "TargetFile": "tests/test_x.py",
+                        "ReplacementChunks": [
+                            {
+                                "TargetContent": "def test_a():\n    assert a == 1\n",
+                                "ReplacementContent": "def test_a():\n    pass\n",
+                            }
+                        ],
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_multi.get("decision"), "deny")
+        self.assertIn("Test tampering blocked", res_multi.get("reason", ""))
+
+        res_docstring = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "edit_file",
+                    "args": {
+                        "Path": "tests/test_x.py",
+                        "Target": "def test_b():\n    assert x == 1\n",
+                        "Replacement": 'def test_b():\n    """\n    assert x == 1\n    """\n',
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_docstring.get("decision"), "deny")
+        self.assertIn("Test tampering blocked", res_docstring.get("reason", ""))
+
+        res_c_comment = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "edit_file",
+                    "args": {
+                        "Path": "tests/test_x.py",
+                        "Target": "def test_b():\n    assert x == 1\n",
+                        "Replacement": "def test_b():\n    /* assert x == 1 */\n",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_c_comment.get("decision"), "deny")
+        self.assertIn("Test tampering blocked", res_c_comment.get("reason", ""))
+
+    def test_h4_h5_m3_subagent_send_message_validation_unsynced_allowlist_and_manage_subagents(
+        self,
+    ) -> None:
+        brain_base = Path(self.artifact_dir) / "brain"
+        parent_brain = brain_base / "parent-h4"
+        sub_brain = brain_base / "sub-h4"
+        parent_brain.mkdir(parents=True, exist_ok=True)
+        sub_brain.mkdir(parents=True, exist_ok=True)
+
+        parent_payload = dict(
+            self.base_payload,
+            conversationId="parent-h4",
+            artifactDirectoryPath=str(parent_brain),
+        )
+        orchestrator_guard.register_subagent(
+            parent_payload,
+            conversation_id="sub-h4",
+            type_name="implementer",
+            model="flash",
+        )
+
+        sub_payload = dict(
+            self.base_payload,
+            conversationId="sub-h4",
+            artifactDirectoryPath=str(sub_brain),
+            modelName="Gemini 4 Flash",
+        )
+
+        bad_report = "STATUS: COMPLETED\nFILES_CHANGED: NONE\n"
+        res_bad = orchestrator_guard.handle_pre_tool(
+            dict(
+                sub_payload,
+                toolCall={
+                    "name": "send_message",
+                    "args": {"Recipient": "parent-h4", "Message": bad_report},
+                },
+            )
+        )
+        self.assertEqual(res_bad.get("decision"), "deny")
+        self.assertIn("Subagent report format error", res_bad.get("reason", ""))
+
+        good_report = (
+            "STATUS: COMPLETED\n"
+            "FILES_CHANGED: NONE\n"
+            "VERIFICATION: pytest tests/ passed\n"
+            "NOTES: Finished all tasks cleanly.\n"
+        )
+        res_good = orchestrator_guard.handle_pre_tool(
+            dict(
+                sub_payload,
+                toolCall={
+                    "name": "send_message",
+                    "args": {"Recipient": "parent-h4", "Message": good_report},
+                },
+            )
+        )
+        self.assertEqual(res_good.get("decision"), "allow")
+
+        res_stop = orchestrator_guard.handle_stop(sub_payload)
+        self.assertEqual(res_stop.get("decision"), "allow")
+
+        unsynced_brain = brain_base / "unsynced-recipient"
+        unsynced_brain.mkdir(parents=True, exist_ok=True)
+        unsynced_payload = {
+            "conversationId": "unsynced-recipient",
+            "artifactDirectoryPath": str(unsynced_brain),
+        }
+        orchestrator_guard._save_state(
+            unsynced_payload, orchestrator_guard._load_state(unsynced_payload)
+        )
+
+        msg_allowed = (
+            "TASK: Refactor module\n"
+            "ALLOWED_FILES: updated.py\n"
+            "RULES:\n1. Open updated.py\n"
+            "REPORT FORMAT:\nSTATUS: COMPLETED\n"
+        )
+        orchestrator_guard.handle_pre_tool(
+            dict(
+                parent_payload,
+                toolCall={
+                    "name": "send_message",
+                    "args": {
+                        "Recipient": "unsynced-recipient",
+                        "Message": msg_allowed,
+                    },
+                },
+            )
+        )
+        unsynced_st = orchestrator_guard._load_state(unsynced_payload)
+        self.assertEqual(
+            unsynced_st.get("self_subagent_meta", {}).get("allowed_files"),
+            ["updated.py"],
+        )
+
+        def_res = orchestrator_guard._handle_define_subagent(
+            {"Name": "implementer", "EnableMCPTools": True}
+        )
+        self.assertEqual(def_res.get("decision"), "allow")
+        self.assertEqual(def_res.get("overwrite"), {"EnableMCPTools": False})
+
+        simple_prompt = "1. Open a.py\n2. Read x\n3. Do not edit any file"
+        self.assertTrue(
+            orchestrator_guard._is_simple_readonly_task("research", simple_prompt)
+        )
+
+        st_manage = orchestrator_guard._load_state(parent_payload)
+        st_manage["subagents"] = {
+            "branch-1": {"active_branch": True},
+            "branch-2": {"active_branch": True},
+        }
+        orchestrator_guard._save_state(parent_payload, st_manage)
+
+        orchestrator_guard._handle_manage_subagents(
+            parent_payload, {"action": "kill", "conversation_ids": ["branch-1"]}
+        )
+        st_m1 = orchestrator_guard._load_state(parent_payload)
+        self.assertFalse(st_m1["subagents"]["branch-1"]["active_branch"])
+        self.assertTrue(st_m1["subagents"]["branch-2"]["active_branch"])
+
+        orchestrator_guard._handle_manage_subagents(
+            parent_payload, {"Action": "kill_all"}
+        )
+        st_m2 = orchestrator_guard._load_state(parent_payload)
+        self.assertFalse(st_m2["subagents"]["branch-2"]["active_branch"])
+
+    def test_l1_cli_main_subprocess_modes_transcript_tail_and_git_diff_fallback(
+        self,
+    ) -> None:
+        import subprocess
+
+        tpath = Path(self.artifact_dir) / "transcript.jsonl"
+        with open(tpath, "w", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps({"type": "USER_MESSAGE", "content": "hello worker"}) + "\n"
+            )
+            fh.write(
+                json.dumps(
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "content": "STATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: pass\nNOTES: done\n",
+                        "tool_calls": [],
+                    }
+                )
+                + "\n"
+            )
+        extracted = orchestrator_guard._extract_last_model_response(
+            {"transcriptPath": str(tpath)}
+        )
+        self.assertIsNotNone(extracted)
+        self.assertIn("STATUS: COMPLETED", extracted or "")
+
+        diff_text = orchestrator_guard._get_workspace_git_diff(
+            {"workspacePaths": [str(orchestrator_guard.PROJECT_ROOT)]}
+        )
+        self.assertIsInstance(diff_text, str)
+
+        entrypoint = SCRIPT_DIR / "orchestrator_guard.py"
+        cli_modes = [
+            ("doctor", {}),
+            ("activate", self.base_payload),
+            ("status", self.base_payload),
+            ("pre-invocation", self.base_payload),
+            (
+                "pre-tool",
+                dict(
+                    self.base_payload,
+                    toolCall={
+                        "name": "read_file",
+                        "args": {
+                            "Path": str(orchestrator_guard.PROJECT_ROOT / "README.md")
+                        },
+                    },
+                ),
+            ),
+            (
+                "pre-tool",
+                dict(
+                    self.base_payload,
+                    toolCall={
+                        "name": "write_file",
+                        "args": {
+                            "Path": str(Path(self.artifact_dir) / "scratch.txt"),
+                            "Content": "test\n",
+                        },
+                    },
+                ),
+            ),
+            (
+                "pre-tool",
+                dict(
+                    self.base_payload,
+                    toolCall={
+                        "name": "run_command",
+                        "args": {"CommandLine": "git status"},
+                    },
+                ),
+            ),
+            (
+                "post-tool",
+                dict(
+                    self.base_payload,
+                    toolCall={
+                        "name": "run_command",
+                        "args": {"CommandLine": "git status"},
+                    },
+                ),
+            ),
+            ("stop", self.base_payload),
+            ("deactivate", self.base_payload),
+            ("reset", self.base_payload),
+        ]
+        for mode, payload in cli_modes:
+            res = subprocess.run(
+                [sys.executable, str(entrypoint), mode],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertEqual(res.returncode, 0)
+            parsed = json.loads(res.stdout)
+            self.assertIsInstance(parsed, dict)
+
 
 if __name__ == "__main__":
     unittest.main()

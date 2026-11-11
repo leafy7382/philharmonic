@@ -65,7 +65,7 @@ Write all `invoke_subagent` prompts and `send_message` instructions using the st
 - List numbered `RULES:` with an explicit file allowlist and verification command.
 - For complex tasks, write detailed technical requirements to `<artifactDirectoryPath>/scratch/spec_<task>.md` and instruct the subagent to open the spec file in Rule 1.
 - Require the four-header `REPORT FORMAT` below. On failure or blocker, instruct `implementer` to write raw output to `<artifactDirectoryPath>/scratch/<task_id>.log` and state the error cause and `file://` URI in `NOTES`.
-- If you are a subagent, `REPORT FORMAT` overrides workspace formatting rules. Return only the four headers (plus up to 10 compact bullet lines under `NOTES`) and omit any post-action retrospective.
+- If you are a subagent, `REPORT FORMAT` overrides workspace formatting rules. Return only the four headers (plus up to 10 compact bullet lines under `NOTES`) and omit any post-action retrospective. Subagent reports must be `<= 1600` characters total with inline summary text on the `NOTES:` header line (plus up to 10 `- ` bullets).
 
 ```markdown
 TASK: <single-sentence objective>
@@ -79,7 +79,7 @@ RULES:
 5. On failure, write raw output to `<artifactDirectoryPath>/scratch/<task_id>.log`.
 
 REPORT FORMAT:
-Return only these four headers (plus up to 10 `- ` bullet lines under NOTES if needed):
+Return only these four headers (plus up to 10 `- ` bullet lines under NOTES if needed; <= 1600 chars total):
 STATUS: COMPLETED | BLOCKED | FAILED
 FILES_CHANGED: <comma-separated paths or NONE>
 VERIFICATION: <one sentence stating the command run and exit result>
