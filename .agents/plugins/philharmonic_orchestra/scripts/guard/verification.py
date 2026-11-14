@@ -19,6 +19,7 @@ from guard.constants import (
     REPORT_BULLET_RE,
     REPORT_LINE_PATTERNS,
     REPORT_LOG_URI_RE,
+    SCOUT_COMPACT_LINE_PATTERNS,
     TAMPER_SKIP_RE,
     TEST_DEF_RE,
     TEST_FILE_RE,
@@ -32,6 +33,7 @@ from guard.identity import (
     _ensure_session_active,
     _is_known_subagent,
     _is_root_orchestrator,
+    _is_scout_subagent,
     _sync_subagents_from_transcript,
     _workspaces_compatible,
 )
@@ -225,8 +227,10 @@ def _get_circuit_breaker(
                 "tripped": False,
                 "seen_failures": [],
                 "last_error": "",
+                "replan_count": 0,
             }
         )
+    cb_root.setdefault("replan_count", 0)
     return cb_root
 
 
@@ -307,6 +311,10 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
         tool_name = tool_call.get("name", "")
         args = tool_call.get("args") or {}
         call_id = _extract_call_id(payload)
+
+        if tool_name == "exit_plan_mode" and payload.get("error"):
+            state["plan_execute_phase"] = False
+            state["plan_allowed_files"] = None
 
         if tool_name == "invoke_subagent" and payload.get("error"):
             pending = state.get("pending_spawns", [])
@@ -389,9 +397,9 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                 ):
                     cb["failure_streak"] = 0
                     cb["tripped"] = False
-                subagent_blocked_or_failed = bool(
+                subagent_non_final = bool(
                     tool_name == "invoke_subagent"
-                    and re.search(r"(?m)^\s*STATUS:\s*(?:BLOCKED|FAILED)\b", output_text)
+                    and re.search(r"(?m)^\s*STATUS:\s*(?:BLOCKED|FAILED|NEEDS_REPLAN|CHECKPOINT)\b", output_text)
                 )
                 entries = (
                     args["Subagents"]
@@ -410,7 +418,7 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 is_verification_subagent = (
                     tool_name == "invoke_subagent"
-                    and not subagent_blocked_or_failed
+                    and not subagent_non_final
                     and not is_async_spawn_ack
                     and any(
                         t not in {"scout", "research", "researcher"} for t in invoked_types
@@ -432,8 +440,8 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {}
 
 
-def validate_subagent_report(text: str) -> Optional[str]:
-    """Validate that a subagent's final output matches the 4-header REPORT FORMAT (Option A + B)."""
+def validate_subagent_report(text: str, is_scout: bool = False) -> Optional[str]:
+    """Validate that a subagent's final output matches the REPORT FORMAT."""
     stripped = (text or "").strip()
     if not stripped:
         return "Subagent response is empty."
@@ -443,6 +451,38 @@ def validate_subagent_report(text: str) -> Optional[str]:
             f"{MAX_SUBAGENT_REPORT_CHARS} chars."
         )
     lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+
+    if (
+        is_scout
+        and len(lines) >= 2
+        and bool(SCOUT_COMPACT_LINE_PATTERNS[0].match(lines[0]))
+        and bool(SCOUT_COMPACT_LINE_PATTERNS[1].match(lines[1]))
+    ):
+        max_lines = 2 + MAX_REPORT_BULLET_LINES
+        if len(lines) > max_lines:
+            return (
+                f"Expected 2 header lines plus at most {MAX_REPORT_BULLET_LINES} bullet lines "
+                f"(2-{max_lines} lines total), got {len(lines)}."
+            )
+        bullet_lines = lines[2:]
+        for b_idx, b_line in enumerate(bullet_lines, start=3):
+            if not REPORT_BULLET_RE.match(b_line):
+                return f"Line {b_idx} after NOTES must be a compact bullet starting with '- ' or '* '."
+
+        status_val = lines[0].split(":", 1)[1].strip().upper().split()[0]
+        if status_val in {"BLOCKED", "FAILED"}:
+            notes_body = lines[1].split(":", 1)[1].strip()
+            combined_notes = " ".join(
+                [notes_body] + [b[1:].strip() for b in bullet_lines]
+            ).strip()
+            non_uri_text = REPORT_LOG_URI_RE.sub("", combined_notes).strip(" -—:,.;()")
+            if len(non_uri_text.split()) < 3:
+                return (
+                    f"When STATUS is {status_val}, NOTES must include an inline error summary "
+                    "(at least 3 words)."
+                )
+        return None
+
     max_lines = 4 + MAX_REPORT_BULLET_LINES
     if len(lines) < 4 or len(lines) > max_lines:
         return (
@@ -462,11 +502,19 @@ def validate_subagent_report(text: str) -> Optional[str]:
             return f"Line {b_idx} after NOTES must be a compact bullet starting with '- ' or '* '."
 
     status_val = lines[0].split(":", 1)[1].strip().upper().split()[0]
-    if status_val in {"BLOCKED", "FAILED"}:
-        notes_body = lines[3].split(":", 1)[1].strip()
-        combined_notes = " ".join(
-            [notes_body] + [b[1:].strip() for b in bullet_lines]
-        ).strip()
+    notes_body = lines[3].split(":", 1)[1].strip()
+    combined_notes = " ".join(
+        [notes_body] + [b[1:].strip() for b in bullet_lines]
+    ).strip()
+
+    if status_val == "NEEDS_REPLAN":
+        non_uri_text = REPORT_LOG_URI_RE.sub("", combined_notes).strip(" -—:,.;()")
+        if len(non_uri_text.split()) < 3:
+            return (
+                "When STATUS is NEEDS_REPLAN, NOTES must include an inline explanation "
+                "(at least 3 words)."
+            )
+    elif status_val in {"BLOCKED", "FAILED"}:
         if not REPORT_LOG_URI_RE.search(combined_notes):
             return f"When STATUS is {status_val}, NOTES must include a 'file://.../*.log' scratch log URI."
         non_uri_text = REPORT_LOG_URI_RE.sub("", combined_notes).strip(" -—:,.;()")
@@ -597,7 +645,9 @@ def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
             if sent_key not in reminded:
                 last_msg = _extract_last_model_response(payload)
                 if last_msg is not None:
-                    report_err = validate_subagent_report(last_msg)
+                    report_err = validate_subagent_report(
+                        last_msg, is_scout=_is_scout_subagent(payload, state)
+                    )
                     if report_err:
                         report_key = f"report:{payload.get('conversationId', '')}:{payload.get('executionNum', 0)}"
                         if report_key not in reminded:
@@ -609,7 +659,7 @@ def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
                                     f"[ORCHESTRATOR GUARD] Subagent context-separation violation: {report_err} "
                                     "Return ONLY the exact 4-header REPORT FORMAT (STATUS, FILES_CHANGED, VERIFICATION, NOTES; "
                                     "allowing up to 10 '-' bullet lines under NOTES and requiring inline error cause plus "
-                                    "file:// .log URI when BLOCKED or FAILED)."
+                                    "file:// .log URI when BLOCKED or FAILED; scouts may use compact 2-header STATUS + NOTES)."
                                 ),
                             }
 

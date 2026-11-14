@@ -1319,7 +1319,7 @@ NOTES: <one sentence summarizing findings>
         # 3rd distinct workspace file exceeds limit
         res_c = orchestrator_guard.handle_pre_tool(make_read_payload(file_c))
         self.assertEqual(res_c["decision"], "deny")
-        self.assertIn("read limit (2 workspace files) exceeded", res_c["reason"])
+        self.assertIn("Direct execution fast-path read budget", res_c["reason"])
 
         # 2. Reading raw log or transcript is denied for orchestrator
         fail_log = str(Path(self.artifact_dir) / "scratch" / "fail.log")
@@ -2441,7 +2441,7 @@ NOTES: <one sentence summarizing findings>
             )
         )
         self.assertEqual(r3["decision"], "deny")
-        self.assertIn("read limit (2 workspace files) exceeded", r3["reason"])
+        self.assertIn("Direct execution fast-path read budget", r3["reason"])
 
     def test_redirection_splitting_and_regex_literal_paths_in_workspace(self) -> None:
         self.assertEqual(
@@ -3917,6 +3917,517 @@ orchestrator_guard.register_subagent(
 
         with mock.patch.object(sys, "stdin", io.StringIO("[1, 2, 3]")):
             self.assertEqual(guard_cli._read_stdin_payload(is_cli_mode=True), {})
+
+    def test_replan_status_and_root_replan_circuit_breaker(self) -> None:
+        # 1. validate_subagent_report for NEEDS_REPLAN
+        valid_replan = (
+            "STATUS: NEEDS_REPLAN\n"
+            "FILES_CHANGED: NONE\n"
+            "VERIFICATION: NONE\n"
+            "NOTES: Core assumption about database schema was invalidated."
+        )
+        self.assertIsNone(orchestrator_guard.validate_subagent_report(valid_replan))
+
+        invalid_replan = (
+            "STATUS: NEEDS_REPLAN\n"
+            "FILES_CHANGED: NONE\n"
+            "VERIFICATION: NONE\n"
+            "NOTES: invalid"
+        )
+        err = orchestrator_guard.validate_subagent_report(invalid_replan)
+        self.assertIsNotNone(err)
+        self.assertIn("NEEDS_REPLAN", err)
+        self.assertIn("at least 3 words", err)
+
+        # 2. Tripped subagent allowed to send STATUS: NEEDS_REPLAN
+        sub_cid = "sub-cb-replan-111"
+        sub_brain = Path(self.artifact_dir).parent / sub_cid
+        sub_brain.mkdir(parents=True, exist_ok=True)
+        orchestrator_guard.register_subagent(
+            self.base_payload,
+            conversation_id=sub_cid,
+            type_name="implementer",
+            model="flash",
+        )
+        state = orchestrator_guard._load_state(self.base_payload)
+        cb = orchestrator_guard._get_circuit_breaker(state, self.base_payload)
+        cb["tripped"] = True
+        cb["failure_streak"] = 2
+        cb["last_error"] = "Command exited with code 1"
+        orchestrator_guard._save_state(self.base_payload, state)
+
+        sub_payload = dict(
+            self.base_payload,
+            conversationId=sub_cid,
+            artifactDirectoryPath=str(sub_brain),
+            toolCall={
+                "name": "send_message",
+                "args": {
+                    "Recipient": self.base_payload["conversationId"],
+                    "Message": valid_replan,
+                },
+            },
+        )
+        res_sub_replan = orchestrator_guard.handle_pre_tool(sub_payload)
+        self.assertEqual(res_sub_replan["decision"], "allow")
+
+        # 3. Tripped root denied without REPLAN: header
+        root_dispatch_no_replan = dict(
+            self.base_payload,
+            toolCall={
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "implementer",
+                    "Prompt": "TASK: Fix bug\nRULES:\n1. Open foo.py\n2. Run pytest\nREPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: foo.py\nVERIFICATION: pytest ok\nNOTES: done",
+                },
+            },
+        )
+        res_root_deny = orchestrator_guard.handle_pre_tool(root_dispatch_no_replan)
+        self.assertEqual(res_root_deny["decision"], "deny")
+        self.assertIn("circuit breaker tripped", res_root_deny["reason"])
+        self.assertIn("REPLAN:", res_root_deny["reason"])
+
+        # Tripped root allowed once with REPLAN: header (resets CB)
+        root_dispatch_with_replan = dict(
+            self.base_payload,
+            toolCall={
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "implementer",
+                    "Prompt": "TASK: Fix bug with revised strategy\nREPLAN: Switched to migration approach\nRULES:\n1. Open foo.py\n2. Run pytest\nREPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: foo.py\nVERIFICATION: pytest ok\nNOTES: done",
+                },
+            },
+        )
+        res_root_allow = orchestrator_guard.handle_pre_tool(root_dispatch_with_replan)
+        self.assertEqual(res_root_allow["decision"], "allow")
+        state_after = orchestrator_guard._load_state(self.base_payload)
+        cb_after = orchestrator_guard._get_circuit_breaker(state_after, self.base_payload)
+        self.assertFalse(cb_after["tripped"])
+        self.assertEqual(cb_after["failure_streak"], 0)
+        self.assertEqual(cb_after["replan_count"], 1)
+
+        # Trip CB again
+        cb_after["tripped"] = True
+        cb_after["failure_streak"] = 2
+        orchestrator_guard._save_state(self.base_payload, state_after)
+
+        # Denied on 2nd trip because replan_count >= MAX_REPLAN_ATTEMPTS (1)
+        res_root_deny2 = orchestrator_guard.handle_pre_tool(root_dispatch_with_replan)
+        self.assertEqual(res_root_deny2["decision"], "deny")
+        self.assertIn("circuit breaker tripped", res_root_deny2["reason"])
+
+    def test_line_byte_read_budget_and_list_dir_exemption(self) -> None:
+        file_paths = []
+        for i in range(5):
+            p = orchestrator_guard.PROJECT_ROOT / f"tmp_small_{i}.txt"
+            p.write_text("line 1\nline 2\nline 3\nline 4\nline 5\n", encoding="utf-8")
+            file_paths.append(str(p))
+
+        try:
+            # 1. Reading 4 small real files succeeds (5 lines each = 20 lines << 400 lines, 4 files < 8 files)
+            for f in file_paths[:4]:
+                res = orchestrator_guard.handle_pre_tool(
+                    dict(
+                        self.base_payload,
+                        toolCall={"name": "read_file", "args": {"Path": f}},
+                    )
+                )
+                self.assertEqual(res["decision"], "allow")
+
+            # 2. StartLine / EndLine slicing accumulates accurately
+            big_p = orchestrator_guard.PROJECT_ROOT / "tmp_big_sliced.txt"
+            big_p.write_text("\n".join(f"line {j}" for j in range(1, 601)) + "\n", encoding="utf-8")
+            big_path = str(big_p)
+            file_paths.append(big_path)
+
+            # Read 200 lines (lines 1..200) -> allows
+            res_slice1 = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={"name": "read_file", "args": {"Path": big_path, "StartLine": 1, "EndLine": 200}},
+                )
+            )
+            self.assertEqual(res_slice1["decision"], "allow")
+
+            # Read another 200 lines (lines 201..400) -> exceeds 400 lines!
+            res_slice2 = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={"name": "read_file", "args": {"Path": big_path, "StartLine": 201, "EndLine": 400}},
+                )
+            )
+            self.assertEqual(res_slice2["decision"], "deny")
+            self.assertIn("Direct execution fast-path read budget", res_slice2["reason"])
+            self.assertIn("400 lines", res_slice2["reason"])
+
+            # 3. Reading > 16 KB single file is blocked
+            huge_p = orchestrator_guard.PROJECT_ROOT / "tmp_huge_bytes.txt"
+            huge_p.write_text("A" * 20000 + "\n", encoding="utf-8")
+            huge_path = str(huge_p)
+            file_paths.append(huge_path)
+
+            state = orchestrator_guard._load_state(self.base_payload)
+            state["direct_budget"].clear()
+            orchestrator_guard._save_state(self.base_payload, state)
+
+            res_huge = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={"name": "read_file", "args": {"Path": huge_path}},
+                )
+            )
+            self.assertEqual(res_huge["decision"], "deny")
+            self.assertIn("16384 bytes", res_huge["reason"])
+
+            # 4. list_dir is free (0 budget cost)
+            for _ in range(15):
+                res_ld = orchestrator_guard.handle_pre_tool(
+                    dict(
+                        self.base_payload,
+                        toolCall={"name": "list_dir", "args": {"Path": str(orchestrator_guard.PROJECT_ROOT)}},
+                    )
+                )
+                self.assertEqual(res_ld["decision"], "allow")
+
+            # But list_dir on .log is blocked
+            res_ld_log = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={"name": "list_dir", "args": {"Path": str(Path(self.artifact_dir) / "scratch" / "run.log")}},
+                )
+            )
+            self.assertEqual(res_ld_log["decision"], "deny")
+            self.assertIn("Context separation violation", res_ld_log["reason"])
+
+        finally:
+            for fp in file_paths:
+                try:
+                    p = Path(fp)
+                    if p.exists():
+                        p.unlink()
+                except OSError:
+                    pass
+
+    def test_grounded_spec_file_validation(self) -> None:
+        spec_path = Path(self.artifact_dir) / "scratch" / "spec_task_test.md"
+        spec_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # 1. Valid spec with SIGNATURES, PITFALLS/INVARIANTS, and VERIFICATION
+        valid_spec_content = (
+            "# Grounded Specification\n\n"
+            "## SIGNATURES\n"
+            "def solve(a: int) -> int: ...\n\n"
+            "## INVARIANTS_AND_PITFALLS\n"
+            "Keep a > 0.\n\n"
+            "## VERIFICATION\n"
+            "Run pytest tests/test_solve.py\n"
+        )
+        spec_path.write_text(valid_spec_content, encoding="utf-8")
+
+        prompt_valid = (
+            f"TASK: Implement solve function\n"
+            f"SPEC_FILE: {spec_path}\n"
+            f"RULES:\n1. Open spec\n2. Run pytest\n"
+            f"REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: foo.py\nVERIFICATION: pytest ok\nNOTES: done"
+        )
+        res_valid = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "invoke_subagent",
+                    "args": {"TypeName": "implementer", "Prompt": prompt_valid},
+                },
+            )
+        )
+        self.assertEqual(res_valid["decision"], "allow")
+        state = orchestrator_guard._load_state(self.base_payload)
+        pending = state.get("pending_spawns", [])
+        self.assertTrue(any(p.get("spec_file") == str(spec_path.resolve()) for p in pending))
+
+        # 2. Missing spec file is denied for implementer
+        missing_spec_prompt = (
+            "TASK: Implement feature\n"
+            "SPEC_FILE: /tmp/scratch/non_existent_spec_xyz.md\n"
+            "RULES:\n1. Open spec\n2. Run pytest\n"
+            "REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: foo.py\nVERIFICATION: pytest ok\nNOTES: done"
+        )
+        res_missing = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "invoke_subagent",
+                    "args": {"TypeName": "implementer", "Prompt": missing_spec_prompt},
+                },
+            )
+        )
+        self.assertEqual(res_missing["decision"], "deny")
+        self.assertIn("does not exist", res_missing["reason"])
+
+        # 3. Spec file missing required sections is denied for implementer
+        stub_spec_path = Path(self.artifact_dir) / "scratch" / "spec_stub.md"
+        stub_spec_path.write_text("# Incomplete Spec\nJust some notes without sections.\n", encoding="utf-8")
+        stub_prompt = (
+            f"TASK: Implement feature\n"
+            f"SPEC_FILE: {stub_spec_path}\n"
+            f"RULES:\n1. Open spec\n2. Run pytest\n"
+            f"REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: foo.py\nVERIFICATION: pytest ok\nNOTES: done"
+        )
+        res_stub = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "invoke_subagent",
+                    "args": {"TypeName": "implementer", "Prompt": stub_prompt},
+                },
+            )
+        )
+        self.assertEqual(res_stub["decision"], "deny")
+        self.assertIn("missing required grounded sections", res_stub["reason"])
+
+    def test_staged_checkpoints_and_checkpoint_status(self) -> None:
+        state = orchestrator_guard._load_state(self.base_payload)
+        receipt = orchestrator_guard._get_test_receipt(state, self.base_payload)
+        receipt["dirty"] = True
+        receipt["verified"] = False
+        orchestrator_guard._save_state(self.base_payload, state)
+
+        # STAGE: 1/2 in invoke_subagent
+        stage_prompt = (
+            "TASK: Multi-stage refactor\n"
+            "ALLOWED_FILES: foo.py\n"
+            "STAGE: 1/2\n"
+            "RULES:\n1. Edit foo.py\n2. Run tests\n"
+            "REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: foo.py\nVERIFICATION: pytest ok\nNOTES: done"
+        )
+        res_spawn = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "invoke_subagent",
+                    "args": {"TypeName": "implementer", "Prompt": stage_prompt},
+                },
+            )
+        )
+        self.assertEqual(res_spawn["decision"], "allow")
+        state = orchestrator_guard._load_state(self.base_payload)
+        pending = state.get("pending_spawns", [])
+        self.assertTrue(any(p.get("stage") == "1/2" for p in pending))
+
+        # STATUS: CHECKPOINT report passes validation
+        checkpoint_report = (
+            "STATUS: CHECKPOINT\n"
+            "FILES_CHANGED: foo.py\n"
+            "VERIFICATION: pytest tests/test_foo.py passed\n"
+            "NOTES: Completed stage 1; ready for stage 2."
+        )
+        self.assertIsNone(orchestrator_guard.validate_subagent_report(checkpoint_report))
+
+        # invoke_subagent output with STATUS: CHECKPOINT does NOT prematurely clear dirty receipt
+        post_res = orchestrator_guard.handle_post_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "invoke_subagent",
+                    "args": {"TypeName": "implementer", "Prompt": stage_prompt},
+                },
+                output=checkpoint_report,
+                error="",
+            )
+        )
+        self.assertEqual(post_res, {})
+        state_post = orchestrator_guard._load_state(self.base_payload)
+        receipt_post = orchestrator_guard._get_test_receipt(state_post, self.base_payload)
+        self.assertTrue(receipt_post.get("dirty"))
+        self.assertFalse(receipt_post.get("verified"))
+
+        # send_message with STAGE: 2/2 and expanded ALLOWED_FILES:
+        sub_cid = "sub-staged-stage2-cid"
+        sub_brain = Path(self.artifact_dir).parent / sub_cid
+        sub_brain.mkdir(parents=True, exist_ok=True)
+        orchestrator_guard.register_subagent(
+            self.base_payload,
+            conversation_id=sub_cid,
+            type_name="implementer",
+            model="flash",
+            allowed_files=["foo.py"],
+        )
+        res_msg = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "send_message",
+                    "args": {
+                        "Recipient": sub_cid,
+                        "Message": "STAGE: 2/2\nALLOWED_FILES: foo.py, bar.py\nPlease proceed with stage 2.",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_msg["decision"], "allow")
+        state_msg = orchestrator_guard._load_state(self.base_payload)
+        sub_info = state_msg.get("subagents", {}).get(sub_cid, {})
+        self.assertEqual(sub_info.get("stage"), "2/2")
+        self.assertIn("2/2", sub_info.get("stage_history", []))
+        self.assertEqual(sub_info.get("allowed_files"), ["foo.py", "bar.py"])
+
+    def test_compact_scout_report_shorthand(self) -> None:
+        compact_report = (
+            "STATUS: COMPLETED\n"
+            "NOTES: Found symbol in foo.py"
+        )
+        # 1. validate_subagent_report allows compact for scout, rejects for implementer
+        self.assertIsNone(orchestrator_guard.validate_subagent_report(compact_report, is_scout=True))
+        err_impl = orchestrator_guard.validate_subagent_report(compact_report, is_scout=False)
+        self.assertIsNotNone(err_impl)
+        self.assertIn("Expected 4 header lines", err_impl)
+
+        # 2. scout sending 2-header compact report via send_message is allowed
+        brain_base = Path(self.artifact_dir) / "brain"
+        parent_brain = brain_base / "parent-scout-test"
+        scout_cid = "sub-scout-compact-99"
+        impl_cid = "sub-impl-compact-fail"
+        scout_brain = brain_base / scout_cid
+        impl_brain = brain_base / impl_cid
+        parent_brain.mkdir(parents=True, exist_ok=True)
+        scout_brain.mkdir(parents=True, exist_ok=True)
+        impl_brain.mkdir(parents=True, exist_ok=True)
+
+        parent_payload = dict(
+            self.base_payload,
+            conversationId="parent-scout-test",
+            artifactDirectoryPath=str(parent_brain),
+        )
+        orchestrator_guard._cli_activate(parent_payload)
+        orchestrator_guard.register_subagent(
+            parent_payload,
+            conversation_id=scout_cid,
+            type_name="scout",
+            model="flash_lite",
+        )
+        orchestrator_guard.register_subagent(
+            parent_payload,
+            conversation_id=impl_cid,
+            type_name="implementer",
+            model="flash",
+        )
+        scout_payload = dict(
+            self.base_payload,
+            conversationId=scout_cid,
+            artifactDirectoryPath=str(scout_brain),
+            toolCall={
+                "name": "send_message",
+                "args": {
+                    "Recipient": "parent-scout-test",
+                    "Message": compact_report,
+                },
+            },
+        )
+        res_scout_msg = orchestrator_guard.handle_pre_tool(scout_payload)
+        self.assertEqual(res_scout_msg["decision"], "allow")
+
+        # 3. implementer sending 2-header compact report via send_message is denied
+        impl_payload = dict(
+            self.base_payload,
+            conversationId=impl_cid,
+            artifactDirectoryPath=str(impl_brain),
+            toolCall={
+                "name": "send_message",
+                "args": {
+                    "Recipient": "parent-scout-test",
+                    "Message": compact_report,
+                },
+            },
+        )
+        res_impl_msg = orchestrator_guard.handle_pre_tool(impl_payload)
+        self.assertEqual(res_impl_msg["decision"], "deny")
+        self.assertIn("Subagent report format error", res_impl_msg["reason"])
+
+        # 4. handle_stop allows compact report for scout
+        stop_payload = dict(
+            self.base_payload,
+            conversationId=scout_cid,
+            artifactDirectoryPath=str(scout_brain),
+            lastAssistantMessage=compact_report,
+            fullyIdle=True,
+        )
+        res_stop = orchestrator_guard.handle_stop(stop_payload)
+        self.assertEqual(res_stop.get("decision"), "allow")
+
+    def test_system_orchestrator_exit_plan_mode_coexistence(self) -> None:
+        orchestrator_guard._cli_activate(self.base_payload)
+        plan_content = (
+            "TASK: Multi-file refactor\n"
+            "ALLOWED_FILES: file_x.py, file_y.py, file_z.py\n"
+            "1. Edit all three files\n"
+            "2. Run tests"
+        )
+        exit_plan_payload = dict(
+            self.base_payload,
+            toolCall={
+                "name": "exit_plan_mode",
+                "args": {"plan": plan_content},
+            },
+        )
+        res_exit = orchestrator_guard.handle_pre_tool(exit_plan_payload)
+        self.assertEqual(res_exit["decision"], "allow")
+
+        state = orchestrator_guard._load_state(self.base_payload)
+        self.assertTrue(state.get("plan_execute_phase"))
+        self.assertFalse(state.get("plan_execute_consumed"))
+        self.assertEqual(state.get("plan_allowed_files"), ["file_x.py", "file_y.py", "file_z.py"])
+
+        # In coexistence mode, root can edit > 2 files in plan_allowed_files
+        for fname in ["file_x.py", "file_y.py", "file_z.py"]:
+            fpath = str(orchestrator_guard.PROJECT_ROOT / fname)
+            res_edit = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={"name": "edit_file", "args": {"Path": fpath, "Target": "", "Replacement": ""}},
+                )
+            )
+            self.assertEqual(res_edit["decision"], "allow")
+
+        # Editing out-of-plan file is denied
+        out_fpath = str(orchestrator_guard.PROJECT_ROOT / "out_of_plan.py")
+        res_out = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={"name": "edit_file", "args": {"Path": out_fpath, "Target": "", "Replacement": ""}},
+            )
+        )
+        self.assertEqual(res_out["decision"], "deny")
+        self.assertIn("File allowlist violation", res_out["reason"])
+
+        # Running multiple commands is allowed
+        for cmd in ["echo 1", "echo 2", "echo 3", "echo 4"]:
+            res_cmd = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={"name": "run_command", "args": {"CommandLine": cmd}},
+                )
+            )
+            self.assertEqual(res_cmd["decision"], "allow")
+
+        # But reading .log is STILL blocked in plan_execute_phase
+        log_fpath = str(Path(self.artifact_dir) / "scratch" / "test.log")
+        res_log = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={"name": "read_file", "args": {"Path": log_fpath}},
+            )
+        )
+        self.assertEqual(res_log["decision"], "deny")
+        self.assertIn("Context separation violation", res_log["reason"])
+
+        # PreInvocation resets plan_execute_phase on [plan review]
+        review_payload = dict(
+            self.base_payload,
+            lastUserInput="Please do [plan review] now",
+        )
+        orchestrator_guard.handle_pre_invocation(review_payload)
+        state_after_review = orchestrator_guard._load_state(self.base_payload)
+        self.assertFalse(state_after_review.get("plan_execute_phase"))
+        self.assertIsNone(state_after_review.get("plan_allowed_files"))
 
 
 if __name__ == "__main__":

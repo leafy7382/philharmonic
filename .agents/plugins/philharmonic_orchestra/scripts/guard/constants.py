@@ -22,6 +22,15 @@ MUTATION_VERBS_RE = re.compile(
 )
 NUMBERED_RULE_RE = re.compile(r"(?m)^\s*[0-9]+[.)]\s+")
 ALLOWED_FILES_HEADER_RE = re.compile(r"(?m)^\s*ALLOWED_FILES:\s*(.+)$", re.I)
+REPLAN_IF_HEADER_RE = re.compile(r"(?m)^\s*REPLAN_IF:\s*(.+)$", re.I)
+REPLAN_HEADER_RE = re.compile(r"(?m)^\s*REPLAN:\s*(.+)$", re.I)
+SPEC_FILE_HEADER_RE = re.compile(r"(?m)^\s*SPEC_FILE:\s*(.+)$", re.I)
+STAGE_HEADER_RE = re.compile(r"(?m)^\s*STAGE:\s*(.+)$", re.I)
+GROUNDED_SPEC_SECTION_PATTERNS = (
+    re.compile(r"(?im)\bsignatures?\b"),
+    re.compile(r"(?im)\b(?:pitfalls?|invariants?)(?:_[a-z0-9_]+)?\b"),
+    re.compile(r"(?im)\bverification\b"),
+)
 UUID_RE = re.compile(
     r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b",
     re.I,
@@ -37,7 +46,12 @@ MAX_STATE_LIST_ENTRIES = 100
 
 MAX_DIRECT_MUTATION_FILES = 2
 MAX_DIRECT_COMMANDS = 2
-MAX_DIRECT_READ_FILES = 2
+MAX_DIRECT_READ_FILES = 8
+MAX_DIRECT_READ_LINES = 400
+MAX_DIRECT_READ_BYTES = 16384
+DEFAULT_UNBOUNDED_READ_LINES = 150
+DEFAULT_UNBOUNDED_READ_BYTES = 6000
+MAX_REPLAN_ATTEMPTS = 1
 MAX_SUBAGENT_REPORT_CHARS = 1600
 MAX_REPORT_BULLET_LINES = 10
 MAX_CONSECUTIVE_FAILURES = 2
@@ -45,13 +59,18 @@ MAX_CONSECUTIVE_FAILURES = 2
 REPORT_BULLET_RE = re.compile(r"^[-*]\s+\S+")
 REPORT_LOG_URI_RE = re.compile(r"file://\S+\.log\b", re.I)
 REPORT_LINE_PATTERNS = (
-    re.compile(r"^STATUS:\s*(?:COMPLETED|BLOCKED|FAILED)\b"),
+    re.compile(r"^STATUS:\s*(?:COMPLETED|CHECKPOINT|NEEDS_REPLAN|BLOCKED|FAILED)\b"),
     re.compile(r"^FILES_CHANGED:\s*\S+"),
     re.compile(r"^VERIFICATION:\s*\S+"),
     re.compile(r"^NOTES:\s*\S+"),
 )
+SCOUT_COMPACT_LINE_PATTERNS = (
+    re.compile(r"^STATUS:\s*(?:COMPLETED|BLOCKED|FAILED)\b"),
+    re.compile(r"^NOTES:\s*\S+"),
+)
 
-READ_TOOLS = {"read_file", "list_dir", "view_file"}
+READ_TOOLS = {"read_file", "view_file"}
+DIR_LIST_TOOLS = {"list_dir"}
 SEARCH_TOOLS = {"grep_search", "find_by_name"}
 MUTATION_TOOLS = {
     "write_file",

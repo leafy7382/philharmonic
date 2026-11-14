@@ -47,7 +47,8 @@ Do not call `define_subagent` upfront at session start. Register `scout` or `imp
 
 ## 2. Token-Optimal Dispatch and Model Selection Rules
 
-- **Direct Execution Fast-Path (Option A: Single Verification Pass)**: The root orchestrator may directly read $\le 2$ workspace files, edit $\le 2$ workspace files, and run $\le 2$ non-git commands per turn using native tools (`read_file`/`view_file`, `write_file`/`write_to_file`, `edit_file`/`replace_file_content`, `grep_search`, `find_by_name`, `run_command`). After a direct fast-path code edit ($\le 2$ files), the root orchestrator may run 1 verification test command (`pytest`, `unittest`, etc.) to record an empirical test receipt. Iterative edit-and-test loops (editing again after a test run, or running a second test command after an edit) are blocked and must be delegated to `implementer`.
+- **Direct Execution Fast-Path (Option A: Single Verification Pass)**: The root orchestrator may directly read $\le 400$ lines / $\le 16\text{ KB}$ across $\le 8$ workspace files (using `read_file`/`view_file` with optional `StartLine`/`EndLine` ranges; `list_dir` is free with 0 read budget cost; reading raw `.log` and `transcript*.jsonl` files remains strictly blocked), edit $\le 2$ workspace files, and run $\le 2$ non-git commands per turn using native tools (`read_file`/`view_file`, `write_file`/`write_to_file`, `edit_file`/`replace_file_content`, `grep_search`, `find_by_name`, `run_command`). After a direct fast-path code edit ($\le 2$ files), the root orchestrator may run 1 verification test command (`pytest`, `unittest`, etc.) to record an empirical test receipt. Iterative edit-and-test loops (editing again after a test run, or running a second test command after an edit) are blocked and must be delegated to `implementer`.
+- **System Orchestrator Hybrid Coexistence Mode**: When executing under Antigravity's built-in System Orchestrator with plan execution, calling `exit_plan_mode` automatically activates hybrid coexistence mode. Direct file mutation caps, command caps, and edit-test loop limits are relaxed to allow the System Orchestrator execution model to run multi-file changes directly, while `.log` isolation, optional plan `ALLOWED_FILES:` enforcement, test anti-tampering guards, empirical test receipts, and circuit breaker protection remain active. Coexistence resets when returning to `[plan review]` or on the next user prompt.
 - **Subagent Delegation Threshold**: Delegate to `implementer` whenever a task touches $3+$ cumulative files, requires broad search, or runs iterative test loops.
 - **Model & Workspace Selection by Runtime**:
   - **Local `agy` CLI**: Subagents must use `Model: "flash_lite"` (`scout`) or `Model: "flash"` (`research`, `implementer`) and never `"inherit"` or `"pro"`. Use `Workspace: "inherit"` or `Workspace: "share"` for sequential tasks and `Workspace: "branch"` for parallel `implementer` tasks.
@@ -62,14 +63,20 @@ Write all `invoke_subagent` prompts and `send_message` instructions using the st
 
 - Specify a clear single-sentence `TASK:` objective.
 - Specify `ALLOWED_FILES: <comma-separated paths or NONE>` to enforce a deterministic `PreToolUse` write allowlist for the subagent.
+- Optionally specify `STAGE: <current>/<total>` for staged mid-flight progress.
+- Optionally specify `SPEC_FILE: <path>` referencing a grounded specification file (`<artifactDirectoryPath>/scratch/spec_<task>.md`). For `implementer`, the guard deterministically verifies that the spec file exists and contains `SIGNATURES`, `PITFALLS` (or `INVARIANTS`), and `VERIFICATION` sections before dispatching.
+- Optionally specify `REPLAN_IF: <condition>` defining conditions under which the subagent should halt and request a replan.
 - List numbered `RULES:` with an explicit file allowlist and verification command.
-- For complex tasks, write detailed technical requirements to `<artifactDirectoryPath>/scratch/spec_<task>.md` and instruct the subagent to open the spec file in Rule 1.
-- Require the four-header `REPORT FORMAT` below. On failure or blocker, instruct `implementer` to write raw output to `<artifactDirectoryPath>/scratch/<task_id>.log` and state the error cause and `file://` URI in `NOTES`.
-- If you are a subagent, `REPORT FORMAT` overrides workspace formatting rules. Return only the four headers (plus up to 10 compact bullet lines under `NOTES`) and omit any post-action retrospective. Subagent reports must be `<= 1600` characters total with inline summary text on the `NOTES:` header line (plus up to 10 `- ` bullets).
+- Require `REPORT FORMAT` below. Subagents may return `STATUS: COMPLETED | CHECKPOINT | NEEDS_REPLAN | BLOCKED | FAILED`. When `STATUS` is `NEEDS_REPLAN`, provide at least 3 inline words explaining the trigger. On failure or blocker, instruct `implementer` to write raw output to `<artifactDirectoryPath>/scratch/<task_id>.log` and state the error cause and `file://` URI in `NOTES`.
+- **Compact Scout Shorthand**: For read-only `scout` tasks ($\le 3$ rules), a compact 2-header report (`STATUS: COMPLETED | BLOCKED | FAILED` and `NOTES: <findings>`) is supported.
+- If you are a subagent, `REPORT FORMAT` overrides workspace formatting rules. Return only the required headers (plus up to 10 compact bullet lines under `NOTES`) and omit any post-action retrospective. Subagent reports must be `<= 1600` characters total with inline summary text on the `NOTES:` header line (plus up to 10 `- ` bullets).
 
 ```markdown
 TASK: <single-sentence objective>
 ALLOWED_FILES: <comma-separated file paths or NONE>
+STAGE: 1/2
+SPEC_FILE: <artifactDirectoryPath>/scratch/spec_<task>.md
+REPLAN_IF: <condition that triggers early replan>
 
 RULES:
 1. Open `<file_path>`.
@@ -80,7 +87,7 @@ RULES:
 
 REPORT FORMAT:
 Return only these four headers (plus up to 10 `- ` bullet lines under NOTES if needed; <= 1600 chars total):
-STATUS: COMPLETED | BLOCKED | FAILED
+STATUS: COMPLETED | CHECKPOINT | NEEDS_REPLAN | BLOCKED | FAILED
 FILES_CHANGED: <comma-separated paths or NONE>
 VERIFICATION: <one sentence stating the command run and exit result>
 NOTES: <summary (and up to 10 `- ` bullets), or inline error cause plus file://.log URI if BLOCKED/FAILED>
@@ -91,18 +98,19 @@ NOTES: <summary (and up to 10 `- ` bullets), or inline error cause plus file://.
 - Invoke independent subagents in parallel in the same turn using your runtime's `invoke_subagent` schema (`Subagents: [{"TypeName", "Role", "Prompt", "Model", "Workspace"}, ...]` in Remote VMs, or flat arguments in local `agy` CLI).
 - End your turn immediately after calling `invoke_subagent` or `send_message`. Do not poll with `manage_subagents`.
 - Reuse an idle `flash` subagent via `send_message` when continuing work in the same module. Never send multi-step or code-editing tasks to a `flash_lite` (`scout`) subagent.
+- **Staged Mid-Flight Checkpoints**: For multi-phase tasks, dispatch subagents with `STAGE: 1/N`. Subagents report `STATUS: CHECKPOINT` upon completing an intermediate stage, allowing orchestrator diff inspection and dynamic `ALLOWED_FILES:` allowlist expansion via `send_message` with `STAGE: 2/N` without resetting test receipts prematurely.
 - Stop completed `Workspace: "branch"` subagents with `manage_subagents` (`Action: "kill"`) after merging or discarding their changes.
-- Keep context clean: do not read `.log` or `transcript.jsonl` files or $> 2$ workspace files directly in the orchestrator. Delegate log slicing to `scout`.
+- Keep context clean: do not read `.log` or `transcript.jsonl` files or $> 8$ workspace files directly in the orchestrator. Delegate log slicing to `scout`.
 
 ## 5. Empirical Test Receipts, Circuit Breaker, and Diff Audit
 
 - **Empirical Test Receipts**: Every code change requires a passing test command recorded by the guard hook after the last file edit.
-- **Two-Turn Circuit Breaker**: Stop retrying after 2 consecutive command or subagent failures, write raw output to the scratch log, and report `STATUS: BLOCKED`.
+- **Two-Turn Circuit Breaker & 1-Shot Re-Plan**: Stop retrying after 2 consecutive command or subagent failures, write raw output to the scratch log, and report `STATUS: BLOCKED`. Tripped orchestrators have a 1-shot re-plan budget: adding a `REPLAN: <revised plan rationale>` header resets the circuit breaker once per turn before hard-locking.
 - **No Test Tampering**: Never delete, skip, or weaken existing test functions or assertions to make a test suite pass.
 
 ## 6. Post-Turn Evaluation
 
-At the end of substantive orchestrator turns, include a concise **Post-Turn Evaluation** covering:
+At the end of substantive orchestrator turns that mutate workspace files, run verification tests, or dispatch `implementer` subagents (pure read-only Q&A, code reviews, and explanations are exempt), include a concise **Post-Turn Evaluation** covering:
 - **Potential Issues**: Residual edge cases, runtime constraints, or state caveats.
 - **Capability Gaps**: Differences between protocol intent and deterministic hook enforcement.
 - **Next Steps**: Concrete follow-up actions or verification steps.

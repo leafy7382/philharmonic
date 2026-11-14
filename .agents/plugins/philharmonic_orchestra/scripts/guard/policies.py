@@ -12,17 +12,28 @@ from guard.constants import (
     ALLOWED_FILES_HEADER_RE,
     ALLOWED_SUBAGENT_MODELS,
     DEFAULT_MODEL_BY_TYPE,
+    DEFAULT_UNBOUNDED_READ_BYTES,
+    DEFAULT_UNBOUNDED_READ_LINES,
+    DIR_LIST_TOOLS,
     FORBIDDEN_DIRECT_READ_RE,
+    GROUNDED_SPEC_SECTION_PATTERNS,
     MAX_DIRECT_COMMANDS,
     MAX_DIRECT_MUTATION_FILES,
+    MAX_DIRECT_READ_BYTES,
     MAX_DIRECT_READ_FILES,
+    MAX_DIRECT_READ_LINES,
+    MAX_REPLAN_ATTEMPTS,
     MUTATION_TOOLS,
     MUTATION_VERBS_RE,
     NUMBERED_RULE_RE,
     PATH_ARG_KEYS,
     PROJECT_ROOT,
     READ_TOOLS,
+    REPLAN_HEADER_RE,
+    REPLAN_IF_HEADER_RE,
     SEARCH_TOOLS,
+    SPEC_FILE_HEADER_RE,
+    STAGE_HEADER_RE,
     _extract_call_id,
     _is_git_only_command,
     _is_test_command,
@@ -189,6 +200,46 @@ def _is_simple_readonly_task(type_name: str, prompt_text: str) -> bool:
     return not has_mutation and rule_count <= 3
 
 
+def _validate_spec_file_header(
+    prompt_text: str, type_name: str, payload: Optional[Dict[str, Any]] = None
+) -> Tuple[Optional[str], Optional[str]]:
+    """Validate SPEC_FILE: header. Returns (resolved_spec_path_str, error_reason)."""
+    match = SPEC_FILE_HEADER_RE.search(prompt_text)
+    if not match:
+        return None, None
+    raw_val = match.group(1).strip().strip("`'\"")
+    if not raw_val or raw_val.upper() == "NONE":
+        return None, None
+
+    raw_path = Path(os.path.expanduser(raw_val))
+    spec_path = raw_path if raw_path.is_absolute() else (PROJECT_ROOT / raw_path)
+    try:
+        resolved_path = spec_path.resolve()
+    except OSError:
+        resolved_path = spec_path
+
+    if type_name.lower() == "implementer":
+        if not resolved_path.is_file():
+            return None, (
+                f"[ORCHESTRATOR GUARD] SPEC_FILE '{raw_val}' does not exist. "
+                "Have 'research' or root write the grounded spec before dispatching 'implementer'."
+            )
+        try:
+            content = resolved_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None, (
+                f"[ORCHESTRATOR GUARD] SPEC_FILE '{raw_val}' could not be read."
+            )
+        for pattern in GROUNDED_SPEC_SECTION_PATTERNS:
+            if not pattern.search(content):
+                return None, (
+                    f"[ORCHESTRATOR GUARD] SPEC_FILE '{resolved_path.name}' is missing required "
+                    "grounded sections (SIGNATURES, PITFALLS/INVARIANTS, VERIFICATION)."
+                )
+
+    return str(resolved_path), None
+
+
 def _validate_and_prepare_subagent_entry(
     entry: Dict[str, Any],
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[str]]:
@@ -249,6 +300,23 @@ def _validate_and_prepare_subagent_entry(
     allowed_files = _parse_allowed_files_header(prompt_text)
     if allowed_files is not None:
         spawn_record["allowed_files"] = allowed_files
+
+    replan_if_match = REPLAN_IF_HEADER_RE.search(prompt_text)
+    if replan_if_match:
+        spawn_record["replan_if"] = replan_if_match.group(1).strip()
+
+    stage_match = STAGE_HEADER_RE.search(prompt_text)
+    if stage_match:
+        stage_val = stage_match.group(1).strip()
+        spawn_record["stage"] = stage_val
+        spawn_record["stage_history"] = [stage_val]
+
+    spec_file, spec_err = _validate_spec_file_header(prompt_text, type_name)
+    if spec_err:
+        return {"decision": "deny", "reason": spec_err}, None, None
+    if spec_file:
+        spawn_record["spec_file"] = spec_file
+
     return None, spawn_record, target_model
 
 
@@ -353,7 +421,7 @@ def _handle_send_message(
     if not _is_root_orchestrator(payload, state) and re.match(r"^\s*STATUS:", message):
         from guard.verification import validate_subagent_report
 
-        err = validate_subagent_report(message)
+        err = validate_subagent_report(message, is_scout=_is_scout_subagent(payload, state))
         if err:
             return {
                 "decision": "deny",
@@ -366,6 +434,26 @@ def _handle_send_message(
             _save_state(payload, state)
 
     subagent_info = state.get("subagents", {}).get(recipient)
+    recipient_type = str(subagent_info.get("type_name") or subagent_info.get("type") or "") if subagent_info else ""
+    spec_file, spec_err = _validate_spec_file_header(message, recipient_type, payload)
+    if spec_err:
+        return {"decision": "deny", "reason": spec_err}
+    if spec_file and subagent_info:
+        subagent_info["spec_file"] = spec_file
+        _save_state(payload, state)
+
+    replan_if_match = REPLAN_IF_HEADER_RE.search(message)
+    if replan_if_match and subagent_info:
+        subagent_info["replan_if"] = replan_if_match.group(1).strip()
+        _save_state(payload, state)
+
+    stage_match = STAGE_HEADER_RE.search(message)
+    if stage_match and subagent_info:
+        stage_val = stage_match.group(1).strip()
+        subagent_info["stage"] = stage_val
+        subagent_info.setdefault("stage_history", []).append(stage_val)
+        _save_state(payload, state)
+
     if subagent_info:
         if subagent_info.get("model") == "flash_lite":
             rule_count = len(NUMBERED_RULE_RE.findall(message))
@@ -385,6 +473,8 @@ def _handle_send_message(
         if subagent_info:
             subagent_info["allowed_files"] = parsed_allowed
             _save_state(payload, state)
+
+    if parsed_allowed is not None or stage_match is not None:
         artifact_dir = payload.get("artifactDirectoryPath")
         if artifact_dir and recipient:
             try:
@@ -397,7 +487,12 @@ def _handle_send_message(
                         with state_transaction(sib_state_file):
                             sib_state = _load_state(sib_state_file)
                             meta = sib_state.setdefault("self_subagent_meta", {})
-                            meta["allowed_files"] = parsed_allowed
+                            if parsed_allowed is not None:
+                                meta["allowed_files"] = parsed_allowed
+                            if stage_match is not None:
+                                stage_val = stage_match.group(1).strip()
+                                meta["stage"] = stage_val
+                                meta.setdefault("stage_history", []).append(stage_val)
                             _save_state(sib_state_file, sib_state)
             except OSError:
                 pass
@@ -495,7 +590,7 @@ def _extract_any_path_arg(tool_name: str, args: Dict[str, Any]) -> Optional[str]
 
 def _extract_target_path(tool_name: str, args: Dict[str, Any]) -> str:
     """Extract the target file or directory path for native Antigravity tools."""
-    if tool_name in (SEARCH_TOOLS | READ_TOOLS | MUTATION_TOOLS):
+    if tool_name in (SEARCH_TOOLS | READ_TOOLS | DIR_LIST_TOOLS | MUTATION_TOOLS):
         return _extract_any_path_arg(tool_name, args) or ""
     return ""
 
@@ -512,18 +607,105 @@ def _check_and_record_direct_budget(
     if not _is_root_orchestrator(payload, state):
         return None
 
+    if state.get("plan_execute_phase"):
+        if tool_name in SEARCH_TOOLS:
+            search_target = _extract_target_path(tool_name, args)
+            if search_target:
+                norm_slashes = search_target.replace("\\", "/")
+                if FORBIDDEN_DIRECT_READ_RE.search(norm_slashes):
+                    return {
+                        "decision": "deny",
+                        "reason": (
+                            "[ORCHESTRATOR GUARD] Context separation violation: root orchestrator cannot "
+                            f"directly read raw log or transcript file '{Path(search_target).name}'. "
+                            "Delegate log slicing to a 'scout' subagent (Model='flash_lite')."
+                        ),
+                    }
+            return None
+
+        if tool_name in READ_TOOLS:
+            target = _extract_target_path(tool_name, args)
+            if target:
+                norm_slashes = str(target).replace("\\", "/")
+                if FORBIDDEN_DIRECT_READ_RE.search(norm_slashes):
+                    return {
+                        "decision": "deny",
+                        "reason": (
+                            "[ORCHESTRATOR GUARD] Context separation violation: root orchestrator cannot "
+                            f"directly read raw log or transcript file '{Path(target).name}'. "
+                            "Delegate log slicing to a 'scout' subagent (Model='flash_lite')."
+                        ),
+                    }
+            return None
+
+        if tool_name in DIR_LIST_TOOLS:
+            target = _extract_target_path(tool_name, args)
+            if target:
+                norm_slashes = str(target).replace("\\", "/")
+                if FORBIDDEN_DIRECT_READ_RE.search(norm_slashes):
+                    return {
+                        "decision": "deny",
+                        "reason": (
+                            "[ORCHESTRATOR GUARD] Context separation violation: root orchestrator cannot "
+                            f"directly list or read log or transcript directory/file '{Path(target).name}'. "
+                            "Delegate log slicing to a 'scout' subagent (Model='flash_lite')."
+                        ),
+                    }
+            return None
+
+        if tool_name in MUTATION_TOOLS:
+            target = _extract_target_path(tool_name, args)
+            plan_allowed = state.get("plan_allowed_files")
+            if (
+                plan_allowed is not None
+                and target
+                and not _is_artifact_or_worktree_path(target, payload)
+            ):
+                if not _is_target_in_allowed_files(
+                    target, plan_allowed, payload.get("workspacePaths")
+                ):
+                    return {
+                        "decision": "deny",
+                        "reason": (
+                            f"[ORCHESTRATOR GUARD] File allowlist violation: plan execution attempted to mutate "
+                            f"'{Path(target).name}', which is outside plan ALLOWED_FILES "
+                            f"({', '.join(plan_allowed) if plan_allowed else 'NONE'})."
+                        ),
+                    }
+            return None
+
+        return None
+
     inv_key = _current_invocation_key(payload, state)
     budget = state.setdefault("direct_budget", {}).setdefault(
         inv_key,
         {
             "mutated_files": [],
             "read_files": [],
+            "read_ranges": [],
+            "read_lines": 0,
+            "read_bytes": 0,
             "commands": [],
             "seen_calls": [],
             "test_runs_after_edit": 0,
         },
     )
     call_id = _extract_call_id(payload)
+
+    if tool_name in DIR_LIST_TOOLS:
+        target = _extract_target_path(tool_name, args)
+        if target:
+            norm_slashes = str(target).replace("\\", "/")
+            if FORBIDDEN_DIRECT_READ_RE.search(norm_slashes):
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        "[ORCHESTRATOR GUARD] Context separation violation: root orchestrator cannot "
+                        f"directly list or read log or transcript directory/file '{Path(target).name}'. "
+                        "Delegate log slicing to a 'scout' subagent (Model='flash_lite')."
+                    ),
+                }
+        return None
 
     if tool_name in SEARCH_TOOLS:
         search_target = _extract_target_path(tool_name, args)
@@ -561,20 +743,84 @@ def _check_and_record_direct_budget(
         except OSError:
             return None
 
+        start_line = (
+            args.get("StartLine")
+            if args.get("StartLine") is not None
+            else args.get("start_line")
+            if args.get("start_line") is not None
+            else args.get("StartLineNumber")
+        )
+        end_line = (
+            args.get("EndLine")
+            if args.get("EndLine") is not None
+            else args.get("end_line")
+            if args.get("end_line") is not None
+            else args.get("EndLineNumber")
+        )
+
+        read_ranges: List[str] = budget.setdefault("read_ranges", [])
         read_files: List[str] = budget.setdefault("read_files", [])
-        if norm_target not in read_files:
-            if len(read_files) >= MAX_DIRECT_READ_FILES:
-                return {
-                    "decision": "deny",
-                    "reason": (
-                        f"[ORCHESTRATOR GUARD] Direct execution fast-path read limit "
-                        f"({MAX_DIRECT_READ_FILES} workspace files) exceeded when reading "
-                        f"'{Path(norm_target).name}'. Delegate multi-file reads or discovery to a "
-                        "'scout' (Model='flash_lite') or 'research' (Model='flash') subagent."
-                    ),
-                }
+        range_key = f"{norm_target}:{start_line or ''}:{end_line or ''}"
+        full_key = f"{norm_target}::"
+        if range_key in read_ranges or full_key in read_ranges:
+            return None
+
+        p = Path(norm_target)
+        if p.is_file():
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+                all_lines = text.splitlines()
+            except OSError:
+                all_lines = []
+            if start_line is not None or end_line is not None:
+                s = max(1, int(start_line or 1))
+                e = min(len(all_lines), int(end_line or len(all_lines)))
+                if s <= e:
+                    sliced = all_lines[s - 1 : e]
+                    lines_cost = len(sliced)
+                    bytes_cost = sum(len(x.encode("utf-8")) + 1 for x in sliced)
+                else:
+                    lines_cost = 0
+                    bytes_cost = 0
+            else:
+                lines_cost = min(800, len(all_lines))
+                try:
+                    bytes_cost = min(46080, p.stat().st_size)
+                except OSError:
+                    bytes_cost = sum(len(x.encode("utf-8")) + 1 for x in all_lines)
+        else:
+            if start_line is not None and end_line is not None:
+                lines_cost = max(1, int(end_line) - int(start_line) + 1)
+                bytes_cost = lines_cost * 40
+            else:
+                lines_cost = DEFAULT_UNBOUNDED_READ_LINES
+                bytes_cost = DEFAULT_UNBOUNDED_READ_BYTES
+
+        current_lines = budget.setdefault("read_lines", 0)
+        current_bytes = budget.setdefault("read_bytes", 0)
+        file_is_new = norm_target not in read_files
+        if (
+            current_lines + lines_cost > MAX_DIRECT_READ_LINES
+            or current_bytes + bytes_cost > MAX_DIRECT_READ_BYTES
+            or (file_is_new and len(read_files) >= MAX_DIRECT_READ_FILES)
+        ):
+            return {
+                "decision": "deny",
+                "reason": (
+                    f"[ORCHESTRATOR GUARD] Direct execution fast-path read budget "
+                    f"({MAX_DIRECT_READ_LINES} lines / {MAX_DIRECT_READ_BYTES} bytes / "
+                    f"{MAX_DIRECT_READ_FILES} workspace files) exceeded when reading "
+                    f"'{Path(norm_target).name}'. Pass StartLine/EndLine for targeted inspection "
+                    "or delegate to a 'scout' (Model='flash_lite') or 'research' (Model='flash') subagent."
+                ),
+            }
+
+        read_ranges.append(range_key)
+        if file_is_new:
             read_files.append(norm_target)
-            _save_state(payload, state)
+        budget["read_lines"] = current_lines + lines_cost
+        budget["read_bytes"] = current_bytes + bytes_cost
+        _save_state(payload, state)
         return None
 
     if tool_name in MUTATION_TOOLS:
@@ -673,6 +919,23 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
         tool_name = tool_call.get("name", "")
         args = tool_call.get("args", {}) or {}
 
+        if tool_name == "exit_plan_mode" and _is_root_orchestrator(payload, state):
+            state["active"] = True
+            state["session_evaluated"] = True
+            state["plan_execute_phase"] = True
+            state["plan_execute_consumed"] = False
+            plan_text = str(args.get("plan") or args.get("Plan") or "")
+            state["plan_allowed_files"] = _parse_allowed_files_header(plan_text)
+            _save_state(payload, state)
+            return {"decision": "allow"}
+
+        if tool_name == "enter_plan_mode" and _is_root_orchestrator(payload, state):
+            state["plan_execute_phase"] = False
+            state["plan_execute_consumed"] = False
+            state["plan_allowed_files"] = None
+            _save_state(payload, state)
+            return {"decision": "allow"}
+
         cb = _get_circuit_breaker(state, payload)
         if cb.get("tripped"):
             if tool_name in MUTATION_TOOLS:
@@ -713,7 +976,7 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
             elif tool_name in {"invoke_subagent", "send_message"}:
                 if tool_name == "send_message" and not _is_root_orchestrator(payload, state):
                     msg_text = str(args.get("Message") or "")
-                    if re.search(r"(?m)^\s*STATUS:\s*(?:BLOCKED|FAILED)\b", msg_text):
+                    if re.search(r"(?m)^\s*STATUS:\s*(?:BLOCKED|FAILED|NEEDS_REPLAN)\b", msg_text):
                         pass
                     else:
                         return {
@@ -727,21 +990,65 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                             ),
                         }
                 else:
-                    return {
-                        "decision": "deny",
-                        "reason": (
-                            f"[ORCHESTRATOR GUARD] 2-turn circuit breaker tripped after "
-                            f"{cb.get('failure_streak', 2)} consecutive failures "
-                            f"(last error: {cb.get('last_error', 'command/subagent failed')}). "
-                            "Stop retrying, write failure details to the scratch log if needed, "
-                            "and report STATUS: BLOCKED."
-                        ),
-                    }
+                    replan_found = False
+                    if tool_name == "invoke_subagent":
+                        entries = (
+                            args["Subagents"]
+                            if isinstance(args.get("Subagents"), list)
+                            else [args]
+                        )
+                        for item in entries:
+                            if isinstance(item, dict) and REPLAN_HEADER_RE.search(
+                                str(item.get("Prompt") or "")
+                            ):
+                                replan_found = True
+                                break
+                    elif tool_name == "send_message":
+                        replan_found = bool(
+                            REPLAN_HEADER_RE.search(str(args.get("Message") or ""))
+                        )
 
-        if tool_name in SEARCH_TOOLS:
+                    replan_count = cb.get("replan_count", 0)
+                    if replan_found and replan_count < MAX_REPLAN_ATTEMPTS:
+                        cb["replan_count"] = replan_count + 1
+                        cb["tripped"] = False
+                        cb["failure_streak"] = 0
+                        _save_state(payload, state)
+                    elif replan_count < MAX_REPLAN_ATTEMPTS:
+                        return {
+                            "decision": "deny",
+                            "reason": (
+                                f"[ORCHESTRATOR GUARD] 2-turn circuit breaker tripped after "
+                                f"{cb.get('failure_streak', 2)} consecutive failures "
+                                f"(last error: {cb.get('last_error', 'command/subagent failed')}). "
+                                "Stop retrying, write failure details to the scratch log if needed, "
+                                "and report STATUS: BLOCKED, or include 'REPLAN: <revised plan rationale>' "
+                                "to use the 1-shot re-plan budget."
+                            ),
+                        }
+                    else:
+                        return {
+                            "decision": "deny",
+                            "reason": (
+                                f"[ORCHESTRATOR GUARD] 2-turn circuit breaker tripped after "
+                                f"{cb.get('failure_streak', 2)} consecutive failures "
+                                f"(last error: {cb.get('last_error', 'command/subagent failed')}). "
+                                "Stop retrying, write failure details to the scratch log if needed, "
+                                "and report STATUS: BLOCKED."
+                            ),
+                        }
+
+        roots = _allowed_roots(payload)
+
+        if tool_name in (SEARCH_TOOLS | DIR_LIST_TOOLS):
             budget_denial = _check_and_record_direct_budget(payload, tool_name, args, state)
             if budget_denial:
                 return budget_denial
+            if tool_name in DIR_LIST_TOOLS:
+                target_path = _extract_target_path(tool_name, args) or str(PROJECT_ROOT)
+                if _is_within_allowed_roots(target_path, roots):
+                    return {"decision": "allow"}
+                return {"decision": "ask"}
 
         if tool_name == "define_subagent":
             return _handle_define_subagent(args)

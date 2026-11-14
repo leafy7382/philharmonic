@@ -432,6 +432,19 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
                 state["root_conversation_id"] = cid
                 changed = True
 
+            user_input = str(payload.get("lastUserInput") or "")
+            if state.get("plan_execute_phase"):
+                if "[plan review]" in user_input.lower() or (
+                    bool(user_input.strip()) and state.get("plan_execute_consumed")
+                ):
+                    state["plan_execute_phase"] = False
+                    state["plan_execute_consumed"] = False
+                    state["plan_allowed_files"] = None
+                    changed = True
+                else:
+                    state["plan_execute_consumed"] = True
+                    changed = True
+
             wps = [
                 str(Path(wp).resolve())
                 for wp in (payload.get("workspacePaths") or [])
@@ -462,13 +475,14 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
                     from guard.verification import _get_circuit_breaker
 
                     cb = _get_circuit_breaker(state, payload)
-                    if cb.get("failure_streak") or cb.get("tripped"):
+                    if cb.get("failure_streak") or cb.get("tripped") or cb.get("replan_count"):
                         cb.update(
                             {
                                 "failure_streak": 0,
                                 "tripped": False,
                                 "seen_failures": [],
                                 "last_error": "",
+                                "replan_count": 0,
                             }
                         )
                         changed = True
@@ -494,7 +508,8 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
                         "delegation rules in SKILL.md. Execute only your assigned TASK and RULES, and return "
                         "strictly the 4-header REPORT FORMAT (STATUS, FILES_CHANGED, VERIFICATION, NOTES; "
                         "allowing up to 10 '-' bullet lines under NOTES and requiring inline error cause plus "
-                        "file:// .log URI when BLOCKED or FAILED)."
+                        "file:// .log URI when BLOCKED or FAILED; status may be COMPLETED, CHECKPOINT, "
+                        "NEEDS_REPLAN, BLOCKED, or FAILED; scouts may use compact 2-header STATUS + NOTES)."
                     )
                 }
             ]

@@ -8,11 +8,14 @@ An **Antigravity (`agy`) plugin** that enforces a Central Orchestrator workflow 
 
 - **On-Demand Session Gating**: Inactive by default in normal chats. Activates for the current conversation when you run `/philharmonic` or `orchestrator_guard.py activate`.
 - **Tiered Subagent Delegation**: Any model can act as the Central Orchestrator while delegating file discovery, research, and multi-file edits to `flash_lite` (`scout`) and `flash` (`research`, `implementer`) subagents.
-- **Direct Fast-Path Budget**: Allows the root orchestrator to handle small tasks directly (up to 2 workspace file reads, 2 workspace file edits, and 2 non-git commands per turn, plus 1 verification test run after a direct edit) while requiring `implementer` delegation for larger changes or iterative edit-and-test loops.
-- **Context Isolation**: Blocks the root orchestrator from reading or searching raw `.log` and `transcript*.jsonl` files directly (`read_file`, `grep_search`, `find_by_name`), keeping bulky logs inside `scout` subagents.
-- **Structured Prompt & Report Contracts**: Validates subagent prompts (`TASK:`, `RULES:`, `REPORT FORMAT:`) on dispatch and checks that subagents return a bounded 4-header report on completion.
+- **Direct Fast-Path Budget**: Allows the root orchestrator to handle small tasks directly (up to 400 lines / 16 KB across $\le 8$ workspace files with line/byte estimation and `list_dir` free, 2 workspace file edits, and 2 non-git commands per turn, plus 1 verification test run after a direct edit) while requiring `implementer` delegation for larger changes or iterative edit-and-test loops.
+- **System Orchestrator Hybrid Coexistence Mode**: Calling `exit_plan_mode` during plan execution unlocks multi-file mutations and iterative test loops for Antigravity's execution model while keeping `.log` isolation, optional plan `ALLOWED_FILES:` enforcement, test anti-tampering guards, empirical test receipts, and circuit breaker gates active. Resets on `[plan review]` or the next user prompt.
+- **Context Isolation**: Blocks the root orchestrator from reading or searching raw `.log` and `transcript*.jsonl` files directly (`read_file`, `grep_search`, `find_by_name`, `list_dir`), keeping bulky logs inside `scout` subagents.
+- **Structured Prompt & Report Contracts**: Validates subagent prompts (`TASK:`, `ALLOWED_FILES:`, optional `STAGE:`, `SPEC_FILE:`, `REPLAN_IF:`, `RULES:`, `REPORT FORMAT:`) on dispatch and verifies reports on completion (with compact 2-header shorthand for `scout`).
+- **Grounded Spec Relay**: Validates that specifications referenced via `SPEC_FILE:` exist and contain `SIGNATURES`, `PITFALLS` (or `INVARIANTS`), and `VERIFICATION` sections before dispatching `implementer` subagents.
+- **Staged Mid-Flight Checkpoints**: Subagents can report intermediate progress via `STATUS: CHECKPOINT` without prematurely verifying empirical test receipts, allowing step-by-step review and dynamic file allowlist expansion.
 - **Test Verification & Anti-Tampering Gate**: Requires a passing test run after code modifications before completion, and blocks test file edits or diffs that delete tests, reduce assertions, comment out `assert` statements, add skip/xfail markers, or insert `assert True`.
-- **2-Turn Circuit Breaker**: Trips after 2 consecutive command or subagent failures, halting further retries and allowing immediate `STATUS: BLOCKED` termination.
+- **2-Turn Circuit Breaker & 1-Shot Re-Plan**: Trips after 2 consecutive command or subagent failures, halting further retries. Includes a 1-shot re-plan recovery budget allowing the root orchestrator to provide `REPLAN: <revised plan rationale>` to reset the circuit breaker once before hard-locking into `STATUS: BLOCKED`.
 
 ---
 
@@ -86,6 +89,9 @@ All subagent prompts (`invoke_subagent` and `send_message`) must use the followi
 ```markdown
 TASK: <single-sentence objective>
 ALLOWED_FILES: <comma-separated file paths or NONE>
+STAGE: 1/2
+SPEC_FILE: <artifactDirectoryPath>/scratch/spec_<task>.md
+REPLAN_IF: <condition that triggers early replan>
 
 RULES:
 1. Open `<file_path>`.
@@ -96,7 +102,7 @@ RULES:
 
 REPORT FORMAT:
 Return only these four headers (plus up to 10 `- ` bullet lines under NOTES if needed):
-STATUS: COMPLETED | BLOCKED | FAILED
+STATUS: COMPLETED | CHECKPOINT | NEEDS_REPLAN | BLOCKED | FAILED
 FILES_CHANGED: <comma-separated paths or NONE>
 VERIFICATION: <one sentence stating the command run and exit result>
 NOTES: <summary (and up to 10 `- ` bullets), or inline error cause plus file://.log URI if BLOCKED/FAILED>
@@ -105,9 +111,12 @@ NOTES: <summary (and up to 10 `- ` bullets), or inline error cause plus file://.
 ### Report Validation Rules
 
 - **Deterministic File Allowlist (`ALLOWED_FILES:`)**: When `ALLOWED_FILES:` is specified in `invoke_subagent` or `send_message`, `PreToolUse` deterministically blocks the subagent from mutating any workspace file outside that allowlist (while still allowing `<artifactDirectoryPath>/scratch/*.log` failure logs).
+- **Staged Mid-Flight Checkpoints (`STAGE:`)**: Subagents can report intermediate progress via `STATUS: CHECKPOINT` without prematurely verifying empirical test receipts, enabling progressive diff review and dynamic allowlist expansion via `send_message`.
+- **Grounded Spec Relay (`SPEC_FILE:`)**: Specs referenced in prompts are verified to exist and contain `SIGNATURES`, `PITFALLS` (or `INVARIANTS`), and `VERIFICATION` before dispatching `implementer` subagents.
+- **Replan-Aware Circuit Breaker (`REPLAN_IF:`)**: Subagents halt and report `STATUS: NEEDS_REPLAN` when assumptions fail. Root orchestrators can use `REPLAN: <rationale>` to reset a tripped circuit breaker once per turn.
+- **Compact Scout Shorthand**: For read-only `scout` tasks ($\le 3$ rules), a compact 2-header report (`STATUS:` + `NOTES:`) is supported.
 - **Bounded `NOTES`**: Reports may include up to 10 bullet lines (`- ` or `* `) under `NOTES:`, with total report length capped at 1,600 characters.
-- **Failure Diagnosis**: When `STATUS` is `BLOCKED` or `FAILED`, `NOTES:` must include both an inline error summary (at least 3 words) and a `file://.../*.log` URI pointing to the raw failure output in `<artifactDirectoryPath>/scratch/`.
-- **Scratch Specification Relay**: For tasks with detailed specifications or schemas, write the spec to `<artifactDirectoryPath>/scratch/spec_<task>.md` and reference it in Rule 1 of `RULES:`.
+- **Failure Diagnosis**: When `STATUS` is `BLOCKED` or `FAILED`, `NOTES:` must include both an inline error summary (at least 3 words) and a `file://.../*.log` URI pointing to the raw failure output in `<artifactDirectoryPath>/scratch/`. When `STATUS` is `NEEDS_REPLAN`, `NOTES:` must provide an inline explanation of at least 3 words.
 
 ---
 
@@ -115,22 +124,27 @@ NOTES: <summary (and up to 10 `- ` bullets), or inline error cause plus file://.
 
 Configured in [hooks.json](.agents/plugins/philharmonic_orchestra/hooks.json) and dispatched via [orchestrator_guard.py](.agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py) (backed by the modular [guard/](.agents/plugins/philharmonic_orchestra/scripts/guard) package: `constants.py`, `identity.py`, `policies.py`, `state_store.py`, `verification.py`, `cli.py`), with session state persisted via `flock` in `<artifactDirectoryPath>/orchestrator_state.json`:
 
-1. **`pre-invocation`**: Records the root orchestrator conversation ID, caches subagent identity across isolated brain directories, and injects a context-isolation reminder into worker subagents.
+1. **`pre-invocation`**: Records the root orchestrator conversation ID, caches subagent identity across isolated brain directories, handles hybrid coexistence resets (on `[plan review]` or next user input), resets circuit breaker `replan_count`, and injects a context-isolation reminder into worker subagents.
 2. **`pre-tool`**:
    - Supports both local `agy` CLI (`read_file`, `write_file`, `edit_file`, `list_dir`, `grep_search`, `find_by_name`, `run_command`, flat `invoke_subagent`, PascalCase `define_subagent`) and Remote VM (`view_file`, `write_to_file`, `replace_file_content`, `lookup_skill`, `lookup_skills`, `Subagents` list `invoke_subagent`, `snake_case` `define_subagent`) tool schemas.
-   - Enforces the root orchestrator fast-path budget (<= 2 file reads, <= 2 file edits, <= 2 non-git commands, and 1 verification test run after edits). Compound shell commands (`&&`, `||`, `;`) are split and checked per sub-command.
-   - Blocks root orchestrator reads and searches on `.log` and `transcript*.jsonl` files.
+   - Enforces the root orchestrator direct read budget (<= 400 lines / <= 16 KB across <= 8 workspace files with line/byte estimation; `list_dir` free), mutation limits (<= 2 file edits), command limits (<= 2 non-git commands), and 1 verification test run after edits.
+   - Handles `exit_plan_mode` and `enter_plan_mode` triggers for System Orchestrator hybrid coexistence mode, lifting direct edit/command/test loop caps while enforcing plan `ALLOWED_FILES:`.
+   - Blocks root orchestrator reads, directory listings, and searches on `.log` and `transcript*.jsonl` files.
+   - Validates grounded specs (`SPEC_FILE:`) containing required sections (`SIGNATURES`, `PITFALLS`/`INVARIANTS`, `VERIFICATION`) for `implementer`.
+   - Tracks `STAGE:` history and allows 1-shot circuit breaker reset with `REPLAN:` header on dispatch.
    - Restricts `research` subagents to writing markdown files under `<artifactDirectoryPath>/scratch/*.md` and enforces per-subagent `ALLOWED_FILES:` workspace write allowlists on `implementer` subagents.
    - Blocks `Model: "pro"`, rewrites `Model: "inherit"`, and downgrades read-only subagent tasks with <= 3 rules and no mutation verbs to `Model: "flash_lite"`.
-   - Validates `invoke_subagent` and `send_message` prompts against the structured prompt contract and tracks `ALLOWED_FILES:` headers.
+   - Validates `invoke_subagent` and `send_message` prompts against the structured prompt contract.
    - Inspects edits to test files and blocks test deletion, assertion reduction, commented-out assertions, skip/xfail additions, or `assert True`.
-   - Blocks retries when the 2-turn circuit breaker is tripped (while still allowing scratch log writes).
+   - Blocks retries when the 2-turn circuit breaker is tripped (while still allowing scratch log writes and 1-shot re-plan dispatch).
 3. **`post-tool`**:
    - Tracks spawned subagent conversation IDs, model tiers, and `branch` workspaces using an incremental `transcript_offset` cursor, rolling back failed spawns.
    - Records passing test runs after code edits and increments or resets the 2-turn circuit breaker counter.
+   - Distinguishes non-final statuses (`CHECKPOINT`, `NEEDS_REPLAN`, `BLOCKED`, `FAILED`) to avoid prematurely marking test receipts as verified.
+   - Rolls back hybrid coexistence state if `exit_plan_mode` tool call returns an error.
 4. **`stop`**:
    - Blocks completion if any `Workspace: "branch"` subagent worktree has not been terminated via `manage_subagents` (`Action: "kill"`).
-   - Reads the tail (64 KB) of subagent transcripts to verify the 4-header `REPORT FORMAT`.
+   - Validates subagent report formats (supporting compact 2-header format for `scout` and 4-header format with `CHECKPOINT`/`NEEDS_REPLAN`).
    - Blocks completion if code files were modified without a subsequent passing test run, or if `git diff HEAD -U0` reveals test tampering.
    - Allows immediate termination when the circuit breaker is tripped so the agent can report `STATUS: BLOCKED`.
 

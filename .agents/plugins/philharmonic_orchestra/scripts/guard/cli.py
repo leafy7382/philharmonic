@@ -34,6 +34,7 @@ def _cli_status(payload: Dict[str, Any]) -> Dict[str, Any]:
         "projectRoot": str(PROJECT_ROOT),
         "stateFile": str(_state_file_path(payload)),
         "active": bool(state.get("active", False)),
+        "planExecutePhase": bool(state.get("plan_execute_phase", False)),
         "rootConversationId": state.get("root_conversation_id"),
         "currentInvocation": inv_key,
         "activeSubagents": state.get("subagents", {}),

@@ -59,7 +59,16 @@ def _default_state() -> Dict[str, Any]:
         "stop_reminded_executions": [],
         "direct_budget": {},
         "test_receipt": {},
-        "circuit_breaker": {},
+        "circuit_breaker": {
+            "failure_streak": 0,
+            "tripped": False,
+            "seen_failures": [],
+            "last_error": "",
+            "replan_count": 0,
+        },
+        "plan_execute_phase": False,
+        "plan_execute_consumed": False,
+        "plan_allowed_files": None,
         "current_invocation_num": 0,
     }
 
@@ -182,6 +191,8 @@ def _load_state(payload_or_path: Any) -> Dict[str, Any]:
                 data["isolation_reminded_invocations"] = (
                     data.get("isolation_reminded_invocations") or []
                 )
+                if isinstance(data.get("circuit_breaker"), dict):
+                    data["circuit_breaker"].setdefault("replan_count", 0)
                 return data
         return _default_state()
 
