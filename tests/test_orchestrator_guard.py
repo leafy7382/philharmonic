@@ -3813,9 +3813,111 @@ orchestrator_guard.register_subagent(
             parsed = json.loads(res.stdout)
             self.assertIsInstance(parsed, dict)
 
+    def test_cli_modes_do_not_hang_on_open_unclosed_stdin_pipe(self) -> None:
+        import os
+        import subprocess
+
+        entrypoint = SCRIPT_DIR / "orchestrator_guard.py"
+        default_state_dir = orchestrator_guard.PROJECT_ROOT / ".agents" / ".state"
+        default_state_file = default_state_dir / "orchestrator_state.json"
+        default_lock_file = default_state_dir / "orchestrator_state.lock"
+        had_state = default_state_file.exists()
+        orig_state_bytes = default_state_file.read_bytes() if had_state else None
+        had_lock = default_lock_file.exists()
+
+        r_fd, w_fd = os.pipe()
+        try:
+            for mode in ("status", "activate", "deactivate", "reset"):
+                res = subprocess.run(
+                    [sys.executable, str(entrypoint), mode],
+                    stdin=r_fd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=3,
+                    check=True,
+                )
+                self.assertEqual(res.returncode, 0)
+                parsed = json.loads(res.stdout)
+                self.assertIsInstance(parsed, dict)
+                if mode == "status":
+                    self.assertEqual(
+                        parsed.get("stateFile"), str(default_state_file)
+                    )
+                elif mode == "activate":
+                    self.assertEqual(parsed.get("status"), "activated")
+                    self.assertTrue(parsed.get("active"))
+                elif mode == "deactivate":
+                    self.assertEqual(parsed.get("status"), "deactivated")
+                    self.assertFalse(parsed.get("active"))
+                elif mode == "reset":
+                    self.assertEqual(parsed.get("status"), "reset")
+        finally:
+            os.close(r_fd)
+            os.close(w_fd)
+            if had_state and orig_state_bytes is not None:
+                default_state_file.write_bytes(orig_state_bytes)
+            elif default_state_file.exists():
+                default_state_file.unlink()
+            if not had_lock and default_lock_file.exists():
+                default_lock_file.unlink()
+
+    def test_cli_status_honors_piped_json_and_stringio_stdin(self) -> None:
+        import io
+        import subprocess
+        from unittest import mock
+        from guard import cli as guard_cli
+
+        entrypoint = SCRIPT_DIR / "orchestrator_guard.py"
+        custom_dir = Path(self.artifact_dir) / "piped_cli_brain"
+        custom_dir.mkdir(parents=True, exist_ok=True)
+        piped_payload = {"artifactDirectoryPath": str(custom_dir)}
+
+        act_res = subprocess.run(
+            [sys.executable, str(entrypoint), "activate"],
+            input=json.dumps(piped_payload),
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=True,
+        )
+        self.assertEqual(json.loads(act_res.stdout).get("active"), True)
+
+        status_res = subprocess.run(
+            [sys.executable, str(entrypoint), "status"],
+            input=json.dumps(piped_payload),
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=True,
+        )
+        status_data = json.loads(status_res.stdout)
+        self.assertEqual(
+            status_data.get("stateFile"),
+            str(custom_dir / "orchestrator_state.json"),
+        )
+        self.assertTrue(status_data.get("active"))
+
+        stdout_buf = io.StringIO()
+        with mock.patch.object(
+            sys, "argv", ["orchestrator_guard.py", "status"]
+        ), mock.patch.object(
+            sys, "stdin", io.StringIO(json.dumps(piped_payload))
+        ), mock.patch.object(
+            sys, "stdout", stdout_buf
+        ):
+            guard_cli.main()
+
+        inproc_status = json.loads(stdout_buf.getvalue())
+        self.assertEqual(
+            inproc_status.get("stateFile"),
+            str(custom_dir / "orchestrator_state.json"),
+        )
+        self.assertTrue(inproc_status.get("active"))
+
+        with mock.patch.object(sys, "stdin", io.StringIO("[1, 2, 3]")):
+            self.assertEqual(guard_cli._read_stdin_payload(is_cli_mode=True), {})
+
 
 if __name__ == "__main__":
     unittest.main()
-
-
-

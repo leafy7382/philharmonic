@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import select
 import sys
 from typing import Any, Dict, List
 
@@ -115,28 +117,62 @@ def _cli_doctor() -> Dict[str, Any]:
     }
 
 
+CLI_MODES = {"status", "reset", "activate", "deactivate"}
+
+
+def _read_stdin_payload(is_cli_mode: bool) -> Dict[str, Any]:
+    if sys.stdin is None:
+        return {}
+    try:
+        if sys.stdin.isatty():
+            return {}
+    except (AttributeError, OSError, ValueError):
+        pass
+
+    if is_cli_mode:
+        try:
+            fd = sys.stdin.fileno()
+        except (AttributeError, OSError, ValueError):
+            fd = -1
+        if isinstance(fd, int) and fd >= 0 and os.name != "nt":
+            try:
+                ready, _, _ = select.select([fd], [], [], 0.05)
+                if not ready:
+                    return {}
+            except (OSError, ValueError):
+                pass
+
+    try:
+        parsed = json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "pre-tool"
     if mode == "doctor":
         json.dump(_cli_doctor(), sys.stdout, indent=2)
+        sys.stdout.write("\n")
         return
 
-    try:
-        payload = json.load(sys.stdin) if not sys.stdin.isatty() else {}
-    except json.JSONDecodeError:
-        payload = {}
+    payload = _read_stdin_payload(is_cli_mode=(mode in CLI_MODES))
 
     if mode == "status":
         json.dump(_cli_status(payload), sys.stdout, indent=2)
+        sys.stdout.write("\n")
         return
     if mode == "reset":
         json.dump(_cli_reset(payload), sys.stdout, indent=2)
+        sys.stdout.write("\n")
         return
     if mode == "activate":
         json.dump(_cli_activate(payload), sys.stdout, indent=2)
+        sys.stdout.write("\n")
         return
     if mode == "deactivate":
         json.dump(_cli_deactivate(payload), sys.stdout, indent=2)
+        sys.stdout.write("\n")
         return
 
     if mode == "pre-invocation":
