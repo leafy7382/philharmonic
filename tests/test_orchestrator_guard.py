@@ -4429,6 +4429,236 @@ orchestrator_guard.register_subagent(
         self.assertFalse(state_after_review.get("plan_execute_phase"))
         self.assertIsNone(state_after_review.get("plan_allowed_files"))
 
+    def test_safe_git_env_prefixes_and_unsafe_env_rejection(self) -> None:
+        # Safe git prefixes accepted by _is_git_only_command
+        safe_cmds = [
+            "GIT_EDITOR=true git status",
+            "GIT_SEQUENCE_EDITOR=: git diff",
+            "GIT_PAGER=cat git log",
+            "LC_ALL=C GIT_TERMINAL_PROMPT=0 git status",
+            "PAGER='' git diff",
+            'LANG="en_US.UTF-8" GIT_EDITOR="/bin/true" git status',
+            "GIT_PAGER=\"\" git status",
+        ]
+        for cmd in safe_cmds:
+            self.assertTrue(
+                orchestrator_guard._is_git_only_command(cmd),
+                f"Expected safe command to be accepted: {cmd}",
+            )
+
+        # Unsafe env prefixes rejected by _is_git_only_command
+        unsafe_cmds = [
+            "GIT_SSH_COMMAND=evil git status",
+            "LD_PRELOAD=/tmp/lib.so git status",
+            "GIT_EDITOR=/tmp/evil.sh git status",
+            "GIT_EDITOR=vim git status",
+            "PATH=/tmp git status",
+            "GIT_EXEC_PATH=/tmp git status",
+        ]
+        for cmd in unsafe_cmds:
+            self.assertFalse(
+                orchestrator_guard._is_git_only_command(cmd),
+                f"Expected unsafe command to be rejected: {cmd}",
+            )
+
+        # Tripped circuit breaker allows safe git inspections but denies unsafe commands
+        state = orchestrator_guard._load_state(self.base_payload)
+        cb = orchestrator_guard._get_circuit_breaker(state)
+        cb["failure_streak"] = 2
+        cb["tripped"] = True
+        cb["last_error"] = "exit 1"
+        orchestrator_guard._save_state(self.base_payload, state)
+
+        res_safe = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": "GIT_EDITOR=true git status",
+                        "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_safe["decision"], "allow")
+
+        res_unsafe = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": "GIT_SSH_COMMAND=evil git status",
+                        "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_unsafe["decision"], "deny")
+        self.assertIn("2-turn circuit breaker tripped", res_unsafe["reason"])
+
+        # Grounded spec with underscore headers is accepted
+        cb["tripped"] = False
+        cb["failure_streak"] = 0
+        orchestrator_guard._save_state(self.base_payload, state)
+
+        spec_file = Path(self.artifact_dir) / "scratch" / "spec_underscores.md"
+        spec_file.parent.mkdir(parents=True, exist_ok=True)
+        spec_file.write_text(
+            "# Grounded Spec with Underscores\n\n"
+            "## SIGNATURES_AND_SNIPPETS\n"
+            "def foo() -> None: pass\n\n"
+            "## INVARIANTS_AND_PITFALLS\n"
+            "- invariant 1\n\n"
+            "## VERIFICATION_EXPECTATIONS\n"
+            "- run pytest\n"
+        )
+        sub_dispatch = dict(
+            self.base_payload,
+            toolCall={
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "implementer",
+                    "Prompt": (
+                        "TASK: Implement underscores test.\n"
+                        f"SPEC_FILE: {spec_file}\n"
+                        "ALLOWED_FILES: tests/test_sample.py\n\n"
+                        "RULES:\n1. Open file.\n2. Edit.\n3. Run pytest.\n\n"
+                        "REPORT FORMAT:\nSTATUS: COMPLETED\n"
+                        "FILES_CHANGED: tests/test_sample.py\n"
+                        "VERIFICATION: pytest ok\n"
+                        "NOTES: done\n"
+                    ),
+                },
+            },
+        )
+        res_dispatch = orchestrator_guard.handle_pre_tool(sub_dispatch)
+        self.assertEqual(res_dispatch["decision"], "allow")
+
+    def test_sandbox_boundary_errors_exempt_from_circuit_breaker(self) -> None:
+        state = orchestrator_guard._load_state(self.base_payload)
+        cb = orchestrator_guard._get_circuit_breaker(state)
+        cb["failure_streak"] = 0
+        cb["tripped"] = False
+        orchestrator_guard._save_state(self.base_payload, state)
+
+        # 1. Error with .git/index.lock: Read-only file system does NOT increment failure streak
+        post_ro_lock = dict(
+            self.base_payload,
+            toolCall={
+                "id": "cmd_ro_lock",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "git checkout -b branch1",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+            error="fatal: Unable to create '/path/.git/index.lock': Read-only file system",
+        )
+        orchestrator_guard.handle_post_tool(post_ro_lock)
+        state_after_ro = orchestrator_guard._load_state(self.base_payload)
+        cb_ro = orchestrator_guard._get_circuit_breaker(state_after_ro)
+        self.assertEqual(cb_ro.get("failure_streak", 0), 0)
+        self.assertFalse(cb_ro.get("tripped", False))
+
+        # 2. Output with sandbox banner does NOT increment failure streak
+        post_sandbox_banner = dict(
+            self.base_payload,
+            toolCall={
+                "id": "cmd_banner",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "git push origin branch1",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+            output="There were sandbox errors that may or may not be related to the failure\nexit status 1",
+            error="Command exited with code 1",
+        )
+        orchestrator_guard.handle_post_tool(post_sandbox_banner)
+        state_after_banner = orchestrator_guard._load_state(self.base_payload)
+        cb_banner = orchestrator_guard._get_circuit_breaker(state_after_banner)
+        self.assertEqual(cb_banner.get("failure_streak", 0), 0)
+        self.assertFalse(cb_banner.get("tripped", False))
+
+        # 3. Payload with sandboxError=True does NOT increment failure streak
+        post_sb_err = dict(
+            self.base_payload,
+            toolCall={
+                "id": "cmd_sberr",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "npm test",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+            sandboxError=True,
+            error="Process failed in sandbox",
+        )
+        orchestrator_guard.handle_post_tool(post_sb_err)
+        state_after_sberr = orchestrator_guard._load_state(self.base_payload)
+        cb_sberr = orchestrator_guard._get_circuit_breaker(state_after_sberr)
+        self.assertEqual(cb_sberr.get("failure_streak", 0), 0)
+        self.assertFalse(cb_sberr.get("tripped", False))
+
+        # 4. Read-only FETCH_HEAD does NOT increment failure streak
+        post_fetch_ro = dict(
+            self.base_payload,
+            toolCall={
+                "id": "cmd_fetch_ro",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "git fetch origin",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+            output="fatal: cannot open .git/FETCH_HEAD: Read-only file system\n",
+            error="Command exited with code 128",
+        )
+        orchestrator_guard.handle_post_tool(post_fetch_ro)
+        state_after_fetch = orchestrator_guard._load_state(self.base_payload)
+        cb_fetch = orchestrator_guard._get_circuit_breaker(state_after_fetch)
+        self.assertEqual(cb_fetch.get("failure_streak", 0), 0)
+        self.assertFalse(cb_fetch.get("tripped", False))
+
+        # 5. Genuine code failures DO increment failure streak and trip breaker at streak 2
+        post_real_1 = dict(
+            self.base_payload,
+            toolCall={
+                "id": "cmd_real_1",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "pytest tests/",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+            error="exit status 1",
+        )
+        orchestrator_guard.handle_post_tool(post_real_1)
+        state_after_real_1 = orchestrator_guard._load_state(self.base_payload)
+        cb_real_1 = orchestrator_guard._get_circuit_breaker(state_after_real_1)
+        self.assertEqual(cb_real_1.get("failure_streak", 0), 1)
+        self.assertFalse(cb_real_1.get("tripped", False))
+
+        post_real_2 = dict(
+            self.base_payload,
+            toolCall={
+                "id": "cmd_real_2",
+                "name": "run_command",
+                "args": {
+                    "CommandLine": "pytest tests/",
+                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
+                },
+            },
+            error="exit status 1",
+        )
+        orchestrator_guard.handle_post_tool(post_real_2)
+        state_after_real_2 = orchestrator_guard._load_state(self.base_payload)
+        cb_real_2 = orchestrator_guard._get_circuit_breaker(state_after_real_2)
+        self.assertEqual(cb_real_2.get("failure_streak", 0), 2)
+        self.assertTrue(cb_real_2.get("tripped", False))
+
 
 if __name__ == "__main__":
     unittest.main()

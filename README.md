@@ -127,7 +127,7 @@ Configured in [hooks.json](.agents/plugins/philharmonic_orchestra/hooks.json) an
 1. **`pre-invocation`**: Records the root orchestrator conversation ID, caches subagent identity across isolated brain directories, handles hybrid coexistence resets (on `[plan review]` or next user input), resets circuit breaker `replan_count`, and injects a context-isolation reminder into worker subagents.
 2. **`pre-tool`**:
    - Supports both local `agy` CLI (`read_file`, `write_file`, `edit_file`, `list_dir`, `grep_search`, `find_by_name`, `run_command`, flat `invoke_subagent`, PascalCase `define_subagent`) and Remote VM (`view_file`, `write_to_file`, `replace_file_content`, `lookup_skill`, `lookup_skills`, `Subagents` list `invoke_subagent`, `snake_case` `define_subagent`) tool schemas.
-   - Enforces the root orchestrator direct read budget (<= 400 lines / <= 16 KB across <= 8 workspace files with line/byte estimation; `list_dir` free), mutation limits (<= 2 file edits), command limits (<= 2 non-git commands), and 1 verification test run after edits.
+   - Enforces the root orchestrator direct read budget (<= 400 lines / <= 16 KB across <= 8 workspace files with line/byte estimation; `list_dir` free), mutation limits (<= 2 file edits), command limits (<= 2 non-git commands), and 1 verification test run after edits. Git inspection commands (status, diff, log) with safe non-interactive environment variable prefixes (`GIT_EDITOR=true`, `GIT_SEQUENCE_EDITOR=:`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, `LC_ALL=C`) do not count against command limits and remain allowed when tripped.
    - Handles `exit_plan_mode` and `enter_plan_mode` triggers for System Orchestrator hybrid coexistence mode, lifting direct edit/command/test loop caps while enforcing plan `ALLOWED_FILES:`.
    - Blocks root orchestrator reads, directory listings, and searches on `.log` and `transcript*.jsonl` files.
    - Validates grounded specs (`SPEC_FILE:`) containing required sections (`SIGNATURES`, `PITFALLS`/`INVARIANTS`, `VERIFICATION`) for `implementer`.
@@ -139,7 +139,7 @@ Configured in [hooks.json](.agents/plugins/philharmonic_orchestra/hooks.json) an
    - Blocks retries when the 2-turn circuit breaker is tripped (while still allowing scratch log writes and 1-shot re-plan dispatch).
 3. **`post-tool`**:
    - Tracks spawned subagent conversation IDs, model tiers, and `branch` workspaces using an incremental `transcript_offset` cursor, rolling back failed spawns.
-   - Records passing test runs after code edits and increments or resets the 2-turn circuit breaker counter.
+   - Records passing test runs after code edits and increments or resets the 2-turn circuit breaker counter (with Antigravity sandbox boundary errors such as `.git/` read-only errors and sandbox error banners exempted from tripping the breaker).
    - Distinguishes non-final statuses (`CHECKPOINT`, `NEEDS_REPLAN`, `BLOCKED`, `FAILED`) to avoid prematurely marking test receipts as verified.
    - Rolls back hybrid coexistence state if `exit_plan_mode` tool call returns an error.
 4. **`stop`**:

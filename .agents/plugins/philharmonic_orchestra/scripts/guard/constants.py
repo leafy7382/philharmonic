@@ -27,9 +27,9 @@ REPLAN_HEADER_RE = re.compile(r"(?m)^\s*REPLAN:\s*(.+)$", re.I)
 SPEC_FILE_HEADER_RE = re.compile(r"(?m)^\s*SPEC_FILE:\s*(.+)$", re.I)
 STAGE_HEADER_RE = re.compile(r"(?m)^\s*STAGE:\s*(.+)$", re.I)
 GROUNDED_SPEC_SECTION_PATTERNS = (
-    re.compile(r"(?im)\bsignatures?\b"),
-    re.compile(r"(?im)\b(?:pitfalls?|invariants?)(?:_[a-z0-9_]+)?\b"),
-    re.compile(r"(?im)\bverification\b"),
+    re.compile(r"(?im)(?:^|[^A-Za-z0-9])signatures?(?:$|[^A-Za-z0-9])"),
+    re.compile(r"(?im)(?:^|[^A-Za-z0-9])(?:pitfalls?|invariants?)(?:$|[^A-Za-z0-9])"),
+    re.compile(r"(?im)(?:^|[^A-Za-z0-9])verification(?:$|[^A-Za-z0-9])"),
 )
 UUID_RE = re.compile(
     r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b",
@@ -94,7 +94,38 @@ FORBIDDEN_DIRECT_READ_RE = re.compile(
     r"(?:^|/)transcript(?:_full|[0-9a-zA-Z_\-]*)?\.jsonl$|\.log$", re.I
 )
 
-GIT_COMMAND_RE = re.compile(r"^\s*git\b")
+SAFE_GIT_ENV_PREFIX_STR = (
+    r"(?:(?:"
+    r"(?:GIT_EDITOR|GIT_SEQUENCE_EDITOR)=(?:['\"]?(?:true|/bin/true|/usr/bin/true|:)['\"]?)"
+    r"|(?:GIT_PAGER|PAGER)=(?:['\"]?(?:cat|/bin/cat|/usr/bin/cat)['\"]?|\"\"|'')"
+    r"|GIT_TERMINAL_PROMPT=(?:['\"]?[01]['\"]?)"
+    r"|(?:LC_ALL|LANG)=(?:['\"]?(?:C|C\.UTF-8|en_US\.UTF-8)['\"]?)"
+    r")\s+)*"
+)
+GIT_COMMAND_RE = re.compile(rf"^\s*{SAFE_GIT_ENV_PREFIX_STR}git\b")
+SAFE_GIT_INSPECTION_RE = re.compile(
+    rf"^\s*{SAFE_GIT_ENV_PREFIX_STR}git\s+(?:status|diff|log)\b"
+)
+SANDBOX_BOUNDARY_ERROR_RE = re.compile(
+    r"(?:There were sandbox errors that may or may not be related to the failure"
+    r"|\.git/[A-Za-z0-9._/\-]*['\"]?:\s*Read-only file system"
+    r"|Unable to create ['\"]?[^'\"]*\.git/[^'\"]*\.lock['\"]?:\s*Read-only file system"
+    r"|cannot open ['\"]?[^'\"]*\.git/[A-Za-z0-9._/\-]*['\"]?:\s*Read-only file system)",
+    re.I,
+)
+
+
+def _is_sandbox_boundary_error(
+    payload: Dict[str, Any], error_text: str, output_text: str
+) -> bool:
+    """Return True if the error is an environment/sandbox restriction rather than a genuine code/command failure."""
+    if payload.get("sandboxError") is True:
+        return True
+    if error_text and bool(SANDBOX_BOUNDARY_ERROR_RE.search(error_text)):
+        return True
+    if output_text and bool(SANDBOX_BOUNDARY_ERROR_RE.search(output_text)):
+        return True
+    return False
 TEST_CMD_START_RE = re.compile(
     r"^\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*"
     r"(?:(?:python3?|py|uv\s+run|poetry\s+run|pipenv\s+run|npx|bunx)\s+(?:-m\s+)?)?)?"

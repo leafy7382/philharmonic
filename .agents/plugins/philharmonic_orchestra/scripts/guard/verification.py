@@ -26,6 +26,7 @@ from guard.constants import (
     TRIVIAL_ASSERT_RE,
     _extract_call_id,
     _is_git_only_command,
+    _is_sandbox_boundary_error,
     _is_test_command,
     _strip_comments,
 )
@@ -370,15 +371,20 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                         error_text = f"Command exited with code {m_exit.group(1)}"
 
             if error_text:
-                seen_failures: List[str] = cb.setdefault("seen_failures", [])
-                dedup_id = f"{tool_name}:{call_id}:{error_text}"
-                if not call_id or dedup_id not in seen_failures:
-                    if call_id:
-                        seen_failures.append(dedup_id)
-                    cb["failure_streak"] = cb.get("failure_streak", 0) + 1
-                    cb["last_error"] = error_text
-                    if cb["failure_streak"] >= MAX_CONSECUTIVE_FAILURES:
-                        cb["tripped"] = True
+                is_sandbox_err = (
+                    tool_name == "run_command"
+                    and _is_sandbox_boundary_error(payload, error_text, output_text)
+                )
+                if not is_sandbox_err:
+                    seen_failures: List[str] = cb.setdefault("seen_failures", [])
+                    dedup_id = f"{tool_name}:{call_id}:{error_text}"
+                    if not call_id or dedup_id not in seen_failures:
+                        if call_id:
+                            seen_failures.append(dedup_id)
+                        cb["failure_streak"] = cb.get("failure_streak", 0) + 1
+                        cb["last_error"] = error_text
+                        if cb["failure_streak"] >= MAX_CONSECUTIVE_FAILURES:
+                            cb["tripped"] = True
                 if is_test_cmd:
                     receipt["verified"] = False
                     receipt["last_test_cmd"] = cmd

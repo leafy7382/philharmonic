@@ -31,6 +31,7 @@ from guard.constants import (
     READ_TOOLS,
     REPLAN_HEADER_RE,
     REPLAN_IF_HEADER_RE,
+    SAFE_GIT_INSPECTION_RE,
     SEARCH_TOOLS,
     SPEC_FILE_HEADER_RE,
     STAGE_HEADER_RE,
@@ -958,7 +959,7 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                     _is_git_only_command(cmd)
                     and bool(sub_cmds)
                     and all(
-                        bool(re.match(r"^\s*git\s+(status|diff|log)\b", c))
+                        bool(SAFE_GIT_INSPECTION_RE.match(c))
                         for c in sub_cmds
                     )
                 )
