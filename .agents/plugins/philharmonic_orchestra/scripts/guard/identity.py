@@ -14,6 +14,7 @@ from guard.constants import (
     MAX_CONSECUTIVE_FAILURES,
     PENDING_SPAWN_TTL_SECONDS,
     PROJECT_ROOT,
+    SCRATCH_ONLY_SUBAGENT_TYPES,
     SLASH_COMMAND_RE,
     STRICT_READONLY_SUBAGENT_TYPES,
     SUBAGENT_SPAWN_RE,
@@ -154,6 +155,13 @@ def _normalize_subagent_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
             normalized["candidate_id"] = cand_val
         else:
             normalized.pop("candidate_id", None)
+    for field_name in ("council_id", "council_role"):
+        if meta.get(field_name) is not None:
+            field_val = str(meta[field_name]).strip()
+            if field_val:
+                normalized[field_name] = field_val
+            else:
+                normalized.pop(field_name, None)
     if "active_worktree" not in normalized:
         ws = str(normalized.get("workspace") or "").strip().lower()
         if ws in ISOLATED_WORKSPACES or normalized.get("active_branch"):
@@ -365,9 +373,15 @@ def _sync_subagents_from_transcript(
                     spawn_meta = pending.pop(0)
                     if isinstance(spawn_meta, dict):
                         cand_id = spawn_meta.get("candidate_id")
+                        c_id = spawn_meta.get("council_id")
+                        c_role = spawn_meta.get("council_role")
                         spawn_meta = _normalize_subagent_meta(spawn_meta)
                         if cand_id is not None and "candidate_id" not in spawn_meta:
                             spawn_meta["candidate_id"] = str(cand_id)
+                        if c_id is not None and "council_id" not in spawn_meta:
+                            spawn_meta["council_id"] = str(c_id)
+                        if c_role is not None and "council_role" not in spawn_meta:
+                            spawn_meta["council_role"] = str(c_role)
                         spawn_meta.setdefault("status", "active")
                     subagents[cid] = spawn_meta
                     changed = True
@@ -577,6 +591,11 @@ def _is_research_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> boo
     return _get_subagent_type(payload, state) in {"research", "researcher"}
 
 
+def _is_scratch_only_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
+    """Return True if the active caller is restricted to scratch-only writes (research, researcher, council)."""
+    return _get_subagent_type(payload, state) in SCRATCH_ONLY_SUBAGENT_TYPES
+
+
 def _is_scout_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
     """Return True if the active caller is a scout subagent."""
     return _get_subagent_type(payload, state) == "scout"
@@ -777,6 +796,8 @@ def register_subagent(
     cohort: Optional[str] = None,
     eval_cmd: Optional[str] = None,
     candidate_id: Optional[str] = None,
+    council_id: Optional[str] = None,
+    council_role: Optional[str] = None,
 ) -> None:
     """Helper for explicitly registering a subagent conversationId -> tier mapping."""
     with state_transaction(payload):
@@ -811,5 +832,9 @@ def register_subagent(
             record["eval_cmd"] = eval_cmd
         if candidate_id is not None:
             record["candidate_id"] = candidate_id
+        if council_id is not None:
+            record["council_id"] = council_id
+        if council_role is not None:
+            record["council_role"] = council_role
         state.setdefault("subagents", {})[cid] = _normalize_subagent_meta(record)
         _save_state(payload, state)

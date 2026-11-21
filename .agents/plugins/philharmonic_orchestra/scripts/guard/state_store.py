@@ -73,6 +73,8 @@ def _default_state() -> Dict[str, Any]:
         "plan_allowed_files": None,
         "active_eval_cmd": None,
         "cohorts": {},
+        "councils": {},
+        "swarm_workers": {},
         "current_invocation_num": 0,
     }
 
@@ -140,6 +142,41 @@ def _prune_state(state: Dict[str, Any]) -> None:
             )
             for old_key in sorted_cohort_keys[:-MAX_STATE_INVOCATION_HISTORY]:
                 cohorts.pop(old_key, None)
+
+    councils = state.get("councils")
+    if isinstance(councils, dict):
+        for council_entry in councils.values():
+            if not isinstance(council_entry, dict):
+                continue
+            for list_key in ("proposers", "judges", "models"):
+                items = council_entry.get(list_key)
+                if isinstance(items, list) and len(items) > MAX_STATE_LIST_ENTRIES:
+                    council_entry[list_key] = items[-MAX_STATE_LIST_ENTRIES:]
+        if len(councils) > MAX_STATE_INVOCATION_HISTORY:
+            sorted_council_keys = sorted(
+                councils.keys(),
+                key=lambda k: (
+                    float(councils[k].get("created_at", 0) or 0)
+                    if isinstance(councils.get(k), dict)
+                    else 0.0
+                ),
+            )
+            for old_key in sorted_council_keys[:-MAX_STATE_INVOCATION_HISTORY]:
+                councils.pop(old_key, None)
+
+    swarm_workers = state.get("swarm_workers")
+    if isinstance(swarm_workers, dict) and len(swarm_workers) > MAX_STATE_LIST_ENTRIES:
+        excess = len(swarm_workers) - MAX_STATE_LIST_ENTRIES
+        killed_keys = [
+            k
+            for k, v in swarm_workers.items()
+            if isinstance(v, dict) and v.get("status") == "killed"
+        ]
+        killed_keys.sort(
+            key=lambda k: float(swarm_workers[k].get("spawned_at", 0) or 0)
+        )
+        for old_key in killed_keys[:excess]:
+            swarm_workers.pop(old_key, None)
 
 
 @contextlib.contextmanager
@@ -218,6 +255,10 @@ def _load_state(payload_or_path: Any) -> Dict[str, Any]:
                 )
                 if not isinstance(data.get("cohorts"), dict):
                     data["cohorts"] = {}
+                if not isinstance(data.get("councils"), dict):
+                    data["councils"] = {}
+                if not isinstance(data.get("swarm_workers"), dict):
+                    data["swarm_workers"] = {}
                 if isinstance(data.get("circuit_breaker"), dict):
                     data["circuit_breaker"].setdefault("replan_count", 0)
                 if isinstance(data.get("test_receipt"), dict):

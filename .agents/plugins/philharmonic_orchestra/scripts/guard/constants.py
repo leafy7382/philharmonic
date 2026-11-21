@@ -9,24 +9,30 @@ from typing import Any, Dict, List, Optional
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 
 ALLOWED_SUBAGENT_MODELS = {"flash", "flash_lite"}
-STRICT_READONLY_SUBAGENT_TYPES = {"scout", "verifier", "reviewer"}
-HIGH_REASONING_READONLY_TYPES = {"verifier", "reviewer"}
+STRICT_READONLY_SUBAGENT_TYPES = {"scout", "verifier", "reviewer", "judge"}
+HIGH_REASONING_READONLY_TYPES = {"verifier", "reviewer", "judge"}
+SCRATCH_ONLY_SUBAGENT_TYPES = {"research", "researcher", "council"}
 READONLY_NON_VERIFICATION_TYPES = {
     "scout",
     "research",
     "researcher",
+    "council",
     "verifier",
     "reviewer",
+    "judge",
 }
 ALLOWED_VERIFIER_REVIEWER_MODELS = {"flash", "pro", "inherit"}
+ALLOWED_COUNCIL_PROPOSER_MODELS = {"flash", "pro", "inherit"}
 ISOLATED_WORKSPACES = {"branch", "share"}
 DEFAULT_MODEL_BY_TYPE = {
     "scout": "flash_lite",
     "research": "flash",
     "researcher": "flash",
+    "council": "flash",
     "implementer": "flash",
     "verifier": "flash",
     "reviewer": "flash",
+    "judge": "flash",
 }
 
 MUTATION_VERBS_RE = re.compile(
@@ -42,7 +48,42 @@ STAGE_HEADER_RE = re.compile(r"(?m)^\s*STAGE:\s*(.+)$", re.I)
 REVIEW_LENS_HEADER_RE = re.compile(r"(?m)^[ \t]*REVIEW_LENS:[ \t]*([^\r\n]+)$", re.I)
 MODE_HEADER_RE = re.compile(r"(?m)^[ \t]*MODE:[ \t]*([^\r\n]+)$", re.I)
 COHORT_HEADER_RE = re.compile(r"(?m)^[ \t]*COHORT:[ \t]*([^\r\n]+)$", re.I)
+COUNCIL_ID_HEADER_RE = re.compile(r"(?m)^[ \t]*COUNCIL_ID:[ \t]*([^\r\n]+)$", re.I)
+COUNCIL_ROLE_HEADER_RE = re.compile(r"(?m)^[ \t]*COUNCIL_ROLE:[ \t]*([^\r\n]+)$", re.I)
 EVAL_CMD_HEADER_RE = re.compile(r"(?m)^[ \t]*EVAL_CMD:[ \t]*([^\r\n]+)$", re.I)
+_MODEL_BRAND_PATTERN = (
+    r"(?:gemini(?:\s+[0-9]+(?:\.[0-9]+)?)?(?:\s+(?:pro|flash(?:_lite)?|carbon|neon|argon|hydrogen))?"
+    r"|claude(?:\s+(?:opus|sonnet|haiku|fable)(?:\s+[0-9]+(?:\.[0-9]+)?)?)?"
+    r"|opus(?:\s+[0-9]+(?:\.[0-9]+)?)?|sonnet(?:\s+[0-9]+(?:\.[0-9]+)?)?"
+    r"|haiku(?:\s+[0-9]+(?:\.[0-9]+)?)?|fable(?:\s+[0-9]+(?:\.[0-9]+)?)?"
+    r"|gpt-[0-9][a-z0-9.\-]*|openai|anthropic|deepseek|llama|qwen|mistral)"
+)
+COUNCIL_NAME_LEAK_RE = re.compile(
+    r"(?:^|[^a-z])(?:gemini|claude|opus|sonnet|haiku|gpt|openai|anthropic|deepseek|llama|qwen|mistral|carbon|neon|argon|hydrogen|fable)(?:$|[^a-z])",
+    re.I,
+)
+BLIND_JUDGE_LEAK_PATTERNS = (
+    re.compile(
+        rf"\b(?:proposal|draft|option|candidate|design|submission|response|answer)\s+[a-z0-9#_-]{{1,20}}[^\r\n]{{0,80}}(?:\(\s*|:\s*|—\s*|-\s*|\bby\s+|\bfrom\s+){_MODEL_BRAND_PATTERN}\b",
+        re.I,
+    ),
+    re.compile(
+        rf"\b{_MODEL_BRAND_PATTERN}\b[^\r\n]{{0,60}}\b(?:wrote|authored|proposed|generated|created|produced|submitted)\b[^\r\n]{{0,60}}\b(?:proposal|draft|option|candidate|design|submission|response|answer)\b",
+        re.I,
+    ),
+    re.compile(
+        rf"\b{_MODEL_BRAND_PATTERN}(?:'s|s')\s+(?:proposal|draft|option|candidate|design|submission|response|answer)\b",
+        re.I,
+    ),
+    re.compile(
+        rf"(?m)^[ \t]*(?:[-*#]+[ \t]*)?(?:model|author|authored[ \t]+by|written[ \t]+by|generated[ \t]+by|proposed[ \t]+by|submitted[ \t]+by|source[ \t]+model|provider|llm)[ \t]*:[ \t]*[^\r\n]*\b{_MODEL_BRAND_PATTERN}\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:(?:proposal|draft|option|candidate|design)[a-z0-9._/\-]*?(?:gemini|claude|opus|sonnet|haiku|fable|gpt-?\d|openai|anthropic|deepseek|llama|qwen|mistral)|(?:gemini|claude|opus|sonnet|haiku|fable|gpt-?\d|openai|anthropic|deepseek|llama|qwen|mistral)[a-z0-9._/\-]*?(?:proposal|draft|option|candidate|design))[a-z0-9._/\-]*\.(?:md|txt|json)\b",
+        re.I,
+    ),
+)
 TRIVIAL_EVAL_CMD_RE = re.compile(
     r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*(?:(?:true|echo|printf|pwd|ls|cat|exit)\b|:(?=$|\s))",
     re.I,

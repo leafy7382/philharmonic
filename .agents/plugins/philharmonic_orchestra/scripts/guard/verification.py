@@ -13,6 +13,7 @@ from guard.constants import (
     ASSERTION_RE,
     COMMENT_LINE_RE,
     DOC_EXTENSIONS,
+    ISOLATED_WORKSPACES,
     MAX_CONSECUTIVE_FAILURES,
     MAX_REPORT_BULLET_LINES,
     MAX_SUBAGENT_REPORT_CHARS,
@@ -47,6 +48,7 @@ from guard.identity import (
 )
 from guard.policies import (
     _compute_prompt_hash,
+    _expand_swarm_worker_names,
     _extract_target_path,
     _is_artifact_or_worktree_path,
     _is_declared_eval_command,
@@ -737,7 +739,7 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
         receipt = _get_test_receipt(state, payload)
         error_text = str(payload.get("error") or "").strip()
 
-        if tool_name in {"run_command", "invoke_subagent", "run_workflow"}:
+        if tool_name in {"run_command", "invoke_subagent", "run_workflow", "swarm"}:
             cmd = (args.get("CommandLine") or "").strip()
             is_test_cmd = tool_name == "run_command" and _is_test_command(cmd)
             is_eval_cmd = tool_name == "run_command" and _is_declared_eval_command(
@@ -751,7 +753,7 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                 or tool_call.get("output")
                 or ""
             )
-            if not error_text and tool_name in {"run_command", "run_workflow"}:
+            if not error_text and tool_name in {"run_command", "run_workflow", "swarm"}:
                 exit_code = (
                     payload.get("exitCode")
                     if payload.get("exitCode") is not None
@@ -776,6 +778,61 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
 
             caller_mode = _current_subagent_meta(payload, state).get("mode")
             if error_text:
+                if (
+                    tool_name == "swarm"
+                    and str(args.get("action") or "").strip().lower() == "add"
+                ):
+                    swarm_workers = state.get("swarm_workers")
+                    rolled_back_names: List[str] = []
+                    if isinstance(swarm_workers, dict):
+                        if call_id:
+                            to_remove = [
+                                wname
+                                for wname, meta in swarm_workers.items()
+                                if isinstance(meta, dict)
+                                and meta.get("call_id") == call_id
+                            ]
+                        else:
+                            to_remove = [
+                                wname
+                                for wname in _expand_swarm_worker_names(args)
+                                if wname in swarm_workers
+                            ]
+                        for wname in to_remove:
+                            swarm_workers.pop(wname, None)
+                            rolled_back_names.append(wname)
+                    if rolled_back_names:
+                        councils = state.get("councils")
+                        if isinstance(councils, dict):
+                            for c_entry in councils.values():
+                                if not isinstance(c_entry, dict):
+                                    continue
+                                for role_list_key in ("proposers", "judges"):
+                                    role_list = c_entry.get(role_list_key)
+                                    if isinstance(role_list, list):
+                                        c_entry[role_list_key] = [
+                                            item
+                                            for item in role_list
+                                            if item not in rolled_back_names
+                                        ]
+                elif (
+                    tool_name == "swarm"
+                    and str(args.get("action") or "").strip().lower() == "kill"
+                ):
+                    wname = str(args.get("name") or "").strip()
+                    swarm_workers = state.get("swarm_workers")
+                    if (
+                        wname
+                        and isinstance(swarm_workers, dict)
+                        and wname in swarm_workers
+                        and isinstance(swarm_workers[wname], dict)
+                    ):
+                        meta = swarm_workers[wname]
+                        meta["status"] = "active"
+                        meta["active_worktree"] = (
+                            str(meta.get("workspace") or "inherit").strip().lower()
+                            in ISOLATED_WORKSPACES
+                        )
                 cohort_candidates = (
                     _collect_invoke_cohort_candidates(
                         payload,
@@ -881,6 +938,7 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                     or is_verification_cmd
                     or (tool_name == "run_command" and not _is_git_only_command(cmd))
                     or tool_name == "run_workflow"
+                    or tool_name == "swarm"
                 ):
                     cb["failure_streak"] = 0
                     cb["tripped"] = False
@@ -1176,19 +1234,35 @@ def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(p, dict)
             and (p.get("active_worktree") or p.get("active_branch"))
         ]
+        active_swarm_worktrees = [
+            wname
+            for wname, meta in (state.get("swarm_workers") or {}).items()
+            if isinstance(meta, dict)
+            and meta.get("status") == "active"
+            and meta.get("active_worktree")
+        ]
 
-        if active_branches or active_pending:
+        if active_branches or active_pending or active_swarm_worktrees:
             exec_key = f"{payload.get('conversationId', '')}:{payload.get('executionNum', 0)}"
             reminded = state.setdefault("stop_reminded_executions", [])
             if exec_key not in reminded:
                 reminded.append(exec_key)
                 _save_state(payload, state)
-                targets = ", ".join(active_branches or active_pending)
+                if active_branches or active_pending:
+                    targets = ", ".join(active_branches or active_pending)
+                    return {
+                        "decision": "continue",
+                        "reason": (
+                            f"[ORCHESTRATOR GUARD] Uncleaned branched subagent worktrees remain ({targets}). "
+                            "Verify/merge branch changes and call manage_subagents(Action='kill') before finishing."
+                        ),
+                    }
                 return {
                     "decision": "continue",
                     "reason": (
-                        f"[ORCHESTRATOR GUARD] Uncleaned branched subagent worktrees remain ({targets}). "
-                        "Verify/merge branch changes and call manage_subagents(Action='kill') before finishing."
+                        f"[ORCHESTRATOR GUARD] Uncleaned isolated swarm worktrees remain "
+                        f"({', '.join(active_swarm_worktrees)}). "
+                        "Merge/discard changes and call swarm(action='kill') before finishing."
                     ),
                 }
 

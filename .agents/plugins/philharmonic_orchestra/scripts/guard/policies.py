@@ -10,10 +10,15 @@ import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from guard.constants import (
+    ALLOWED_COUNCIL_PROPOSER_MODELS,
     ALLOWED_FILES_HEADER_RE,
     ALLOWED_SUBAGENT_MODELS,
     ALLOWED_VERIFIER_REVIEWER_MODELS,
+    BLIND_JUDGE_LEAK_PATTERNS,
     COHORT_HEADER_RE,
+    COUNCIL_ID_HEADER_RE,
+    COUNCIL_NAME_LEAK_RE,
+    COUNCIL_ROLE_HEADER_RE,
     DEFAULT_MODEL_BY_TYPE,
     DEFAULT_UNBOUNDED_READ_BYTES,
     DEFAULT_UNBOUNDED_READ_LINES,
@@ -41,6 +46,7 @@ from guard.constants import (
     REPLAN_IF_HEADER_RE,
     REVIEW_LENS_HEADER_RE,
     SAFE_GIT_INSPECTION_RE,
+    SCRATCH_ONLY_SUBAGENT_TYPES,
     SEARCH_TOOLS,
     SPEC_FILE_HEADER_RE,
     STAGE_HEADER_RE,
@@ -59,6 +65,7 @@ from guard.identity import (
     _is_known_subagent,
     _is_research_subagent,
     _is_root_orchestrator,
+    _is_scratch_only_subagent,
     _is_scout_subagent,
     _is_strict_readonly_subagent,
     _is_within_allowed_roots,
@@ -194,7 +201,7 @@ def _normalize_review_lens(lens: str) -> str:
 
 
 def _parse_mode_header(prompt_text: str) -> Optional[str]:
-    """Parse MODE: header from a subagent prompt, normalizing Best-of-N variants."""
+    """Parse MODE: header from a subagent prompt, normalizing Best-of-N and Council variants."""
     if not prompt_text:
         return None
     match = MODE_HEADER_RE.search(prompt_text)
@@ -206,6 +213,8 @@ def _parse_mode_header(prompt_text: str) -> Optional[str]:
     cleaned = re.sub(r"[\s\-]+", "_", raw_val.lower()).strip("_")
     if cleaned in {"best_of_n", "bestofn"}:
         return "best_of_n"
+    if cleaned in {"council", "council_of_models", "councilofmodels"}:
+        return "council"
     return cleaned or None
 
 
@@ -221,6 +230,154 @@ def _parse_cohort_header(prompt_text: str) -> Optional[str]:
         return None
     cleaned = re.sub(r"[\s_-]+", "-", raw_val.lower()).strip("-")
     return cleaned or None
+
+
+def _parse_council_id_header(text: str) -> Optional[str]:
+    """Parse COUNCIL_ID: header from a prompt or brief, returning None if omitted."""
+    if not text:
+        return None
+    match = COUNCIL_ID_HEADER_RE.search(text)
+    if not match:
+        return None
+    raw_val = match.group(1).strip().strip("`'\"")
+    if not raw_val or raw_val.upper() == "NONE":
+        return None
+    cleaned = re.sub(r"[\s_-]+", "-", raw_val.lower()).strip("-")
+    return cleaned or None
+
+
+def _parse_council_role_header(text: str) -> Optional[str]:
+    """Parse COUNCIL_ROLE: header from a prompt or brief, normalizing proposer | judge | synthesizer."""
+    if not text:
+        return None
+    match = COUNCIL_ROLE_HEADER_RE.search(text)
+    if not match:
+        return None
+    raw_val = match.group(1).strip().strip("`'\"").lower()
+    if not raw_val or raw_val == "none":
+        return None
+    cleaned = re.sub(r"[\s_-]+", "_", raw_val).strip("_")
+    if cleaned in {"proposer", "proposal", "member"}:
+        return "proposer"
+    if cleaned in {"judge", "blind_judge", "voter"}:
+        return "judge"
+    if cleaned in {"synthesizer", "synthesis", "synth"}:
+        return "synthesizer"
+    return cleaned or None
+
+
+def _resolve_scratch_doc_candidates(text: str, artifact_dir: str) -> List[Path]:
+    """Return existing scratch .md/.txt file paths referenced in text within artifact_dir/scratch."""
+    try:
+        resolved_art = Path(artifact_dir).resolve()
+        scratch_root = (resolved_art / "scratch").resolve()
+    except OSError:
+        return []
+    seen: Set[Path] = set()
+    results: List[Path] = []
+    for match in re.finditer(r"(?:file://)?([^\s`'\"<>(),;:]+\.(?:md|txt))", text, re.I):
+        raw_tok = match.group(1)
+        try:
+            tok_path = Path(os.path.expanduser(raw_tok))
+        except OSError:
+            continue
+        to_check = (
+            [tok_path]
+            if tok_path.is_absolute()
+            else [resolved_art / tok_path, PROJECT_ROOT / tok_path]
+        )
+        for cand in to_check:
+            try:
+                resolved_cand = cand.resolve()
+                resolved_cand.relative_to(scratch_root)
+            except (OSError, ValueError):
+                continue
+            if resolved_cand not in seen and resolved_cand.is_file():
+                seen.add(resolved_cand)
+                results.append(resolved_cand)
+    return results
+
+
+def _detect_blind_judge_leak(
+    text: str, payload: Optional[Dict[str, Any]] = None
+) -> Optional[str]:
+    """Return the matched attribution string if text or referenced scratch docs leak model identity to a judge, else None."""
+    if not text:
+        return None
+    for pattern in BLIND_JUDGE_LEAK_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return match.group(0)
+    artifact_dir = payload.get("artifactDirectoryPath") if isinstance(payload, dict) else None
+    if not artifact_dir:
+        return None
+    for candidate in _resolve_scratch_doc_candidates(text, str(artifact_dir)):
+        try:
+            with open(candidate, "r", encoding="utf-8", errors="replace") as fh:
+                content = fh.read(65536)
+        except OSError:
+            continue
+        for pattern in BLIND_JUDGE_LEAK_PATTERNS:
+            fmatch = pattern.search(content)
+            if fmatch:
+                return f"{candidate.name}: {fmatch.group(0)}"
+    return None
+
+
+def _detect_council_name_leak(name: str) -> Optional[str]:
+    """Return the matched token if a council worker name reveals model identity, else None."""
+    if not name:
+        return None
+    match = COUNCIL_NAME_LEAK_RE.search(name)
+    if match:
+        return match.group(0)
+    return None
+
+
+def _expand_swarm_worker_names(args: Dict[str, Any]) -> List[str]:
+    """Expand swarm worker name(s) from 'name', 'tasks', and 'n' arguments."""
+    name = str(args.get("name") or "").strip()
+    if not name:
+        return []
+    tasks = args.get("tasks")
+    n = args.get("n")
+    if isinstance(tasks, list) and len(tasks) > 0:
+        return [f"{name}-{i}" for i in range(1, len(tasks) + 1)]
+    if isinstance(n, int) and not isinstance(n, bool) and n > 1:
+        return [f"{name}-{i}" for i in range(1, n + 1)]
+    return [name]
+
+
+def _record_council_member(
+    state: Dict[str, Any],
+    council_id: str,
+    member_name: str,
+    council_role: Optional[str],
+    model: str,
+    is_judge_type: bool = False,
+) -> None:
+    """Record a proposer/judge member and model in state['councils'][council_id]."""
+    councils = state.setdefault("councils", {})
+    council_entry = councils.setdefault(
+        council_id,
+        {
+            "proposers": [],
+            "judges": [],
+            "models": [],
+            "created_at": time.time(),
+        },
+    )
+    proposers = council_entry.setdefault("proposers", [])
+    judges = council_entry.setdefault("judges", [])
+    models = council_entry.setdefault("models", [])
+    if council_role == "judge" or (council_role is None and is_judge_type):
+        if member_name and member_name not in judges:
+            judges.append(member_name)
+    elif council_role == "proposer" or (council_role is None and not is_judge_type):
+        if member_name and member_name not in proposers:
+            proposers.append(member_name)
+    if model and model not in models:
+        models.append(model)
 
 
 def _compute_prompt_hash(prompt_text: str) -> str:
@@ -448,7 +605,7 @@ def _handle_define_subagent(args: Dict[str, Any]) -> Dict[str, Any]:
             overwrite["EnableWriteTools"] = False
         if args.get("enable_write_tools") is True:
             overwrite["enable_write_tools"] = False
-    if sub_name in {"scout", "implementer", "verifier", "reviewer"}:
+    if sub_name in {"scout", "implementer", "verifier", "reviewer", "judge", "council"}:
         if args.get("EnableMCPTools") is True:
             overwrite["EnableMCPTools"] = False
         if args.get("enable_mcp_tools") is True:
@@ -522,6 +679,7 @@ def _validate_and_prepare_subagent_entry(
     batch_entries: Optional[List[Dict[str, Any]]] = None,
     exclude_call_sigs: Optional[Set[str]] = None,
     inv_key: str = "0",
+    payload: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[str]]:
     """Validate a single subagent spec and return (denial, spawn_record, target_model)."""
     type_name = (entry.get("TypeName") or "").strip()
@@ -552,6 +710,28 @@ def _validate_and_prepare_subagent_entry(
         mode = "best_of_n"
     if mode == "best_of_n" and not cohort_id:
         cohort_id = f"best-of-n-{inv_key}"
+
+    council_id = _parse_council_id_header(prompt_text)
+    council_role = _parse_council_role_header(prompt_text)
+    if (council_id or council_role) and mode is None:
+        mode = "council"
+    if mode == "council" and not council_id:
+        council_id = f"council-{inv_key}"
+
+    if norm_type == "judge" or council_role == "judge":
+        leak = _detect_blind_judge_leak(prompt_text, payload=payload)
+        if leak:
+            return (
+                {
+                    "decision": "deny",
+                    "reason": (
+                        f"[ORCHESTRATOR GUARD] Blind judging violation: judge prompt leaks model identity "
+                        f"('{leak}'). Anonymize proposals before invoking judge."
+                    ),
+                },
+                None,
+                None,
+            )
 
     eval_cmd = _parse_eval_cmd_header(prompt_text)
     if eval_cmd is not None and _is_trivial_eval_command(eval_cmd):
@@ -591,6 +771,11 @@ def _validate_and_prepare_subagent_entry(
             target_model = DEFAULT_MODEL_BY_TYPE.get(norm_type, "flash")
     elif mode == "best_of_n":
         if raw_model in {"pro", "flash"}:
+            target_model = raw_model
+        else:
+            target_model = DEFAULT_MODEL_BY_TYPE.get(norm_type, "flash")
+    elif (mode == "council" or norm_type == "council") and norm_type in SCRATCH_ONLY_SUBAGENT_TYPES:
+        if raw_model in ALLOWED_COUNCIL_PROPOSER_MODELS:
             target_model = raw_model
         else:
             target_model = DEFAULT_MODEL_BY_TYPE.get(norm_type, "flash")
@@ -719,6 +904,10 @@ def _validate_and_prepare_subagent_entry(
         spawn_record["mode"] = mode
     if cohort_id is not None:
         spawn_record["cohort"] = cohort_id
+    if council_id is not None:
+        spawn_record["council_id"] = council_id
+    if council_role is not None:
+        spawn_record["council_role"] = council_role
     if eval_cmd is not None:
         spawn_record["eval_cmd"] = eval_cmd
     prompt_hash = _compute_prompt_hash(prompt_text)
@@ -792,6 +981,7 @@ def _handle_invoke_subagent(
             batch_entries=batch_entries,
             exclude_call_sigs=existing_retry_sigs,
             inv_key=inv_key,
+            payload=payload,
         )
         if denial is not None or spawn_record is None or target_model is None:
             return denial or {
@@ -842,6 +1032,18 @@ def _handle_invoke_subagent(
                 )
                 if spawn_record.get("eval_cmd"):
                     cohort_entry["eval_cmd"] = spawn_record["eval_cmd"]
+            if spawn_record.get("mode") == "council" and spawn_record.get("council_id"):
+                s_type = str(
+                    spawn_record.get("type_name") or spawn_record.get("type") or ""
+                ).strip().lower()
+                _record_council_member(
+                    state,
+                    str(spawn_record["council_id"]),
+                    str(spawn_record.get("role") or s_type or "member"),
+                    spawn_record.get("council_role"),
+                    str(spawn_record.get("model") or target_model),
+                    is_judge_type=(s_type == "judge"),
+                )
             state.setdefault("pending_spawns", []).append(spawn_record)
             if spawn_record.get("eval_cmd"):
                 state["active_eval_cmd"] = spawn_record["eval_cmd"]
@@ -940,6 +1142,19 @@ def _handle_send_message(
                     f"[ORCHESTRATOR GUARD] Stale {recipient_type} '{recipient}': workspace code was "
                     f"mutated since spawn (epoch {spawned_epoch} -> {current_epoch}). "
                     f"Spawn a fresh '{recipient_type}' via invoke_subagent instead of reusing via send_message."
+                ),
+            }
+
+    if recipient_meta and (
+        recipient_type == "judge" or recipient_meta.get("council_role") == "judge"
+    ) and not re.match(r"^\s*STATUS:", message):
+        leak = _detect_blind_judge_leak(message, payload=payload)
+        if leak:
+            return {
+                "decision": "deny",
+                "reason": (
+                    f"[ORCHESTRATOR GUARD] Blind judging violation: judge prompt leaks model identity "
+                    f"('{leak}'). Anonymize proposals before invoking judge."
                 ),
             }
 
@@ -1093,6 +1308,149 @@ def _handle_manage_subagents(
             remaining_pending.append(pending)
         state["pending_spawns"] = remaining_pending
         _save_state(payload, state)
+
+    return {"decision": "allow"}
+
+
+def _handle_swarm(
+    payload: Dict[str, Any],
+    args: Dict[str, Any],
+    state: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Validate and track swarm tool calls (council anonymity, blind judging, worktrees, EVAL_CMD)."""
+    action = str(args.get("action") or "").strip().lower()
+    if action in {"status", "models", "title"}:
+        return {"decision": "allow"}
+
+    if action == "kill":
+        wname = str(args.get("name") or "").strip()
+        workers = state.get("swarm_workers")
+        if isinstance(workers, dict) and wname in workers and isinstance(workers[wname], dict):
+            workers[wname]["status"] = "killed"
+            workers[wname]["active_worktree"] = False
+            _save_state(payload, state)
+            return {"decision": "allow"}
+        if wname and isinstance(workers, dict):
+            sharded_active = [
+                k
+                for k, meta in workers.items()
+                if isinstance(meta, dict)
+                and meta.get("base_name") == wname
+                and meta.get("sharded") is True
+                and meta.get("status") == "active"
+            ]
+            if sharded_active:
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"[ORCHESTRATOR GUARD] Swarm group '{wname}' was spawned as sharded workers "
+                        f"({', '.join(sharded_active)}). Call swarm(action='kill') with each individual "
+                        "worker name to clean up their worktrees."
+                    ),
+                }
+        return {"decision": "allow"}
+
+    if action == "model":
+        wname = str(args.get("name") or "").strip()
+        new_model = str(args.get("model") or "").strip()
+        workers = state.get("swarm_workers")
+        if (
+            isinstance(workers, dict)
+            and wname in workers
+            and isinstance(workers[wname], dict)
+            and new_model
+        ):
+            workers[wname]["model"] = new_model
+            _save_state(payload, state)
+        return {"decision": "allow"}
+
+    if action == "add":
+        brief = str(args.get("brief") or "")
+        name = str(args.get("name") or "").strip()
+        model = str(args.get("model") or "").strip()
+        workspace = str(args.get("workspace") or "inherit").strip()
+
+        eval_cmd = _parse_eval_cmd_header(brief)
+        if eval_cmd is not None and _is_trivial_eval_command(eval_cmd):
+            return {
+                "decision": "deny",
+                "reason": (
+                    f"[ORCHESTRATOR GUARD] Trivial or no-op EVAL_CMD rejected in swarm: '{eval_cmd}'. "
+                    "Provide a real test or evaluation script command."
+                ),
+            }
+
+        mode = _parse_mode_header(brief)
+        council_id = _parse_council_id_header(brief)
+        council_role = _parse_council_role_header(brief)
+        if (council_id or council_role) and mode is None:
+            mode = "council"
+        if mode == "council" and not council_id:
+            council_id = f"council-{_current_invocation_key(payload, state)}"
+
+        if mode == "council":
+            name_leak = _detect_council_name_leak(name)
+            if name_leak:
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"[ORCHESTRATOR GUARD] Blind council violation: swarm worker name '{name}' "
+                        f"reveals model identity ('{name_leak.strip()}'). "
+                        "Use anonymous names like 'proposer-a', 'judge-1'."
+                    ),
+                }
+            if council_role == "judge" or "judge" in name.lower():
+                leak = _detect_blind_judge_leak(brief, payload=payload)
+                if leak:
+                    return {
+                        "decision": "deny",
+                        "reason": (
+                            f"[ORCHESTRATOR GUARD] Blind judging violation: judge prompt leaks model identity "
+                            f"('{leak}'). Anonymize proposals before invoking judge."
+                        ),
+                    }
+
+        if eval_cmd:
+            state["active_eval_cmd"] = eval_cmd
+
+        worker_names = _expand_swarm_worker_names(args)
+        is_sharded = len(worker_names) > 1
+        call_id = _extract_call_id(payload)
+        now_ts = time.time()
+        is_isolated = workspace.lower() in ISOLATED_WORKSPACES
+        swarm_workers = state.setdefault("swarm_workers", {})
+        for wname in worker_names:
+            swarm_workers[wname] = {
+                "name": wname,
+                "base_name": name,
+                "sharded": is_sharded,
+                "model": model,
+                "workspace": workspace,
+                "active_worktree": is_isolated,
+                "status": "active",
+                "mode": mode,
+                "council_id": council_id,
+                "council_role": council_role,
+                "call_id": call_id,
+                "spawned_at": now_ts,
+            }
+
+        if mode == "council" and council_id:
+            is_judge_name = (council_role == "judge") or (
+                council_role is None and "judge" in name.lower()
+            )
+            for wname in worker_names:
+                _record_council_member(
+                    state,
+                    council_id,
+                    wname,
+                    council_role,
+                    model,
+                    is_judge_type=is_judge_name,
+                )
+
+        _save_state(payload, state)
+        return {"decision": "allow"}
 
     return {"decision": "allow"}
 
@@ -1546,7 +1904,10 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                             "and report STATUS: BLOCKED."
                         ),
                     }
-            elif tool_name in {"invoke_subagent", "send_message", "run_workflow"}:
+            elif tool_name in {"invoke_subagent", "send_message", "run_workflow"} or (
+                tool_name == "swarm"
+                and str(args.get("action") or "").strip().lower() == "add"
+            ):
                 if tool_name == "send_message" and not _is_root_orchestrator(payload, state):
                     msg_text = str(args.get("Message") or "")
                     if re.search(r"(?m)^\s*STATUS:\s*(?:BLOCKED|FAILED|NEEDS_REPLAN)\b", msg_text):
@@ -1584,6 +1945,10 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                         replan_found = bool(
                             REPLAN_HEADER_RE.search(str(args.get("Description") or ""))
                             or REPLAN_HEADER_RE.search(str(args.get("Script") or ""))
+                        )
+                    elif tool_name == "swarm":
+                        replan_found = bool(
+                            REPLAN_HEADER_RE.search(str(args.get("brief") or ""))
                         )
 
                     replan_count = cb.get("replan_count", 0)
@@ -1640,6 +2005,9 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
         if tool_name == "manage_subagents":
             return _handle_manage_subagents(payload, args, state)
 
+        if tool_name == "swarm":
+            return _handle_swarm(payload, args, state)
+
         if tool_name in MUTATION_TOOLS:
             if _is_strict_readonly_subagent(payload, state):
                 sub_type = _get_subagent_type(payload, state) or "readonly"
@@ -1657,13 +2025,15 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                     "decision": "deny",
                     "reason": reason,
                 }
-            if _is_research_subagent(payload, state):
+            if _is_scratch_only_subagent(payload, state):
                 target = _extract_target_path(tool_name, args)
                 if not _is_allowed_research_scratch_write(target, payload):
+                    sub_type = _get_subagent_type(payload, state)
+                    role_word = "Council" if sub_type == "council" else "Research"
                     return {
                         "decision": "deny",
                         "reason": (
-                            "[ORCHESTRATOR GUARD] Research subagents may only write markdown reports "
+                            f"[ORCHESTRATOR GUARD] {role_word} subagents may only write markdown reports "
                             "to <artifactDirectoryPath>/scratch/*.md. Workspace mutations are prohibited."
                         ),
                     }

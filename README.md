@@ -1,23 +1,21 @@
 # Philharmonic (`philharmonic_orchestra`)
 
-An **Antigravity (`agy`) plugin** enforcing a Central Orchestrator workflow with `flash`/`flash_lite` workers, read-only `verifier` and `reviewer` roles, bounded direct budgets, structured contracts, and test gates. Zero external dependencies (Python 3 stdlib only).
+An **Antigravity (`agy`) plugin** enforcing a Central Orchestrator workflow with `flash`/`flash_lite` workers, read-only `verifier`/`reviewer`/`judge` roles, scratch-only `research`/`council` proposers, opt-in `swarm` Council support, bounded direct budgets, structured contracts, and test gates. Zero external dependencies (Python 3 stdlib only).
 
 ---
 
 ## Features
 
 - **On-Demand Session Gating**: Inactive by default; activates per conversation via `/philharmonic` or `orchestrator_guard.py activate`.
-- **Pattern Selection Flowchart**: Routes tasks in `SKILL.md` by shape — fast-path for simple/coupled steps, Builder + fresh `verifier` for medium changes, disjoint `implementer` lanes for independent modules, Best of N (`MODE: BEST_OF_N`) in isolated `"branch"`/`"share"` worktrees for high-variance tasks with deterministic tests/evals, and a parallel `reviewer` team (`REVIEW_LENS:`) for large changes.
-- **Tiered Subagent Delegation**: Delegates discovery, research, bounded edits, fresh verification, and review to `flash_lite` (`scout`), `flash` (`research`, `implementer`; explicit `"pro"` allowed for `MODE: BEST_OF_N` candidates), and read-only `verifier`/`reviewer` (`flash` default; explicit `pro`/`inherit` allowed; never `flash_lite`).
-- **Disjoint Lanes, Best-of-N Worktrees & Freshness Gate**: Blocks overlapping `ALLOWED_FILES:` across concurrent `implementer` workers on `Workspace: "inherit"` (allowing isolated `"branch"`/`"share"` worktrees), isolates `MODE: BEST_OF_N` candidate receipts/failures per `COHORT:`, and blocks `send_message` to stale `verifier`/`reviewer` threads after code edits (`mutation_epoch`).
-- **Direct Fast-Path Budget**: Allows <= 400 lines / <= 16 KB reads across <= 8 files (`list_dir` free), <= 2 edits, <= 2 non-git commands per turn, and 1 verification test after direct edits; larger work or edit-test loops require `implementer`.
-- **Hybrid Coexistence Mode**: `exit_plan_mode` lifts direct edit/command/loop caps for System Orchestrator plans while keeping `.log` isolation, plan `ALLOWED_FILES:`, anti-tampering, test receipts, and circuit breaker active; resets on `[plan review]` or next user prompt.
+- **Pattern Selection Flowchart**: Routes tasks in `SKILL.md` — fast-path for simple/coupled steps, Builder + fresh `verifier` for medium changes, disjoint `implementer` lanes for independent modules, Best of N (`MODE: BEST_OF_N`) in `"branch"`/`"share"` worktrees for high-variance deterministic tasks, Council of Models (`swarm` or `MODE: COUNCIL`) for open-ended/subjective designs, and parallel `reviewer`s (`REVIEW_LENS:`) for large changes.
+- **Tiered Subagent Delegation**: Routes discovery (`scout` / `flash_lite`), research/proposals (`research`, `council` / `flash`, or `"pro"`/`"inherit"` in `MODE: COUNCIL`), edits (`implementer` / `flash`, or `"pro"` in `BEST_OF_N`), and strict read-only `verifier`/`reviewer`/`judge` (`flash` default; `"pro"`/`"inherit"` allowed; never `flash_lite`).
+- **Disjoint Lanes, Worktrees & Freshness Gate**: Blocks overlapping `ALLOWED_FILES:` across concurrent `implementer`s on `Workspace: "inherit"` (allowing isolated `"branch"`/`"share"` worktrees), isolates `BEST_OF_N` candidate receipts/failures per `COHORT:`, and blocks `send_message` to stale `verifier`/`reviewer`/`judge` threads after code edits (`mutation_epoch`).
+- **Blind Council Judging & `swarm` Guard**: Supports opt-in `swarm` (`models`, `add`, `kill`, `model`, `status`, `title`) and `MODE: COUNCIL` fallback while blocking model-identity attribution leaks in `judge` prompts/briefs and non-anonymous `swarm` council roster names.
+- **Direct Fast-Path Budget**: Allows <= 400 lines / <= 16 KB reads across <= 8 files (`list_dir` free), <= 2 edits, <= 2 non-git commands/turn, and 1 post-edit verification run; larger work or edit-test loops require `implementer`.
+- **Hybrid Coexistence Mode**: `exit_plan_mode` lifts direct edit/command/loop caps for System Orchestrator plans while keeping `.log` isolation, plan `ALLOWED_FILES:`, anti-tampering, test receipts, and circuit breaker active; resets on `[plan review]` or next prompt.
 - **Context Isolation**: Blocks root reads, listings, and searches on raw `.log` and `transcript*.jsonl` files.
-- **Structured Prompt & Report Contracts**: Validates dispatch headers (`TASK:`, `ALLOWED_FILES:`, mandatory `REVIEW_LENS:` for `reviewer`, optional `MODE:`, `COHORT:`, `EVAL_CMD:`, `STAGE:`, `SPEC_FILE:`, `REPLAN_IF:`, `RULES:`, `REPORT FORMAT:`) and completion reports.
-- **Grounded Spec Relay**: Verifies `SPEC_FILE:` exists with `SIGNATURES`, `PITFALLS`/`INVARIANTS`, and `VERIFICATION` before dispatching `implementer`.
-- **Staged Checkpoints**: Supports `STATUS: CHECKPOINT` for step-by-step diff review and `ALLOWED_FILES:` expansion via `send_message`.
-- **Test / Eval Verification & Anti-Tampering Gate**: Requires a passing test command or declared non-trivial `EVAL_CMD:` after code edits and blocks test deletion, assertion reduction, commented-out `assert`s, skip/xfail markers, `assert True`, or trivial eval commands (`true`, `:`, `echo`).
-- **2-Turn Circuit Breaker, Cohort Isolation & 1-Shot Re-Plan**: Trips after 2 consecutive failures; `REPLAN: <rationale>` resets the breaker once per turn before hard-locking into `STATUS: BLOCKED`. In `MODE: BEST_OF_N`, candidate failures are isolated per `COHORT:` and trip the global breaker only when all $N \ge 2$ candidates fail.
+- **Structured Contracts & Spec Relay**: Validates `TASK:`, `ALLOWED_FILES:`, `REVIEW_LENS:`, `MODE:`, `COHORT:`, `COUNCIL_ID:`, `COUNCIL_ROLE:`, `EVAL_CMD:`, `STAGE:`, `SPEC_FILE:` (`SIGNATURES`, `PITFALLS`/`INVARIANTS`, `VERIFICATION`), `REPLAN_IF:`, `RULES:`, `REPORT FORMAT:`, and `STATUS: CHECKPOINT`.
+- **Test / Eval Anti-Tampering & Circuit Breaker**: Requires post-edit passing tests or non-trivial `EVAL_CMD:` (blocking test deletion/weakening and trivial evals like `true`, `:`, `echo`). Trips after 2 consecutive failures (isolated per `COHORT:` in `BEST_OF_N`), with 1-shot `REPLAN:` reset.
 
 ---
 
@@ -62,21 +60,23 @@ ln -s "$(pwd)/.agents/plugins/philharmonic_orchestra" ~/.gemini/config/plugins/p
   mkdir -p ~/.gemini/config/plugins
   cp -r .agents/plugins/philharmonic_orchestra ~/.gemini/config/plugins/
   ```
-- **Remote VM Dual-Schema**: `SKILL.md` and `orchestrator_guard.py` support both local `agy` CLI and Remote VM schemas (`Subagents: [...]` with `Model: "inherit"`, `Workspace: "inherit"`, and `snake_case` `define_subagent`).
+- **Remote VM Dual-Schema**: Supports both local `agy` CLI and Remote VM schemas (`Subagents: [...]` with `Model: "inherit"`, `Workspace: "inherit"`, and `snake_case` `define_subagent`).
 
 ---
 
 ## Subagent Architecture
 
-Custom subagents (`scout`, `implementer`, `verifier`, `reviewer`) are registered lazily via `define_subagent` before first use; `research` is built-in.
+Custom subagents (`scout`, `implementer`, `verifier`, `reviewer`, `judge`, `council`) are registered lazily via `define_subagent`; `research` is built-in.
 
 | Subagent Type | Model Tier | Write Access | Workspace Mode | Purpose |
 | :--- | :--- | :--- | :--- | :--- |
 | `scout` | `flash_lite` | Disabled | `inherit` | Single-hop lookups, symbol extraction, log slicing (<= 3 rules) |
-| `research` | `flash` (downgraded to `flash_lite` if <= 3 read-only rules) | Scratch-only (`<artifactDirectoryPath>/scratch/*.md`) | `inherit` | Multi-file analysis, doc lookups, scratch reports |
-| `implementer` | `flash` (`pro` allowed when `MODE: BEST_OF_N`) | Enabled | `branch` / `share` / `inherit` | Bounded edits/tests (disjoint `ALLOWED_FILES:` on `inherit`; isolated `"branch"`/`"share"` for Best-of-N) |
+| `research` | `flash` (`flash_lite` if <= 3 read-only rules; `pro`/`inherit` in `MODE: COUNCIL`) | Scratch-only (`scratch/*.md`) | `inherit` | Multi-file analysis, doc lookups, council proposals |
+| `council` | `flash` (`pro`/`inherit` allowed; no `flash_lite` downgrade) | Scratch-only (`scratch/*.md`) | `inherit` | Non-`swarm` Council of Models proposal drafting |
+| `implementer` | `flash` (`pro` allowed in `MODE: BEST_OF_N`) | Enabled | `branch` / `share` / `inherit` | Bounded edits/tests (disjoint `ALLOWED_FILES:` on `inherit`; isolated worktrees for Best-of-N) |
 | `verifier` | `flash` default (`pro`/`inherit` allowed; never `flash_lite`) | Disabled (strict read-only) | `inherit` | Fresh post-build verification (`VERDICT: PASS \| FAIL`) |
 | `reviewer` | `flash` default (`pro`/`inherit` allowed; never `flash_lite`) | Disabled (strict read-only) | `inherit` | Specialized review with distinct `REVIEW_LENS:` (`VERDICT: APPROVE \| REQUEST_CHANGES`) |
+| `judge` | `flash` default (`pro`/`inherit` allowed; never `flash_lite`) | Disabled (strict read-only) | `inherit` | Blind Council of Models voting on anonymized drafts (`VERDICT: <winner>`) |
 
 ---
 
@@ -88,8 +88,10 @@ All `invoke_subagent` and `send_message` prompts must use:
 TASK: <single-sentence objective>
 ALLOWED_FILES: <comma-separated file paths or NONE>
 REVIEW_LENS: <required for reviewer, e.g., security | edge-cases | simplicity | ux>
-MODE: BEST_OF_N
-COHORT: <optional cohort id; setting COHORT implies BEST_OF_N>
+MODE: BEST_OF_N | COUNCIL
+COHORT: <optional Best-of-N cohort id; implies BEST_OF_N>
+COUNCIL_ID: <optional Council id; implies COUNCIL>
+COUNCIL_ROLE: <proposer | judge | synthesizer; implies COUNCIL>
 EVAL_CMD: <optional non-trivial benchmark/eval command>
 STAGE: 1/2
 SPEC_FILE: <artifactDirectoryPath>/scratch/spec_<task>.md
@@ -107,39 +109,38 @@ Return only these four headers (plus up to 10 `- ` bullet lines under NOTES if n
 STATUS: COMPLETED | CHECKPOINT | NEEDS_REPLAN | BLOCKED | FAILED
 FILES_CHANGED: <comma-separated paths or NONE>
 VERIFICATION: <one sentence stating the command run and exit result>
-NOTES: <summary (start with VERDICT: PASS|FAIL or APPROVE|REQUEST_CHANGES for verifier/reviewer, or SCORE: <metric> for BEST_OF_N, plus up to 10 `- ` bullets), or inline error cause plus file://.log URI if BLOCKED/FAILED>
+NOTES: <summary (VERDICT: PASS|FAIL, APPROVE|REQUEST_CHANGES, or <winner>; SCORE: <metric> for BEST_OF_N; + <= 10 `- ` bullets), or error + file://.log URI if BLOCKED/FAILED>
 ```
 
 ### Report Validation Rules
 
-- **`ALLOWED_FILES:` & Disjoint Lanes**: `PreToolUse` blocks subagent edits outside `ALLOWED_FILES:` (allowing `<artifactDirectoryPath>/scratch/*.log`). Concurrent `implementer` lanes on `Workspace: "inherit"` cannot overlap files or ancestor/descendant paths (`"branch"`/`"share"` worktrees may overlap).
-- **Best of N (`MODE:`, `COHORT:`, `EVAL_CMD:`)**: `MODE: BEST_OF_N` (or `COHORT:`) requires `Workspace: "branch"` or `"share"`, allows explicit `Model: "pro"`, auto-generates `best-of-n-<inv_key>` when `COHORT:` is omitted, and reports `SCORE:` under `NOTES:`. `EVAL_CMD:` accepts custom deterministic eval scripts while rejecting trivial/no-op commands (`true`, `:`, `echo`, etc.) and `||` / `$(...)` / backtick bypasses.
-- **Mandatory & Distinct `REVIEW_LENS:`**: `reviewer` requires `REVIEW_LENS:`; normalized lenses (`"edge cases"`, `"edge-cases"`, `"edge_cases"`) must be distinct across active `reviewer`s until completion or kill.
-- **Verdicts (`verifier`/`reviewer`)**: Require the full 4-header report (2-header shorthand is `scout`-only) with `VERDICT: PASS | FAIL` or `VERDICT: APPROVE | REQUEST_CHANGES` under `NOTES:`.
-- **Checkpoints (`STAGE:`) & Spec Relay (`SPEC_FILE:`)**: `STATUS: CHECKPOINT` enables mid-flight review without clearing receipts; `SPEC_FILE:` requires `SIGNATURES`, `PITFALLS`/`INVARIANTS`, and `VERIFICATION` for `implementer`.
-- **Re-Plan (`REPLAN_IF:`), Shorthand & Limits**: `REPLAN: <rationale>` resets a tripped breaker once per turn; `scout` (<= 3 rules) supports 2-header shorthand; `NOTES:` allows <= 10 bullets within 1,600 chars total. `BLOCKED`/`FAILED` requires a >= 3-word summary + `file://.../*.log` URI; `NEEDS_REPLAN` requires >= 3 words.
+- **`ALLOWED_FILES:` & Disjoint Lanes**: Blocks edits outside `ALLOWED_FILES:` (allowing `scratch/*.log`). Concurrent `implementer`s on `Workspace: "inherit"` cannot overlap files or ancestor/descendant paths (`"branch"`/`"share"` may overlap).
+- **Best of N (`MODE: BEST_OF_N`, `COHORT:`, `EVAL_CMD:`)**: Requires `"branch"`/`"share"`, allows `"pro"`, auto-generates `best-of-n-<inv_key>`, and reports `SCORE:` under `NOTES:`. `EVAL_CMD:` rejects trivial commands (`true`, `:`, `echo`, etc.) and `||` / `$(...)` / backticks.
+- **Council of Models (`MODE: COUNCIL`, `COUNCIL_ID:`, `COUNCIL_ROLE:`) & Blind Judging**: Infers `COUNCIL` when `COUNCIL_ID:`/`COUNCIL_ROLE:` is set; `judge` prompts, `swarm` judge briefs, and `swarm` council roster names cannot leak model identities (`proposer-a`/`b`/`c`, `judge-1` allowed). `council`/`research` proposers allow `"pro"`/`"inherit"` in `MODE: COUNCIL` with scratch-only `.md` writes.
+- **Mandatory `REVIEW_LENS:` & Verdicts**: `reviewer` requires distinct normalized `REVIEW_LENS:` across active reviewers. `verifier`/`reviewer`/`judge`/`council` require the full 4-header report (2-header shorthand is `scout`-only).
+- **Checkpoints, Spec Relay & Limits**: `CHECKPOINT` skips premature receipt checks; `SPEC_FILE:` requires `SIGNATURES`, `PITFALLS`/`INVARIANTS`, `VERIFICATION`; `REPLAN:` resets a tripped breaker once/turn; `NOTES:` allows <= 10 bullets within 1,600 chars (`BLOCKED`/`FAILED` needs >= 3 words + `file://.../*.log`).
 
 ---
 
 ## Lifecycle Hooks
 
-Configured in [hooks.json](.agents/plugins/philharmonic_orchestra/hooks.json) and dispatched via [orchestrator_guard.py](.agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py) (backed by [guard/](.agents/plugins/philharmonic_orchestra/scripts/guard): `constants.py`, `identity.py`, `policies.py`, `state_store.py`, `verification.py`, `cli.py`, `__init__.py`), using `flock` state at `<artifactDirectoryPath>/orchestrator_state.json`:
+Configured in [hooks.json](.agents/plugins/philharmonic_orchestra/hooks.json) and dispatched via [orchestrator_guard.py](.agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py) ([guard/](.agents/plugins/philharmonic_orchestra/scripts/guard): `constants.py`, `identity.py`, `policies.py`, `state_store.py`, `verification.py`, `cli.py`, `__init__.py`), using `flock` state at `<artifactDirectoryPath>/orchestrator_state.json`:
 
-1. **`pre-invocation`**: Records root conversation ID, caches subagent identity across brain dirs, resets hybrid coexistence (and `active_eval_cmd`) on `[plan review]` or new user input, resets `replan_count`, and injects context-isolation reminders.
+1. **`pre-invocation`**: Tracks root ID, caches subagent identity across brain dirs, resets coexistence + `active_eval_cmd` on `[plan review]` or new input, resets `replan_count`, and injects context-isolation reminders.
 2. **`pre-tool`**:
-   - Supports local `agy` CLI and Remote VM tool schemas (`Subagents` list, `snake_case`/`PascalCase` `define_subagent`), plus `run_workflow` (`Cwd`/`ScriptPath` checked against workspace roots; `Description` supports `EVAL_CMD:` anti-tampering and 1-shot `REPLAN:` recovery).
-   - Enforces root read/edit/command budgets, exempts safe git inspection (`status`/`diff`/`log`), handles `exit_plan_mode`/`enter_plan_mode` coexistence (including plan `EVAL_CMD:` validation), and blocks root access to `.log`/`transcript*.jsonl`.
-   - Enforces strict read-only tools on `scout`, `verifier`, `reviewer` (`EnableWriteTools`/`EnableMCPTools`/`EnableSubagentTools` forced `false`; `MUTATION_TOOLS` and mutating shell commands blocked while `read_file` and git inspection remain allowed), scratch-only markdown on `research`, and `ALLOWED_FILES:` on `implementer`.
-   - Enforces per-role model policy: `verifier`/`reviewer` default to `"flash"`, allow `"pro"`/`"inherit"`, never `"flash_lite"` or short-prompt downgrade; `MODE: BEST_OF_N` candidates default to `"flash"` and allow `"pro"`; standard workers block `"pro"`, rewrite `"inherit"`, and downgrade simple read-only tasks to `"flash_lite"`.
-   - Validates `SPEC_FILE:`, `STAGE:`/`REPLAN:`, `REVIEW_LENS:` uniqueness, disjoint `implementer` lanes on `inherit`, `MODE: BEST_OF_N`/`COHORT:` worktree isolation (`"branch"`/`"share"`), non-trivial `EVAL_CMD:`, and the `mutation_epoch` freshness gate.
-   - Increments `test_receipt["mutation_epoch"]` on code mutations (isolating `best_of_n` candidates from parent receipts), tracks `status` (`active`/`killed`) and `active_worktree`, blocks test tampering, and halts retries when tripped.
+   - Supports local `agy` CLI, Remote VM schemas (`Subagents`, `snake_case`/`PascalCase` `define_subagent`), `run_workflow` (`Cwd`/`ScriptPath` root checks, `Description` `EVAL_CMD:`/`REPLAN:`), and `swarm` (`models`/`status`/`kill`/`title` always allowed; `add` gated on breaker + `EVAL_CMD:` + council anonymity + blind judging).
+   - Enforces root read/edit/command budgets, exempts git inspection, handles `exit_plan_mode`/`enter_plan_mode`, and blocks root access to `.log`/`transcript*.jsonl`.
+   - Enforces strict read-only tools on `scout`, `verifier`, `reviewer`, `judge` (`define_subagent` strips write/MCP/subagent tools; `MUTATION_TOOLS` and mutating shell commands blocked), scratch-only `.md` on `research`/`council`, and `ALLOWED_FILES:` on `implementer`.
+   - Enforces per-role model policy: `verifier`/`reviewer`/`judge` and `MODE: COUNCIL` proposers allow `"flash"`/`"pro"`/`"inherit"` (no `flash_lite` downgrade); `MODE: BEST_OF_N` allows `"flash"`/`"pro"`; standard workers block `"pro"` and rewrite `"inherit"`.
+   - Validates `SPEC_FILE:`, `STAGE:`/`REPLAN:`, `REVIEW_LENS:`, disjoint `inherit` lanes, `"branch"`/`"share"` Best-of-N isolation, blind judging (`BLIND_JUDGE_LEAK_PATTERNS`, `COUNCIL_NAME_LEAK_RE`), and `mutation_epoch` freshness (`verifier`/`reviewer`/`judge`).
+   - Increments `mutation_epoch` on code edits (isolating `best_of_n` candidates), tracks `active_worktree`/`swarm_workers`, blocks test tampering, and halts retries when tripped.
 3. **`post-tool`**:
-   - Tracks subagent IDs, model tiers, `status`, `active_worktree`, `mode`, `cohort`, `eval_cmd`, `spawned_mutation_epoch`, and `review_lens` via `transcript_offset`, rolling back failed spawns and marking sync completions `"completed"`.
-   - Records passing test runs and declared `EVAL_CMD:` runs, isolates `best_of_n` candidate receipts and per-cohort failures (tripping global breaker only if $N \ge 2$ and all fail), prevents `READONLY_NON_VERIFICATION_TYPES` (`scout`, `research`, `verifier`, `reviewer`), `best_of_n` candidates, or `run_workflow` completions from auto-clearing dirty `test_receipt`, and updates the circuit breaker across `run_command`/`invoke_subagent`/`run_workflow` (exempting sandbox boundary errors).
-   - Preserves dirty receipts on `CHECKPOINT`/`NEEDS_REPLAN`/`BLOCKED`/`FAILED` and rolls back failed `exit_plan_mode` transitions.
+   - Tracks subagents, `cohorts`, `councils`, and `swarm_workers` via `transcript_offset`, rolling back failed spawns/`swarm(action="add")` calls and marking sync completions `"completed"`.
+   - Records passing tests and `EVAL_CMD:` runs, isolates `best_of_n` candidate receipts and cohort failures (tripping global breaker only if all $N \ge 2$ fail), prevents `READONLY_NON_VERIFICATION_TYPES` (`scout`, `research`, `council`, `verifier`, `reviewer`, `judge`), `best_of_n`, `run_workflow`, or `swarm` from clearing dirty `test_receipt`, and updates the circuit breaker across `run_command`/`invoke_subagent`/`run_workflow`/`swarm`.
+   - Preserves dirty receipts on `CHECKPOINT`/`NEEDS_REPLAN`/`BLOCKED`/`FAILED` and rolls back failed `exit_plan_mode`.
 4. **`stop`**:
-   - Requires `manage_subagents` (`kill`) cleanup for uncleaned `Workspace: "branch"` and `"share"` worktrees (`active_worktree`/`active_branch`) and validates 4-header reports (`scout` keeps 2-header shorthand), marking clean subagent stops `"completed"` and recording async `best_of_n` cohort outcomes in the parent brain.
-   - Blocks completion on missing post-edit test/eval receipts or `git diff HEAD -U0` test tampering (keeping `verifier`/`reviewer` protocol-guided via `SKILL.md`), and allows immediate exit when the circuit breaker is tripped.
+   - Requires `manage_subagents(kill)` for uncleaned `"branch"`/`"share"` subagent worktrees and `swarm(action="kill")` for uncleaned isolated `"branch"`/`"share"` `swarm` worktrees (`workspace: "inherit"` swarm workers do not block `Stop`).
+   - Validates 4-header reports (`scout` keeps 2-header shorthand), marks clean subagent stops `"completed"`, records async `best_of_n` outcomes, and enforces post-edit test/eval receipts and anti-tampering (`verifier`/`reviewer`/`judge` invocation stays protocol-guided via `SKILL.md`).
 
 ---
 

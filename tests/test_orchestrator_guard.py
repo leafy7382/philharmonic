@@ -6947,6 +6947,969 @@ orchestrator_guard.register_subagent(
         self.assertEqual(st_tb_2["circuit_breaker"]["failure_streak"], 2)
         self.assertTrue(st_tb_2["circuit_breaker"]["tripped"])
 
+    def test_phase3_judge_define_subagent_and_model_policy(self) -> None:
+        orchestrator_guard._cli_activate(self.base_payload)
+
+        # define_subagent strips Write, Subagent, and MCP tools for judge (PascalCase + snake_case)
+        res_pascal = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "define_subagent",
+                    "args": {
+                        "Name": "judge",
+                        "EnableWriteTools": True,
+                        "EnableSubagentTools": True,
+                        "EnableMCPTools": True,
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_pascal["decision"], "allow")
+        self.assertEqual(
+            res_pascal["overwrite"],
+            {
+                "EnableSubagentTools": False,
+                "EnableWriteTools": False,
+                "EnableMCPTools": False,
+            },
+        )
+
+        res_snake = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "define_subagent",
+                    "args": {
+                        "name": "judge",
+                        "enable_write_tools": True,
+                        "enable_subagent_tools": True,
+                        "enable_mcp_tools": True,
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_snake["decision"], "allow")
+        self.assertEqual(
+            res_snake["overwrite"],
+            {
+                "enable_subagent_tools": False,
+                "enable_write_tools": False,
+                "enable_mcp_tools": False,
+            },
+        )
+
+        # define_subagent strips Subagent and MCP tools (but not WriteTools) for council
+        res_council_def = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "define_subagent",
+                    "args": {
+                        "Name": "council",
+                        "EnableWriteTools": True,
+                        "EnableSubagentTools": True,
+                        "EnableMCPTools": True,
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_council_def["decision"], "allow")
+        self.assertEqual(
+            res_council_def["overwrite"],
+            {
+                "EnableSubagentTools": False,
+                "EnableMCPTools": False,
+            },
+        )
+
+        # judge allows pro and inherit untouched, rewrites flash_lite and omitted to flash
+        judge_prompt = f"MODE: COUNCIL\nCOUNCIL_ID: c-policy\nCOUNCIL_ROLE: judge\n{VALID_PROMPT}"
+        for allowed_model in ("pro", "inherit", "flash"):
+            res_ok = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={
+                        "id": f"judge_{allowed_model}",
+                        "name": "invoke_subagent",
+                        "args": {
+                            "TypeName": "judge",
+                            "Role": f"Judge-{allowed_model}",
+                            "Model": allowed_model,
+                            "Prompt": judge_prompt,
+                        },
+                    },
+                )
+            )
+            self.assertEqual(res_ok["decision"], "allow")
+            self.assertNotIn("overwrite", res_ok)
+
+        res_lite = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "judge_lite",
+                    "name": "invoke_subagent",
+                    "args": {
+                        "TypeName": "judge",
+                        "Role": "Judge-lite",
+                        "Model": "flash_lite",
+                        "Prompt": judge_prompt,
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_lite["decision"], "allow")
+        self.assertEqual(res_lite["overwrite"]["Model"], "flash")
+
+        res_omitted = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "judge_omitted",
+                    "name": "invoke_subagent",
+                    "args": {
+                        "TypeName": "judge",
+                        "Role": "Judge-default",
+                        "Prompt": judge_prompt,
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_omitted["decision"], "allow")
+        self.assertEqual(res_omitted["overwrite"]["Model"], "flash")
+
+    def test_phase3_judge_strict_readonly_report_receipt_and_freshness(self) -> None:
+        orchestrator_guard._cli_activate(self.base_payload)
+
+        # Mark dirty receipt on root before spawning judge
+        st = orchestrator_guard._load_state(self.base_payload)
+        receipt = orchestrator_guard._get_test_receipt(st, self.base_payload)
+        receipt["dirty"] = True
+        receipt["verified"] = False
+        receipt["mutation_epoch"] = 1
+        orchestrator_guard._save_state(self.base_payload, st)
+
+        judge_cid = "sub-judge-readonly-1"
+        orchestrator_guard.register_subagent(
+            self.base_payload,
+            conversation_id=judge_cid,
+            type_name="judge",
+            model="pro",
+            spawned_mutation_epoch=1,
+            mode="council",
+            council_id="c-1",
+            council_role="judge",
+        )
+        judge_payload = dict(self.base_payload, conversationId=judge_cid)
+
+        # Strict read-only: blocks write_file and shell write redirection
+        res_write = orchestrator_guard.handle_pre_tool(
+            dict(
+                judge_payload,
+                toolCall={
+                    "name": "write_file",
+                    "args": {"Path": str(Path(self.artifact_dir) / "scratch" / "vote.md"), "Content": "x"},
+                },
+            )
+        )
+        self.assertEqual(res_write["decision"], "deny")
+        self.assertIn("strictly read-only", res_write["reason"])
+
+        res_shell = orchestrator_guard.handle_pre_tool(
+            dict(
+                judge_payload,
+                toolCall={
+                    "name": "run_command",
+                    "args": {"CommandLine": "echo vote > vote.txt"},
+                },
+            )
+        )
+        self.assertEqual(res_shell["decision"], "deny")
+        self.assertIn("strictly read-only", res_shell["reason"])
+
+        # judge is NOT a scout and requires full 4-header report
+        self.assertFalse(
+            orchestrator_guard._is_scout_subagent(
+                judge_payload, orchestrator_guard._load_state(judge_payload)
+            )
+        )
+        res_stop_bad = orchestrator_guard.handle_stop(
+            dict(
+                judge_payload,
+                fullyIdle=True,
+                lastAssistantMessage="STATUS: COMPLETED\nNOTES: Voted for Proposal A.",
+            )
+        )
+        self.assertEqual(res_stop_bad["decision"], "continue")
+        self.assertIn("4-header REPORT FORMAT", res_stop_bad["reason"])
+
+        # Completing judge via PostToolUse does NOT clear dirty test_receipt
+        orchestrator_guard.handle_post_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "inv_judge_ok",
+                    "name": "invoke_subagent",
+                    "args": {
+                        "TypeName": "judge",
+                        "Role": "Judge",
+                        "Model": "pro",
+                        "Prompt": VALID_PROMPT,
+                    },
+                },
+                output="STATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: n/a\nNOTES: Winner is Proposal A.",
+            )
+        )
+        st_after_judge = orchestrator_guard._load_state(self.base_payload)
+        self.assertTrue(st_after_judge["test_receipt"]["dirty"])
+        self.assertFalse(st_after_judge["test_receipt"]["verified"])
+
+        # Mutation epoch bump invalidates stale judge on send_message
+        st_after_judge["test_receipt"]["mutation_epoch"] = 2
+        orchestrator_guard._save_state(self.base_payload, st_after_judge)
+        res_stale = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "send_message",
+                    "args": {
+                        "Recipient": judge_cid,
+                        "Message": "Re-evaluate Proposal A vs Proposal B.",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_stale["decision"], "deny")
+        self.assertIn("Stale judge", res_stale["reason"])
+
+    def test_phase3_blind_judging_anti_leakage(self) -> None:
+        orchestrator_guard._cli_activate(self.base_payload)
+
+        leaking_prompts = [
+            "Evaluate Proposal A (Claude Opus 5.5) vs Proposal B.",
+            "Compare Draft B by Gemini 4 Carbon against Draft A.",
+            "Claude Opus authored Proposal C; please score it.",
+            "Review Gemini 4 Argon's proposal for the cache layer.",
+        ]
+        for idx, leak_text in enumerate(leaking_prompts):
+            res_leak = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={
+                        "id": f"leak_{idx}",
+                        "name": "invoke_subagent",
+                        "args": {
+                            "TypeName": "judge",
+                            "Role": "Blind Judge",
+                            "Model": "pro",
+                            "Prompt": f"MODE: COUNCIL\nCOUNCIL_ROLE: judge\n{leak_text}",
+                        },
+                    },
+                )
+            )
+            self.assertEqual(res_leak["decision"], "deny", msg=f"Should deny: {leak_text}")
+            self.assertIn("Blind judging violation", res_leak["reason"])
+
+        # Reviewer invoked with COUNCIL_ROLE: judge is also gated
+        res_role_judge = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "leak_role_judge",
+                    "name": "invoke_subagent",
+                    "args": {
+                        "TypeName": "reviewer",
+                        "Role": "Judge",
+                        "Model": "pro",
+                        "Prompt": "REVIEW_LENS: architecture\nCOUNCIL_ROLE: judge\nOption 1 - GPT-5.2",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_role_judge["decision"], "deny")
+        self.assertIn("Blind judging violation", res_role_judge["reason"])
+
+        # Anonymized proposals and benign technical prose are allowed
+        benign_prompts = [
+            "Proposal A: use carbon theme for the dashboard.\nProposal B: use Gemini API client with retry.",
+            "Compare Proposal A, Proposal B, and Proposal C on correctness and maintainability.",
+        ]
+        for idx, ok_text in enumerate(benign_prompts):
+            res_ok = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={
+                        "id": f"benign_{idx}",
+                        "name": "invoke_subagent",
+                        "args": {
+                            "TypeName": "judge",
+                            "Role": f"Blind Judge {idx}",
+                            "Model": "pro",
+                            "Prompt": f"MODE: COUNCIL\nCOUNCIL_ID: blind-ok\nCOUNCIL_ROLE: judge\n{ok_text}",
+                        },
+                    },
+                )
+            )
+            self.assertEqual(res_ok["decision"], "allow", msg=f"Should allow: {ok_text}")
+
+    def test_phase3_swarm_council_hooks_expansion_kill_and_stop(self) -> None:
+        orchestrator_guard._cli_activate(self.base_payload)
+
+        # Status / models / title allowed
+        for act in ("models", "status", "title"):
+            res_info = orchestrator_guard.handle_pre_tool(
+                dict(self.base_payload, toolCall={"name": "swarm", "args": {"action": act}})
+            )
+            self.assertEqual(res_info["decision"], "allow")
+
+        # Non-anonymous council roster name denied
+        res_bad_name = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "sw_bad_name",
+                    "name": "swarm",
+                    "args": {
+                        "action": "add",
+                        "name": "proposer-claude",
+                        "model": "claude-opus-4",
+                        "brief": "MODE: COUNCIL\nCOUNCIL_ID: arch-1\nCOUNCIL_ROLE: proposer\nDraft design.",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_bad_name["decision"], "deny")
+        self.assertIn("Blind council violation", res_bad_name["reason"])
+
+        # Blind judge leak inside swarm brief denied
+        res_bad_judge = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "sw_bad_judge",
+                    "name": "swarm",
+                    "args": {
+                        "action": "add",
+                        "name": "judge-1",
+                        "model": "gemini-4-pro",
+                        "brief": "MODE: COUNCIL\nCOUNCIL_ID: arch-1\nCOUNCIL_ROLE: judge\nVote on Draft A by Claude Opus 5.5.",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_bad_judge["decision"], "deny")
+        self.assertIn("Blind judging violation", res_bad_judge["reason"])
+
+        # Expansion via n=2 (branch) and tasks=[...] (share) + inherit worker
+        res_n = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "sw_n",
+                    "name": "swarm",
+                    "args": {
+                        "action": "add",
+                        "name": "proposer",
+                        "n": 2,
+                        "model": "claude-sonnet",
+                        "workspace": "branch",
+                        "brief": "MODE: COUNCIL\nCOUNCIL_ID: arch-1\nCOUNCIL_ROLE: proposer\nEVAL_CMD: python3 -m unittest",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_n["decision"], "allow")
+
+        res_tasks = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "sw_tasks",
+                    "name": "swarm",
+                    "args": {
+                        "action": "add",
+                        "name": "reviewer",
+                        "tasks": ["task1", "task2"],
+                        "model": "gpt-5",
+                        "workspace": "share",
+                        "brief": "Review candidate patches.",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_tasks["decision"], "allow")
+
+        res_inherit = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "sw_inherit",
+                    "name": "swarm",
+                    "args": {
+                        "action": "add",
+                        "name": "judge-1",
+                        "model": "gemini-4-pro",
+                        "workspace": "inherit",
+                        "brief": "MODE: COUNCIL\nCOUNCIL_ID: arch-1\nCOUNCIL_ROLE: judge\nScore Proposal A vs Proposal B.",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_inherit["decision"], "allow")
+
+        st = orchestrator_guard._load_state(self.base_payload)
+        self.assertEqual(
+            sorted(st["swarm_workers"].keys()),
+            ["judge-1", "proposer-1", "proposer-2", "reviewer-1", "reviewer-2"],
+        )
+        self.assertTrue(st["swarm_workers"]["proposer-1"]["active_worktree"])
+        self.assertTrue(st["swarm_workers"]["reviewer-2"]["active_worktree"])
+        self.assertFalse(st["swarm_workers"]["judge-1"]["active_worktree"])
+        self.assertEqual(st["active_eval_cmd"], "python3 -m unittest")
+        self.assertEqual(st["councils"]["arch-1"]["proposers"], ["proposer-1", "proposer-2"])
+        self.assertEqual(st["councils"]["arch-1"]["judges"], ["judge-1"])
+        self.assertEqual(st["councils"]["arch-1"]["models"], ["claude-sonnet", "gemini-4-pro"])
+
+        # action="model" updates worker model
+        orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "name": "swarm",
+                    "args": {"action": "model", "name": "judge-1", "model": "gemini-4-carbon"},
+                },
+            )
+        )
+        self.assertEqual(
+            orchestrator_guard._load_state(self.base_payload)["swarm_workers"]["judge-1"]["model"],
+            "gemini-4-carbon",
+        )
+
+        # Stop blocks on uncleaned isolated swarm worktrees
+        res_stop_blocked = orchestrator_guard.handle_stop(
+            dict(self.base_payload, executionNum=1, fullyIdle=True)
+        )
+        self.assertEqual(res_stop_blocked["decision"], "continue")
+        self.assertIn("Uncleaned isolated swarm worktrees remain", res_stop_blocked["reason"])
+        self.assertIn("swarm(action='kill')", res_stop_blocked["reason"])
+
+        # Kill all isolated workers; leave workspace='inherit' judge-1 active
+        for wname in ("proposer-1", "proposer-2", "reviewer-1", "reviewer-2"):
+            orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={"name": "swarm", "args": {"action": "kill", "name": wname}},
+                )
+            )
+        st_killed = orchestrator_guard._load_state(self.base_payload)
+        self.assertEqual(st_killed["swarm_workers"]["proposer-1"]["status"], "killed")
+        self.assertFalse(st_killed["swarm_workers"]["proposer-1"]["active_worktree"])
+        self.assertEqual(st_killed["swarm_workers"]["judge-1"]["status"], "active")
+
+        # Stop allows when only workspace='inherit' worker remains active
+        res_stop_ok = orchestrator_guard.handle_stop(
+            dict(self.base_payload, executionNum=2, fullyIdle=True)
+        )
+        self.assertEqual(res_stop_ok["decision"], "allow")
+
+    def test_phase3_swarm_post_tool_rollback_breaker_and_replan(self) -> None:
+        orchestrator_guard._cli_activate(self.base_payload)
+
+        # Mark dirty receipt to verify swarm success does not clear it
+        st = orchestrator_guard._load_state(self.base_payload)
+        receipt = orchestrator_guard._get_test_receipt(st, self.base_payload)
+        receipt["dirty"] = True
+        receipt["verified"] = False
+        orchestrator_guard._save_state(self.base_payload, st)
+
+        # Trivial EVAL_CMD in swarm brief is denied
+        res_trivial = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "sw_triv",
+                    "name": "swarm",
+                    "args": {
+                        "action": "add",
+                        "name": "proposer-a",
+                        "brief": "MODE: COUNCIL\nEVAL_CMD: true",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_trivial["decision"], "deny")
+        self.assertIn("Trivial or no-op EVAL_CMD rejected", res_trivial["reason"])
+
+        # First swarm add + PostToolUse failure rolls back by call_id and increments failure_streak
+        add_args_1 = {
+            "action": "add",
+            "name": "proposer-a",
+            "model": "claude-opus",
+            "brief": "MODE: COUNCIL\nCOUNCIL_ID: c-err\nCOUNCIL_ROLE: proposer\nDraft A",
+        }
+        orchestrator_guard.handle_pre_tool(
+            dict(self.base_payload, toolCall={"id": "sw_err_1", "name": "swarm", "args": add_args_1})
+        )
+        self.assertIn("proposer-a", orchestrator_guard._load_state(self.base_payload)["swarm_workers"])
+
+        orchestrator_guard.handle_post_tool(
+            dict(
+                self.base_payload,
+                toolCall={"id": "sw_err_1", "name": "swarm", "args": add_args_1},
+                error="swarm add failed",
+            )
+        )
+        st_err_1 = orchestrator_guard._load_state(self.base_payload)
+        self.assertNotIn("proposer-a", st_err_1["swarm_workers"])
+        self.assertEqual(st_err_1["councils"]["c-err"]["proposers"], [])
+        self.assertEqual(st_err_1["circuit_breaker"]["failure_streak"], 1)
+        self.assertFalse(st_err_1["circuit_breaker"]["tripped"])
+
+        # Second swarm add + PostToolUse failure (empty call_id fallback) trips circuit breaker
+        add_args_2 = {
+            "action": "add",
+            "name": "proposer-b",
+            "n": 2,
+            "model": "gpt-5",
+            "brief": "MODE: COUNCIL\nCOUNCIL_ID: c-err\nCOUNCIL_ROLE: proposer\nDraft B",
+        }
+        orchestrator_guard.handle_pre_tool(
+            dict(self.base_payload, toolCall={"name": "swarm", "args": add_args_2})
+        )
+        orchestrator_guard.handle_post_tool(
+            dict(
+                self.base_payload,
+                toolCall={"name": "swarm", "args": add_args_2},
+                exitCode=1,
+            )
+        )
+        st_err_2 = orchestrator_guard._load_state(self.base_payload)
+        self.assertNotIn("proposer-b-1", st_err_2["swarm_workers"])
+        self.assertNotIn("proposer-b-2", st_err_2["swarm_workers"])
+        self.assertEqual(st_err_2["circuit_breaker"]["failure_streak"], 2)
+        self.assertTrue(st_err_2["circuit_breaker"]["tripped"])
+
+        # Tripped breaker allows status/kill, blocks add without REPLAN:, allows 1-shot REPLAN:
+        self.assertEqual(
+            orchestrator_guard.handle_pre_tool(
+                dict(self.base_payload, toolCall={"name": "swarm", "args": {"action": "status"}})
+            )["decision"],
+            "allow",
+        )
+        self.assertEqual(
+            orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={"name": "swarm", "args": {"action": "kill", "name": "any"}},
+                )
+            )["decision"],
+            "allow",
+        )
+        res_blocked = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "sw_blocked",
+                    "name": "swarm",
+                    "args": {
+                        "action": "add",
+                        "name": "proposer-c",
+                        "brief": "Retry without replan",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_blocked["decision"], "deny")
+        self.assertIn("REPLAN:", res_blocked["reason"])
+
+        res_replan = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "sw_replan",
+                    "name": "swarm",
+                    "args": {
+                        "action": "add",
+                        "name": "proposer-c",
+                        "model": "gemini-4-pro",
+                        "brief": "REPLAN: switch provider\nMODE: COUNCIL\nCOUNCIL_ID: c-err\nCOUNCIL_ROLE: proposer",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_replan["decision"], "allow")
+        st_replanned = orchestrator_guard._load_state(self.base_payload)
+        self.assertFalse(st_replanned["circuit_breaker"]["tripped"])
+        self.assertEqual(st_replanned["circuit_breaker"]["replan_count"], 1)
+
+        # Success resets failure_streak while preserving dirty test_receipt
+        orchestrator_guard.handle_post_tool(
+            dict(
+                self.base_payload,
+                toolCall={"id": "sw_replan", "name": "swarm", "args": {"action": "add", "name": "proposer-c"}},
+                output="Worker proposer-c ready",
+            )
+        )
+        st_ok = orchestrator_guard._load_state(self.base_payload)
+        self.assertEqual(st_ok["circuit_breaker"]["failure_streak"], 0)
+        self.assertFalse(st_ok["circuit_breaker"]["tripped"])
+        self.assertTrue(st_ok["test_receipt"]["dirty"])
+
+    def test_phase3_non_swarm_council_proposer_and_cli_status(self) -> None:
+        orchestrator_guard._cli_activate(self.base_payload)
+
+        # MODE: COUNCIL research proposer allows pro/inherit/flash without flash_lite downgrade
+        res_research_pro = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "inv_res_pro",
+                    "name": "invoke_subagent",
+                    "args": {
+                        "TypeName": "research",
+                        "Role": "Proposer A",
+                        "Model": "pro",
+                        "Prompt": "MODE: COUNCIL\nCOUNCIL_ID: fallback-1\nCOUNCIL_ROLE: proposer\n1. Compare options.",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_research_pro["decision"], "allow")
+        self.assertNotIn("overwrite", res_research_pro)
+
+        res_research_flash = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "inv_res_flash",
+                    "name": "invoke_subagent",
+                    "args": {
+                        "TypeName": "research",
+                        "Role": "Proposer B",
+                        "Model": "flash",
+                        "Prompt": "MODE: COUNCIL\nCOUNCIL_ID: fallback-1\nCOUNCIL_ROLE: proposer\n1. Summarize design.",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_research_flash["decision"], "allow")
+        self.assertNotIn("overwrite", res_research_flash)
+
+        # council type allows inherit untouched even without explicit MODE header
+        res_council_inherit = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "inv_c_inh",
+                    "name": "invoke_subagent",
+                    "args": {
+                        "TypeName": "council",
+                        "Role": "Proposer C",
+                        "Model": "inherit",
+                        "Prompt": "1. Propose architecture.",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_council_inherit["decision"], "allow")
+        self.assertNotIn("overwrite", res_council_inherit)
+
+        # Standard non-council research still rejects Model='pro'
+        res_std_research = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "inv_std_res",
+                    "name": "invoke_subagent",
+                    "args": {
+                        "TypeName": "research",
+                        "Role": "Standard Research",
+                        "Model": "pro",
+                        "Prompt": "1. Investigate module.",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_std_research["decision"], "deny")
+        self.assertIn("Model='pro'", res_std_research["reason"])
+
+        # Council proposer is scratch-only: scratch .md allowed, workspace code denied, receipt kept dirty
+        st = orchestrator_guard._load_state(self.base_payload)
+        receipt = orchestrator_guard._get_test_receipt(st, self.base_payload)
+        receipt["dirty"] = True
+        receipt["verified"] = False
+        orchestrator_guard._save_state(self.base_payload, st)
+
+        council_cid = "sub-council-proposer-1"
+        orchestrator_guard.register_subagent(
+            self.base_payload,
+            conversation_id=council_cid,
+            type_name="council",
+            model="pro",
+            mode="council",
+            council_id="fallback-1",
+            council_role="proposer",
+        )
+        council_payload = dict(self.base_payload, conversationId=council_cid)
+
+        res_scratch = orchestrator_guard.handle_pre_tool(
+            dict(
+                council_payload,
+                toolCall={
+                    "name": "write_file",
+                    "args": {
+                        "Path": str(Path(self.artifact_dir) / "scratch" / "proposal_a.md"),
+                        "Content": "# Proposal A\n",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_scratch["decision"], "allow")
+
+        res_code_mut = orchestrator_guard.handle_pre_tool(
+            dict(
+                council_payload,
+                toolCall={
+                    "name": "write_file",
+                    "args": {
+                        "Path": str(orchestrator_guard.PROJECT_ROOT / "src" / "hack.py"),
+                        "Content": "x = 1\n",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_code_mut["decision"], "deny")
+        self.assertIn("may only write markdown reports", res_code_mut["reason"])
+
+        orchestrator_guard.handle_post_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "inv_c_done",
+                    "name": "invoke_subagent",
+                    "args": {
+                        "TypeName": "council",
+                        "Role": "Proposer C",
+                        "Model": "inherit",
+                        "Prompt": "1. Propose architecture.",
+                    },
+                },
+                output="STATUS: COMPLETED\nFILES_CHANGED: scratch/proposal_a.md\nVERIFICATION: n/a\nNOTES: Drafted Proposal A.",
+            )
+        )
+        st_after = orchestrator_guard._load_state(self.base_payload)
+        self.assertTrue(st_after["test_receipt"]["dirty"])
+        self.assertEqual(st_after["councils"]["fallback-1"]["proposers"], ["Proposer A", "Proposer B"])
+
+        # _cli_status surfaces councils and swarmWorkers
+        status_out = orchestrator_guard._cli_status(self.base_payload)
+        self.assertIn("councils", status_out)
+        self.assertIn("swarmWorkers", status_out)
+        self.assertIn("fallback-1", status_out["councils"])
+
+        # _prune_state bounds councils and prunes oldest killed swarm_workers
+        prune_state = orchestrator_guard._default_state()
+        for i in range(orchestrator_guard.MAX_STATE_INVOCATION_HISTORY + 5):
+            prune_state["councils"][f"c-{i}"] = {
+                "proposers": [f"p-{j}" for j in range(orchestrator_guard.MAX_STATE_LIST_ENTRIES + 5)],
+                "judges": [],
+                "models": [],
+                "created_at": float(i),
+            }
+        for i in range(orchestrator_guard.MAX_STATE_LIST_ENTRIES + 5):
+            prune_state["swarm_workers"][f"w-{i}"] = {
+                "name": f"w-{i}",
+                "status": "killed" if i < 10 else "active",
+                "spawned_at": float(i),
+            }
+        orchestrator_guard._prune_state(prune_state)
+        self.assertEqual(len(prune_state["councils"]), orchestrator_guard.MAX_STATE_INVOCATION_HISTORY)
+        self.assertNotIn("c-0", prune_state["councils"])
+        first_c = next(iter(prune_state["councils"].values()))
+        self.assertEqual(len(first_c["proposers"]), orchestrator_guard.MAX_STATE_LIST_ENTRIES)
+        self.assertEqual(len(prune_state["swarm_workers"]), orchestrator_guard.MAX_STATE_LIST_ENTRIES)
+        self.assertNotIn("w-0", prune_state["swarm_workers"])
+        self.assertIn("w-5", prune_state["swarm_workers"])
+
+    def test_phase3_blind_judge_metadata_filename_and_scratch_file_leaks(self) -> None:
+        orchestrator_guard._cli_activate(self.base_payload)
+
+        def _invoke_judge(prompt: str, call_id: str) -> dict:
+            return orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={
+                        "id": call_id,
+                        "name": "invoke_subagent",
+                        "args": {
+                            "TypeName": "judge",
+                            "Role": "Blind Judge",
+                            "Model": "inherit",
+                            "Prompt": prompt,
+                        },
+                    },
+                )
+            )
+
+        # Standalone metadata lines
+        res_meta1 = _invoke_judge(
+            "MODE: COUNCIL\nCOUNCIL_ID: c-meta-1\nCOUNCIL_ROLE: judge\nModel: Claude Opus 5.5\nCompare proposals.",
+            "j_meta1",
+        )
+        self.assertEqual(res_meta1["decision"], "deny")
+        self.assertIn("Blind judging violation", res_meta1["reason"])
+
+        res_meta2 = _invoke_judge(
+            "MODE: COUNCIL\nCOUNCIL_ID: c-meta-2\nCOUNCIL_ROLE: judge\n- Author: Gemini 4 Carbon\nCompare proposals.",
+            "j_meta2",
+        )
+        self.assertEqual(res_meta2["decision"], "deny")
+        self.assertIn("Blind judging violation", res_meta2["reason"])
+
+        # Wider same-line attribution (>30 chars between proposal id and model)
+        res_wide = _invoke_judge(
+            "MODE: COUNCIL\nCOUNCIL_ID: c-wide\nCOUNCIL_ROLE: judge\n"
+            "Proposal A (written carefully over two iterations by Claude Opus 5.5)",
+            "j_wide",
+        )
+        self.assertEqual(res_wide["decision"], "deny")
+        self.assertIn("Blind judging violation", res_wide["reason"])
+
+        # Model-named proposal filename
+        res_fname = _invoke_judge(
+            "MODE: COUNCIL\nCOUNCIL_ID: c-fname\nCOUNCIL_ROLE: judge\n"
+            "Review scratch/proposal_claude.md and scratch/proposal_b.md.",
+            "j_fname",
+        )
+        self.assertEqual(res_fname["decision"], "deny")
+        self.assertIn("Blind judging violation", res_fname["reason"])
+
+        # Referenced scratch file containing metadata leak
+        scratch_dir = Path(self.artifact_dir) / "scratch"
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        prop_a = scratch_dir / "proposal_a.md"
+        prop_a.write_text("# Proposal A\nAuthor: Gemini 4 Carbon\nUse modular handlers.\n", encoding="utf-8")
+
+        res_scratch_leak = _invoke_judge(
+            f"MODE: COUNCIL\nCOUNCIL_ID: c-scratch-leak\nCOUNCIL_ROLE: judge\nReview {prop_a}.",
+            "j_scratch_leak",
+        )
+        self.assertEqual(res_scratch_leak["decision"], "deny")
+        self.assertIn("proposal_a.md", res_scratch_leak["reason"])
+
+        # Referenced scratch file with benign technical prose ("carbon accounting with the Gemini API client")
+        prop_b = scratch_dir / "proposal_b.md"
+        prop_b.write_text(
+            "# Proposal B\nImplement carbon accounting with the Gemini API client.\n",
+            encoding="utf-8",
+        )
+        res_clean = _invoke_judge(
+            "MODE: COUNCIL\nCOUNCIL_ID: c-clean\nCOUNCIL_ROLE: judge\nReview scratch/proposal_b.md.",
+            "j_clean",
+        )
+        self.assertEqual(res_clean["decision"], "allow")
+
+    def test_phase3_swarm_sharded_kill_base_name_and_kill_error_rollback(self) -> None:
+        orchestrator_guard._cli_activate(self.base_payload)
+
+        # Spawn sharded workers with isolated worktrees
+        res_add = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "sw_sharded_add",
+                    "name": "swarm",
+                    "args": {
+                        "action": "add",
+                        "name": "proposer",
+                        "n": 2,
+                        "workspace": "share",
+                        "brief": "MODE: COUNCIL\nCOUNCIL_ID: c-shard\nCOUNCIL_ROLE: proposer\nDraft design",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_add["decision"], "allow")
+        st_added = orchestrator_guard._load_state(self.base_payload)
+        self.assertEqual(st_added["swarm_workers"]["proposer-1"]["base_name"], "proposer")
+        self.assertTrue(st_added["swarm_workers"]["proposer-1"]["sharded"])
+
+        # Killing by base name instead of individual sharded worker names is denied
+        res_kill_base = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "sw_kill_base",
+                    "name": "swarm",
+                    "args": {"action": "kill", "name": "proposer"},
+                },
+            )
+        )
+        self.assertEqual(res_kill_base["decision"], "deny")
+        self.assertIn("proposer-1", res_kill_base["reason"])
+        self.assertIn("proposer-2", res_kill_base["reason"])
+
+        # Killing proposer-1 allowed at PreToolUse -> temporarily marked killed
+        res_kill_1_pre = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "sw_kill_1_err",
+                    "name": "swarm",
+                    "args": {"action": "kill", "name": "proposer-1"},
+                },
+            )
+        )
+        self.assertEqual(res_kill_1_pre["decision"], "allow")
+        self.assertEqual(
+            orchestrator_guard._load_state(self.base_payload)["swarm_workers"]["proposer-1"]["status"],
+            "killed",
+        )
+
+        # PostToolUse error rolls back proposer-1 to active + active_worktree=True
+        orchestrator_guard.handle_post_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "sw_kill_1_err",
+                    "name": "swarm",
+                    "args": {"action": "kill", "name": "proposer-1"},
+                },
+                error="Worker not found or kill failed",
+            )
+        )
+        st_rolled = orchestrator_guard._load_state(self.base_payload)
+        self.assertEqual(st_rolled["swarm_workers"]["proposer-1"]["status"], "active")
+        self.assertTrue(st_rolled["swarm_workers"]["proposer-1"]["active_worktree"])
+
+        # Stop still blocks because active isolated worktrees remain
+        res_stop_blocked = orchestrator_guard.handle_stop(
+            dict(self.base_payload, executionNum=1, fullyIdle=True)
+        )
+        self.assertEqual(res_stop_blocked["decision"], "continue")
+
+        # Cleanly kill both sharded workers (PreToolUse + PostToolUse without error)
+        for wname in ("proposer-1", "proposer-2"):
+            cid = f"sw_kill_ok_{wname}"
+            args_kill = {"action": "kill", "name": wname}
+            res_pre = orchestrator_guard.handle_pre_tool(
+                dict(self.base_payload, toolCall={"id": cid, "name": "swarm", "args": args_kill})
+            )
+            self.assertEqual(res_pre["decision"], "allow")
+            orchestrator_guard.handle_post_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={"id": cid, "name": "swarm", "args": args_kill},
+                    output=f"Killed {wname}",
+                )
+            )
+
+        res_stop_ok = orchestrator_guard.handle_stop(
+            dict(self.base_payload, executionNum=2, fullyIdle=True)
+        )
+        self.assertEqual(res_stop_ok["decision"], "allow")
+
 
 if __name__ == "__main__":
     unittest.main()
