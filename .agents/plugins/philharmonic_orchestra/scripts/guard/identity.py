@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional
 
 from guard.constants import (
     ALLOWED_SYSTEM_PATH_PREFIXES,
+    ISOLATED_WORKSPACES,
+    MAX_CONSECUTIVE_FAILURES,
     PENDING_SPAWN_TTL_SECONDS,
     PROJECT_ROOT,
     SLASH_COMMAND_RE,
@@ -146,6 +148,18 @@ def _normalize_subagent_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
         normalized["type_name"] = normalized["type"]
     elif "type_name" in normalized and "type" not in normalized:
         normalized["type"] = normalized["type_name"]
+    if meta.get("candidate_id") is not None:
+        cand_val = str(meta["candidate_id"]).strip()
+        if cand_val:
+            normalized["candidate_id"] = cand_val
+        else:
+            normalized.pop("candidate_id", None)
+    if "active_worktree" not in normalized:
+        ws = str(normalized.get("workspace") or "").strip().lower()
+        if ws in ISOLATED_WORKSPACES or normalized.get("active_branch"):
+            normalized["active_worktree"] = bool(
+                normalized.get("active_branch") or ws in ISOLATED_WORKSPACES
+            )
     return normalized
 
 
@@ -350,7 +364,10 @@ def _sync_subagents_from_transcript(
                 if pending:
                     spawn_meta = pending.pop(0)
                     if isinstance(spawn_meta, dict):
+                        cand_id = spawn_meta.get("candidate_id")
                         spawn_meta = _normalize_subagent_meta(spawn_meta)
+                        if cand_id is not None and "candidate_id" not in spawn_meta:
+                            spawn_meta["candidate_id"] = str(cand_id)
                         spawn_meta.setdefault("status", "active")
                     subagents[cid] = spawn_meta
                     changed = True
@@ -457,6 +474,7 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
                     state["plan_execute_user_input"] = None
                     state["plan_execute_turn_finished"] = False
                     state["plan_allowed_files"] = None
+                    state["active_eval_cmd"] = None
                     changed = True
                 else:
                     if not state.get("plan_execute_consumed"):
@@ -630,6 +648,110 @@ def _mark_subagent_status_in_parent_brain(
         pass
 
 
+def _apply_cohort_outcome(
+    target_state: Dict[str, Any],
+    child_cid: str,
+    cohort_id: str,
+    outcome: str,
+    error_summary: str = "",
+) -> bool:
+    """Update a cohort's succeeded/failed tracking and parent circuit breaker in target_state."""
+    cohorts = target_state.setdefault("cohorts", {})
+    cohort_entry = cohorts.get(cohort_id)
+    if not isinstance(cohort_entry, dict):
+        return False
+    succeeded = cohort_entry.setdefault("succeeded", [])
+    failed = cohort_entry.setdefault("failed", [])
+    cb = target_state.setdefault(
+        "circuit_breaker",
+        {
+            "failure_streak": 0,
+            "tripped": False,
+            "seen_failures": [],
+            "last_error": "",
+            "replan_count": 0,
+        },
+    )
+    norm_cid = (child_cid or "").strip().lower()
+    if outcome == "succeeded":
+        if norm_cid and norm_cid not in succeeded:
+            succeeded.append(norm_cid)
+        if norm_cid and norm_cid in failed:
+            failed.remove(norm_cid)
+        cb["failure_streak"] = 0
+        cb["tripped"] = False
+    else:
+        if norm_cid and norm_cid not in succeeded and norm_cid not in failed:
+            failed.append(norm_cid)
+        total_spawned = int(cohort_entry.get("total_spawned", 0) or 0)
+        if (
+            total_spawned >= 2
+            and len(failed) >= total_spawned
+            and len(succeeded) == 0
+        ):
+            cb["failure_streak"] = max(
+                MAX_CONSECUTIVE_FAILURES, int(cb.get("failure_streak", 0) or 0) + 1
+            )
+            cb["tripped"] = True
+            cb["last_error"] = error_summary or "All Best-of-N cohort candidates failed"
+    return True
+
+
+def _record_cohort_outcome_in_parent_brain(
+    payload: Dict[str, Any],
+    state: Dict[str, Any],
+    child_cid: str,
+    cohort_id: str,
+    outcome: str,
+    error_summary: str = "",
+) -> None:
+    """Record an async Best-of-N subagent completion outcome in parent brain cohorts."""
+    norm_cid = (child_cid or "").strip().lower()
+    conv_cid = (payload.get("conversationId") or "").strip().lower()
+    if not norm_cid or not cohort_id:
+        return
+    if _apply_cohort_outcome(state, norm_cid, cohort_id, outcome, error_summary):
+        _save_state(payload, state)
+
+    artifact_dir = payload.get("artifactDirectoryPath")
+    if not artifact_dir:
+        return
+    try:
+        resolved_art = Path(artifact_dir).resolve()
+        if resolved_art.parent.name != "brain":
+            return
+        meta = state.get("self_subagent_meta") or {}
+        parent_cid = str(meta.get("parent_conversation_id") or "").strip().lower()
+        for sibling_state_path in resolved_art.parent.glob("*/orchestrator_state.json"):
+            if sibling_state_path.parent == resolved_art:
+                continue
+            with state_transaction(sibling_state_path):
+                sib_data = _load_state(sibling_state_path)
+                sib_subagents = sib_data.get("subagents") or {}
+                root_cid = str(sib_data.get("root_conversation_id") or "").strip().lower()
+                dir_name = sibling_state_path.parent.name.lower()
+                matches_subagent = bool(
+                    norm_cid in sib_subagents or (conv_cid and conv_cid in sib_subagents)
+                )
+                matches_parent = bool(
+                    parent_cid and (root_cid == parent_cid or dir_name == parent_cid)
+                )
+                if (matches_subagent or matches_parent) and _workspaces_compatible(
+                    payload, sib_data
+                ):
+                    sib_meta = sib_subagents.get(conv_cid) if conv_cid else None
+                    effective_cid = str(
+                        (sib_meta.get("candidate_id") if isinstance(sib_meta, dict) else None)
+                        or norm_cid
+                    ).strip().lower()
+                    if _apply_cohort_outcome(
+                        sib_data, effective_cid, cohort_id, outcome, error_summary
+                    ):
+                        _save_state(sibling_state_path, sib_data)
+    except OSError:
+        pass
+
+
 def _is_root_orchestrator(
     payload: Dict[str, Any], state: Optional[Dict[str, Any]] = None
 ) -> bool:
@@ -650,17 +772,28 @@ def register_subagent(
     status: Optional[str] = None,
     spawned_mutation_epoch: Optional[int] = None,
     review_lens: Optional[str] = None,
+    active_worktree: Optional[bool] = None,
+    mode: Optional[str] = None,
+    cohort: Optional[str] = None,
+    eval_cmd: Optional[str] = None,
+    candidate_id: Optional[str] = None,
 ) -> None:
     """Helper for explicitly registering a subagent conversationId -> tier mapping."""
     with state_transaction(payload):
         state = _load_state(payload)
         cid = conversation_id.strip().lower()
+        norm_ws = workspace.strip().lower()
         record: Dict[str, Any] = {
             "role": role or type_name,
             "type": type_name,
             "model": model,
             "workspace": workspace,
-            "active_branch": workspace == "branch",
+            "active_branch": norm_ws == "branch",
+            "active_worktree": (
+                active_worktree
+                if active_worktree is not None
+                else (norm_ws in ISOLATED_WORKSPACES)
+            ),
         }
         if allowed_files is not None:
             record["allowed_files"] = list(allowed_files)
@@ -670,5 +803,13 @@ def register_subagent(
             record["spawned_mutation_epoch"] = spawned_mutation_epoch
         if review_lens is not None:
             record["review_lens"] = review_lens
+        if mode is not None:
+            record["mode"] = mode
+        if cohort is not None:
+            record["cohort"] = cohort
+        if eval_cmd is not None:
+            record["eval_cmd"] = eval_cmd
+        if candidate_id is not None:
+            record["candidate_id"] = candidate_id
         state.setdefault("subagents", {})[cid] = _normalize_subagent_meta(record)
         _save_state(payload, state)

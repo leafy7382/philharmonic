@@ -19,6 +19,7 @@ READONLY_NON_VERIFICATION_TYPES = {
     "reviewer",
 }
 ALLOWED_VERIFIER_REVIEWER_MODELS = {"flash", "pro", "inherit"}
+ISOLATED_WORKSPACES = {"branch", "share"}
 DEFAULT_MODEL_BY_TYPE = {
     "scout": "flash_lite",
     "research": "flash",
@@ -39,6 +40,13 @@ REPLAN_HEADER_RE = re.compile(r"(?m)^\s*REPLAN:\s*(.+)$", re.I)
 SPEC_FILE_HEADER_RE = re.compile(r"(?m)^\s*SPEC_FILE:\s*(.+)$", re.I)
 STAGE_HEADER_RE = re.compile(r"(?m)^\s*STAGE:\s*(.+)$", re.I)
 REVIEW_LENS_HEADER_RE = re.compile(r"(?m)^[ \t]*REVIEW_LENS:[ \t]*([^\r\n]+)$", re.I)
+MODE_HEADER_RE = re.compile(r"(?m)^[ \t]*MODE:[ \t]*([^\r\n]+)$", re.I)
+COHORT_HEADER_RE = re.compile(r"(?m)^[ \t]*COHORT:[ \t]*([^\r\n]+)$", re.I)
+EVAL_CMD_HEADER_RE = re.compile(r"(?m)^[ \t]*EVAL_CMD:[ \t]*([^\r\n]+)$", re.I)
+TRIVIAL_EVAL_CMD_RE = re.compile(
+    r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*(?:(?:true|echo|printf|pwd|ls|cat|exit)\b|:(?=$|\s))",
+    re.I,
+)
 GROUNDED_SPEC_SECTION_PATTERNS = (
     re.compile(r"(?im)(?:^|[^A-Za-z0-9])signatures?(?:$|[^A-Za-z0-9])"),
     re.compile(r"(?im)(?:^|[^A-Za-z0-9])(?:pitfalls?|invariants?)(?:$|[^A-Za-z0-9])"),

@@ -71,6 +71,8 @@ def _default_state() -> Dict[str, Any]:
         "plan_execute_user_input": None,
         "plan_execute_turn_finished": False,
         "plan_allowed_files": None,
+        "active_eval_cmd": None,
+        "cohorts": {},
         "current_invocation_num": 0,
     }
 
@@ -117,6 +119,27 @@ def _prune_state(state: Dict[str, Any]) -> None:
         seen_failures = cb.get("seen_failures")
         if isinstance(seen_failures, list) and len(seen_failures) > MAX_STATE_LIST_ENTRIES:
             cb["seen_failures"] = seen_failures[-MAX_STATE_LIST_ENTRIES:]
+
+    cohorts = state.get("cohorts")
+    if isinstance(cohorts, dict):
+        for cohort_entry in cohorts.values():
+            if not isinstance(cohort_entry, dict):
+                continue
+            for outcome_key in ("succeeded", "failed"):
+                items = cohort_entry.get(outcome_key)
+                if isinstance(items, list) and len(items) > MAX_STATE_LIST_ENTRIES:
+                    cohort_entry[outcome_key] = items[-MAX_STATE_LIST_ENTRIES:]
+        if len(cohorts) > MAX_STATE_INVOCATION_HISTORY:
+            sorted_cohort_keys = sorted(
+                cohorts.keys(),
+                key=lambda k: (
+                    float(cohorts[k].get("created_at", 0) or 0)
+                    if isinstance(cohorts.get(k), dict)
+                    else 0.0
+                ),
+            )
+            for old_key in sorted_cohort_keys[:-MAX_STATE_INVOCATION_HISTORY]:
+                cohorts.pop(old_key, None)
 
 
 @contextlib.contextmanager
@@ -193,6 +216,8 @@ def _load_state(payload_or_path: Any) -> Dict[str, Any]:
                 data["isolation_reminded_invocations"] = (
                     data.get("isolation_reminded_invocations") or []
                 )
+                if not isinstance(data.get("cohorts"), dict):
+                    data["cohorts"] = {}
                 if isinstance(data.get("circuit_breaker"), dict):
                     data["circuit_breaker"].setdefault("replan_count", 0)
                 if isinstance(data.get("test_receipt"), dict):

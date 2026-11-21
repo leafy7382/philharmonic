@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from guard.constants import (
@@ -39,12 +40,18 @@ from guard.identity import (
     _is_root_orchestrator,
     _is_scout_subagent,
     _mark_subagent_status_in_parent_brain,
+    _normalize_subagent_meta,
+    _record_cohort_outcome_in_parent_brain,
     _sync_subagents_from_transcript,
     _workspaces_compatible,
 )
 from guard.policies import (
+    _compute_prompt_hash,
     _extract_target_path,
     _is_artifact_or_worktree_path,
+    _is_declared_eval_command,
+    _parse_cohort_header,
+    _parse_mode_header,
 )
 from guard.state_store import (
     _current_invocation_key,
@@ -259,6 +266,359 @@ def _get_test_receipt(
     return receipt_root
 
 
+def _current_subagent_meta(
+    payload: Dict[str, Any], state: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Return metadata dictionary for the active subagent caller, if any."""
+    meta = state.get("self_subagent_meta")
+    if isinstance(meta, dict) and meta:
+        return meta
+    cid = (payload.get("conversationId") or "").strip().lower()
+    sub_info = (state.get("subagents") or {}).get(cid)
+    if isinstance(sub_info, dict) and sub_info:
+        return sub_info
+    artifact_dir = payload.get("artifactDirectoryPath")
+    if artifact_dir and cid:
+        try:
+            resolved_art = Path(artifact_dir).resolve()
+            if resolved_art.parent.name == "brain":
+                for sibling_state_path in resolved_art.parent.glob(
+                    "*/orchestrator_state.json"
+                ):
+                    if sibling_state_path.parent == resolved_art:
+                        continue
+                    try:
+                        sib_data = _load_state(sibling_state_path)
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    sib_subagents = sib_data.get("subagents") or {}
+                    if cid in sib_subagents and isinstance(sib_subagents[cid], dict):
+                        resolved_meta = _normalize_subagent_meta(sib_subagents[cid])
+                        if "parent_conversation_id" not in resolved_meta:
+                            resolved_meta["parent_conversation_id"] = (
+                                sib_data.get("root_conversation_id")
+                                or sibling_state_path.parent.name
+                            )
+                        state["self_subagent_meta"] = resolved_meta
+                        _save_state(payload, state)
+                        return resolved_meta
+        except OSError:
+            pass
+    return {}
+
+
+def _extract_expected_cohort_specs(
+    args: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Tuple[Optional[str], Optional[str], str]]]:
+    """Extract (entries, [(cohort_id_or_none, role_or_none, prompt_hash), ...]) from invoke_subagent args."""
+    entries = (
+        args["Subagents"]
+        if isinstance(args.get("Subagents"), list) and args["Subagents"]
+        else [args]
+    )
+    specs: List[Tuple[Optional[str], Optional[str], str]] = []
+    for item in entries:
+        if not isinstance(item, dict):
+            specs.append((None, None, ""))
+            continue
+        prompt_text = str(item.get("Prompt") or "")
+        _ = _parse_mode_header(prompt_text)
+        c_id = _parse_cohort_header(prompt_text)
+        role_val = (item.get("Role") or item.get("TypeName") or "").strip().lower() or None
+        prompt_hash = _compute_prompt_hash(prompt_text)
+        specs.append((c_id, role_val, prompt_hash))
+    return entries, specs
+
+
+def _pending_matches_spec(
+    p: Any,
+    exp_cohort: Optional[str],
+    exp_role: Optional[str],
+    exp_prompt_hash: Optional[str] = None,
+    require_prompt_hash: bool = False,
+) -> bool:
+    """Return True if a pending_spawns record matches the expected cohort, role/type, and optional prompt_hash."""
+    if not isinstance(p, dict):
+        return False
+    if exp_cohort is not None:
+        if str(p.get("cohort") or "").strip().lower() != exp_cohort:
+            return False
+    if exp_role is not None:
+        p_role = str(p.get("role") or "").strip().lower()
+        p_type = str(p.get("type_name") or p.get("type") or "").strip().lower()
+        if exp_role not in {p_role, p_type}:
+            return False
+    if require_prompt_hash:
+        if not exp_prompt_hash or str(p.get("prompt_hash") or "") != exp_prompt_hash:
+            return False
+    return True
+
+
+def _match_pending_spawns_two_pass(
+    candidates: List[Dict[str, Any]],
+    entries: List[Dict[str, Any]],
+    expected_specs: List[Tuple[Optional[str], Optional[str], str]],
+    *,
+    allow_cohort_only_without_role: bool = False,
+    allow_type_fallback: bool = False,
+    allow_tail_fallback: bool = False,
+) -> List[Dict[str, Any]]:
+    """Match up to len(entries) active pending spawns via Pass 1 (prompt_hash) and Pass 2 (cohort/role FIFO)."""
+    active_candidates = [
+        p
+        for p in candidates
+        if isinstance(p, dict) and p.get("status", "active") == "active"
+    ]
+    max_matches = len(entries)
+    matched_by_idx: Dict[int, Dict[str, Any]] = {}
+    used_ids: set = set()
+
+    # Pass 1: exact prompt_hash + cohort/role match
+    for idx, (exp_cohort, exp_role, exp_prompt_hash) in enumerate(expected_specs):
+        if idx >= max_matches:
+            break
+        if not exp_prompt_hash:
+            continue
+        for p in active_candidates:
+            if id(p) not in used_ids and _pending_matches_spec(
+                p,
+                exp_cohort,
+                exp_role,
+                exp_prompt_hash=exp_prompt_hash,
+                require_prompt_hash=True,
+            ):
+                used_ids.add(id(p))
+                matched_by_idx[idx] = p
+                break
+
+    # Pass 2: cohort/role FIFO fallback (plus optional call-site fallbacks)
+    for idx, (exp_cohort, exp_role, _) in enumerate(expected_specs):
+        if idx >= max_matches or len(matched_by_idx) >= max_matches:
+            break
+        if idx in matched_by_idx:
+            continue
+        item = (
+            entries[idx]
+            if idx < len(entries) and isinstance(entries[idx], dict)
+            else {}
+        )
+        chosen: Optional[Dict[str, Any]] = None
+        if exp_cohort is not None or exp_role is not None:
+            for p in active_candidates:
+                if id(p) not in used_ids and _pending_matches_spec(
+                    p, exp_cohort, exp_role
+                ):
+                    chosen = p
+                    break
+        if chosen is None and allow_cohort_only_without_role:
+            has_explicit_role = bool(str(item.get("Role") or "").strip())
+            if not has_explicit_role:
+                for p in active_candidates:
+                    if id(p) not in used_ids and (
+                        exp_cohort is None
+                        or str(p.get("cohort") or "").strip().lower() == exp_cohort
+                    ):
+                        chosen = p
+                        break
+        if chosen is None and allow_type_fallback:
+            inv_type = str(item.get("TypeName") or "").strip().lower()
+            if inv_type:
+                for p in active_candidates:
+                    if id(p) not in used_ids and (
+                        exp_cohort is None
+                        or str(p.get("cohort") or "").strip().lower() == exp_cohort
+                    ):
+                        p_type = str(
+                            p.get("type_name") or p.get("type") or ""
+                        ).strip().lower()
+                        if p_type == inv_type:
+                            chosen = p
+                            break
+        if chosen is None and allow_tail_fallback:
+            for p in reversed(active_candidates):
+                if id(p) not in used_ids:
+                    chosen = p
+                    break
+            if chosen is None:
+                for p in reversed(candidates):
+                    if isinstance(p, dict) and id(p) not in used_ids:
+                        chosen = p
+                        break
+        if chosen is not None:
+            used_ids.add(id(chosen))
+            matched_by_idx[idx] = chosen
+
+    return [
+        matched_by_idx[idx]
+        for idx in range(min(max_matches, len(expected_specs)))
+        if idx in matched_by_idx
+    ]
+
+
+def _collect_invoke_cohort_candidates(
+    payload: Dict[str, Any],
+    state: Dict[str, Any],
+    args: Dict[str, Any],
+    call_id: str,
+    output_text: str,
+    pre_popped_entries: Optional[List[Dict[str, Any]]] = None,
+) -> List[Tuple[str, str]]:
+    """Resolve (cohort_id, candidate_key) pairs for an invoke_subagent call."""
+    matched_cids_list: List[str] = []
+    for regex in (SUBAGENT_SPAWN_RE, UUID_RE):
+        for m in regex.finditer(output_text or ""):
+            cid_val = m.group(1).lower()
+            if cid_val not in matched_cids_list:
+                matched_cids_list.append(cid_val)
+    matched_cids_set = set(matched_cids_list)
+
+    if pre_popped_entries:
+        results: List[Tuple[str, str]] = []
+        multi = len(pre_popped_entries) > 1
+        for idx, p in enumerate(pre_popped_entries):
+            c_id = p.get("cohort")
+            if p.get("mode") == "best_of_n" and c_id:
+                cand_key = (
+                    p.get("candidate_id")
+                    or (matched_cids_list[idx] if idx < len(matched_cids_list) else None)
+                    or p.get("call_sig")
+                    or (f"{call_id}:{idx}" if call_id and multi else call_id)
+                    or ""
+                )
+                results.append((str(c_id), str(cand_key)))
+        if results:
+            return results
+
+    subagent_results: List[Tuple[str, str]] = []
+    for sub_cid, sub_meta in (state.get("subagents") or {}).items():
+        if not isinstance(sub_meta, dict):
+            continue
+        if sub_cid.lower() in matched_cids_set or (
+            call_id and sub_meta.get("call_id") == call_id
+        ):
+            if sub_meta.get("mode") == "best_of_n" and sub_meta.get("cohort"):
+                cand_key = sub_meta.get("candidate_id") or sub_cid.lower()
+                subagent_results.append((str(sub_meta["cohort"]), str(cand_key)))
+    if subagent_results:
+        return subagent_results
+
+    if call_id:
+        pending_matches = [
+            p
+            for p in (state.get("pending_spawns") or [])
+            if isinstance(p, dict)
+            and p.get("mode") == "best_of_n"
+            and p.get("cohort")
+            and p.get("call_id") == call_id
+        ]
+    else:
+        entries, expected_specs = _extract_expected_cohort_specs(args)
+        active_pending = [
+            p
+            for p in (state.get("pending_spawns") or [])
+            if isinstance(p, dict)
+            and p.get("mode") == "best_of_n"
+            and p.get("cohort")
+            and p.get("status", "active") == "active"
+        ]
+        pending_matches = _match_pending_spawns_two_pass(
+            active_pending,
+            entries,
+            expected_specs,
+            allow_cohort_only_without_role=True,
+        )
+
+    if pending_matches:
+        multi = len(pending_matches) > 1
+        return [
+            (
+                str(p["cohort"]),
+                str(
+                    p.get("candidate_id")
+                    or (matched_cids_list[idx] if idx < len(matched_cids_list) else None)
+                    or p.get("call_sig")
+                    or (f"{call_id}:{idx}" if call_id and multi else call_id)
+                    or ""
+                ),
+            )
+            for idx, p in enumerate(pending_matches)
+        ]
+
+    entries = (
+        args["Subagents"]
+        if isinstance(args.get("Subagents"), list) and args["Subagents"]
+        else [args]
+    )
+    inv_key = _current_invocation_key(payload, state)
+    entry_results: List[Tuple[str, str]] = []
+    multi = len(entries) > 1
+    for idx, item in enumerate(entries):
+        if not isinstance(item, dict):
+            continue
+        prompt_text = str(item.get("Prompt") or "")
+        mode = _parse_mode_header(prompt_text)
+        cohort_id = _parse_cohort_header(prompt_text)
+        if cohort_id and mode is None:
+            mode = "best_of_n"
+        if mode == "best_of_n":
+            c_id = cohort_id or f"best-of-n-{inv_key}"
+            cand_key = (
+                (matched_cids_list[idx] if idx < len(matched_cids_list) else None)
+                or (f"{call_id}:{idx}" if call_id and multi else call_id)
+                or ""
+            )
+            entry_results.append((c_id, str(cand_key)))
+    return entry_results
+
+
+def _apply_cohort_invoke_outcome(
+    state: Dict[str, Any],
+    cb: Dict[str, Any],
+    cohort_candidates: List[Tuple[str, str]],
+    outcome: str,
+    error_summary: str = "",
+) -> None:
+    """Update cohort succeeded/failed tracking and trip global breaker only if 0/N (N>=2) survive."""
+    cohorts = state.setdefault("cohorts", {})
+    for cohort_id, cand_key in cohort_candidates:
+        cohort_entry = cohorts.get(cohort_id)
+        if not isinstance(cohort_entry, dict):
+            cohort_entry = {
+                "total_spawned": 0,
+                "succeeded": [],
+                "failed": [],
+                "created_at": time.time(),
+            }
+            cohorts[cohort_id] = cohort_entry
+        succeeded = cohort_entry.setdefault("succeeded", [])
+        failed = cohort_entry.setdefault("failed", [])
+        if outcome == "failed":
+            key = cand_key or f"fail:{len(failed)}"
+            if key not in succeeded and key not in failed:
+                failed.append(key)
+            total_spawned = int(cohort_entry.get("total_spawned", 0) or 0)
+            if (
+                total_spawned >= 2
+                and len(failed) >= total_spawned
+                and len(succeeded) == 0
+            ):
+                cb["failure_streak"] = max(
+                    MAX_CONSECUTIVE_FAILURES, int(cb.get("failure_streak", 0) or 0) + 1
+                )
+                cb["tripped"] = True
+                cb["last_error"] = (
+                    error_summary or "All Best-of-N cohort candidates failed"
+                )
+        else:
+            key = cand_key or f"ok:{len(succeeded)}"
+            if key not in succeeded:
+                succeeded.append(key)
+            if key in failed:
+                failed.remove(key)
+            cb["failure_streak"] = 0
+            cb["tripped"] = False
+
+
 def _propagate_receipt_to_parent_brain(
     payload: Dict[str, Any],
     dirty: bool,
@@ -330,11 +690,21 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
             state["plan_execute_user_input"] = None
             state["plan_execute_turn_finished"] = False
             state["plan_allowed_files"] = None
+            state["active_eval_cmd"] = None
 
+        failed_cohort_entries: List[Dict[str, Any]] = []
         if tool_name == "invoke_subagent" and payload.get("error"):
             pending = state.get("pending_spawns", [])
             recorded = state.get("recorded_spawn_calls", [])
             if call_id and any(p.get("call_id") == call_id for p in pending):
+                failed_cohort_entries = [
+                    dict(p)
+                    for p in pending
+                    if isinstance(p, dict)
+                    and p.get("call_id") == call_id
+                    and p.get("mode") == "best_of_n"
+                    and p.get("cohort")
+                ]
                 state["pending_spawns"] = [p for p in pending if p.get("call_id") != call_id]
                 if isinstance(recorded, list):
                     state["recorded_spawn_calls"] = [
@@ -342,14 +712,24 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                         if not (isinstance(sig, str) and call_id in sig)
                     ]
             else:
-                pop_count = (
-                    len(args["Subagents"])
-                    if isinstance(args.get("Subagents"), list) and args["Subagents"]
-                    else 1
+                entries, expected_specs = _extract_expected_cohort_specs(args)
+                matched_pops = _match_pending_spawns_two_pass(
+                    pending,
+                    entries,
+                    expected_specs,
+                    allow_tail_fallback=True,
                 )
-                for _ in range(min(pop_count, len(pending))):
-                    if pending:
-                        pending.pop()
+                if matched_pops:
+                    matched_ids = {id(p) for p in matched_pops}
+                    state["pending_spawns"] = [
+                        p for p in pending if id(p) not in matched_ids
+                    ]
+                    for popped in matched_pops:
+                        if (
+                            popped.get("mode") == "best_of_n"
+                            and popped.get("cohort")
+                        ):
+                            failed_cohort_entries.append(dict(popped))
         else:
             _sync_subagents_from_transcript(payload, state)
 
@@ -357,9 +737,13 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
         receipt = _get_test_receipt(state, payload)
         error_text = str(payload.get("error") or "").strip()
 
-        if tool_name in {"run_command", "invoke_subagent"}:
+        if tool_name in {"run_command", "invoke_subagent", "run_workflow"}:
             cmd = (args.get("CommandLine") or "").strip()
             is_test_cmd = tool_name == "run_command" and _is_test_command(cmd)
+            is_eval_cmd = tool_name == "run_command" and _is_declared_eval_command(
+                cmd, state, payload
+            )
+            is_verification_cmd = is_test_cmd or is_eval_cmd
             output_text = str(
                 payload.get("output")
                 or payload.get("result")
@@ -367,7 +751,7 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                 or tool_call.get("output")
                 or ""
             )
-            if not error_text and tool_name == "run_command":
+            if not error_text and tool_name in {"run_command", "run_workflow"}:
                 exit_code = (
                     payload.get("exitCode")
                     if payload.get("exitCode") is not None
@@ -383,26 +767,57 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                     )
                     if m_exit:
                         error_text = f"Command exited with code {m_exit.group(1)}"
+            if (
+                not error_text
+                and tool_name == "run_workflow"
+                and "Traceback (most recent call last):" in output_text
+            ):
+                error_text = "Workflow script raised an exception"
 
+            caller_mode = _current_subagent_meta(payload, state).get("mode")
             if error_text:
-                is_sandbox_err = (
-                    tool_name == "run_command"
-                    and _is_sandbox_boundary_error(payload, error_text, output_text)
+                cohort_candidates = (
+                    _collect_invoke_cohort_candidates(
+                        payload,
+                        state,
+                        args,
+                        call_id,
+                        output_text,
+                        pre_popped_entries=failed_cohort_entries,
+                    )
+                    if tool_name == "invoke_subagent"
+                    else []
                 )
-                if not is_sandbox_err:
-                    seen_failures: List[str] = cb.setdefault("seen_failures", [])
-                    dedup_id = f"{tool_name}:{call_id}:{error_text}"
-                    if not call_id or dedup_id not in seen_failures:
-                        if call_id:
-                            seen_failures.append(dedup_id)
-                        cb["failure_streak"] = cb.get("failure_streak", 0) + 1
-                        cb["last_error"] = error_text
-                        if cb["failure_streak"] >= MAX_CONSECUTIVE_FAILURES:
-                            cb["tripped"] = True
-                if is_test_cmd:
+                if cohort_candidates:
+                    _apply_cohort_invoke_outcome(
+                        state,
+                        cb,
+                        cohort_candidates,
+                        "failed",
+                        error_summary=error_text,
+                    )
+                else:
+                    is_sandbox_err = (
+                        tool_name in {"run_command", "run_workflow"}
+                        and _is_sandbox_boundary_error(payload, error_text, output_text)
+                    )
+                    if not is_sandbox_err:
+                        seen_failures: List[str] = cb.setdefault("seen_failures", [])
+                        dedup_id = f"{tool_name}:{call_id}:{error_text}"
+                        if not call_id or dedup_id not in seen_failures:
+                            if call_id:
+                                seen_failures.append(dedup_id)
+                            cb["failure_streak"] = cb.get("failure_streak", 0) + 1
+                            cb["last_error"] = error_text
+                            if cb["failure_streak"] >= MAX_CONSECUTIVE_FAILURES:
+                                cb["tripped"] = True
+                if is_verification_cmd:
                     receipt["verified"] = False
                     receipt["last_test_cmd"] = cmd
-                    if not _is_root_orchestrator(payload, state):
+                    if (
+                        not _is_root_orchestrator(payload, state)
+                        and caller_mode != "best_of_n"
+                    ):
                         _propagate_receipt_to_parent_brain(
                             payload,
                             dirty=bool(receipt.get("dirty", True)),
@@ -410,16 +825,18 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                             last_test_cmd=cmd,
                         )
             else:
-                if (
+                subagent_failed_status = bool(
                     tool_name == "invoke_subagent"
-                    or is_test_cmd
-                    or (tool_name == "run_command" and not _is_git_only_command(cmd))
-                ):
-                    cb["failure_streak"] = 0
-                    cb["tripped"] = False
+                    and re.search(
+                        r"(?m)^\s*STATUS:\s*(?:FAILED|BLOCKED)\b", output_text
+                    )
+                )
                 subagent_non_final = bool(
                     tool_name == "invoke_subagent"
-                    and re.search(r"(?m)^\s*STATUS:\s*(?:BLOCKED|FAILED|NEEDS_REPLAN|CHECKPOINT)\b", output_text)
+                    and re.search(
+                        r"(?m)^\s*STATUS:\s*(?:BLOCKED|FAILED|NEEDS_REPLAN|CHECKPOINT)\b",
+                        output_text,
+                    )
                 )
                 entries = (
                     args["Subagents"]
@@ -436,6 +853,38 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                     and re.search(r"Created the following subagents?\b", output_text)
                     and not re.search(r"(?m)^\s*STATUS:\s*COMPLETED\b", output_text)
                 )
+                cohort_candidates = (
+                    _collect_invoke_cohort_candidates(
+                        payload, state, args, call_id, output_text
+                    )
+                    if tool_name == "invoke_subagent"
+                    else []
+                )
+                if cohort_candidates and subagent_failed_status:
+                    _apply_cohort_invoke_outcome(
+                        state,
+                        cb,
+                        cohort_candidates,
+                        "failed",
+                        error_summary="Best-of-N candidate reported STATUS: FAILED/BLOCKED",
+                    )
+                elif (
+                    cohort_candidates
+                    and not subagent_non_final
+                    and not is_async_spawn_ack
+                ):
+                    _apply_cohort_invoke_outcome(
+                        state, cb, cohort_candidates, "succeeded"
+                    )
+                elif (
+                    (tool_name == "invoke_subagent" and not subagent_failed_status)
+                    or is_verification_cmd
+                    or (tool_name == "run_command" and not _is_git_only_command(cmd))
+                    or tool_name == "run_workflow"
+                ):
+                    cb["failure_streak"] = 0
+                    cb["tripped"] = False
+
                 if tool_name == "invoke_subagent" and not is_async_spawn_ack:
                     matched_cids = {
                         m.group(1).lower()
@@ -462,34 +911,34 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                             ):
                                 pending_entry["status"] = "completed"
                     else:
-                        remaining_types = [t for t in invoked_types if t]
-                        for pending_entry in pending_list:
-                            if (
-                                isinstance(pending_entry, dict)
-                                and pending_entry.get("status", "active") == "active"
-                            ):
-                                p_type = str(
-                                    pending_entry.get("type_name")
-                                    or pending_entry.get("type")
-                                    or ""
-                                ).strip().lower()
-                                if p_type in remaining_types:
-                                    pending_entry["status"] = "completed"
-                                    remaining_types.remove(p_type)
+                        _, expected_specs = _extract_expected_cohort_specs(args)
+                        matched_completions = _match_pending_spawns_two_pass(
+                            pending_list,
+                            entries,
+                            expected_specs,
+                            allow_type_fallback=True,
+                        )
+                        for chosen_entry in matched_completions:
+                            chosen_entry["status"] = "completed"
 
                 is_verification_subagent = (
                     tool_name == "invoke_subagent"
                     and not subagent_non_final
                     and not is_async_spawn_ack
+                    and not cohort_candidates
                     and any(
                         t not in READONLY_NON_VERIFICATION_TYPES for t in invoked_types
                     )
                 )
-                if is_test_cmd or (is_verification_subagent and receipt.get("dirty")):
+                if is_verification_cmd or (is_verification_subagent and receipt.get("dirty")):
                     receipt["dirty"] = False
                     receipt["verified"] = True
                     receipt["last_test_cmd"] = cmd or "invoke_subagent"
-                    if is_test_cmd and not _is_root_orchestrator(payload, state):
+                    if (
+                        is_verification_cmd
+                        and not _is_root_orchestrator(payload, state)
+                        and caller_mode != "best_of_n"
+                    ):
                         _propagate_receipt_to_parent_brain(
                             payload,
                             dirty=False,
@@ -652,6 +1101,47 @@ def _get_workspace_git_diff(payload: Dict[str, Any]) -> str:
     return ""
 
 
+def _finalize_subagent_stop_sync(
+    payload: Dict[str, Any], state: Dict[str, Any], cb_tripped: bool = False
+) -> None:
+    """Sync subagent completion and Best-of-N cohort outcome into parent brain state."""
+    cid = (payload.get("conversationId") or "").strip().lower()
+    if not cid:
+        return
+    _mark_subagent_status_in_parent_brain(payload, state, cid, "completed")
+    sub_meta = _current_subagent_meta(payload, state)
+    if sub_meta.get("mode") == "best_of_n" and sub_meta.get("cohort"):
+        last_msg = _extract_last_model_response(payload) or ""
+        status_m = re.search(r"(?m)^\s*STATUS:\s*([A-Za-z_]+)\b", last_msg)
+        report_status = status_m.group(1).upper() if status_m else ""
+        if report_status in {"FAILED", "BLOCKED"} or (
+            cb_tripped and report_status != "COMPLETED"
+        ):
+            outcome = "failed"
+            cb_root = _get_circuit_breaker(state, payload)
+            err_summary = (
+                str(cb_root.get("last_error") or "").strip()
+                or f"Subagent {cid} finished with STATUS: {report_status or 'BLOCKED'}"
+            )
+        else:
+            outcome = "succeeded"
+            err_summary = ""
+        sub_reg = (state.get("subagents") or {}).get(cid)
+        candidate_key = str(
+            sub_meta.get("candidate_id")
+            or (sub_reg.get("candidate_id") if isinstance(sub_reg, dict) else None)
+            or cid
+        )
+        _record_cohort_outcome_in_parent_brain(
+            payload,
+            state,
+            candidate_key,
+            str(sub_meta["cohort"]),
+            outcome,
+            error_summary=err_summary,
+        )
+
+
 def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
     with state_transaction(payload):
         state_path = _state_file_path(payload)
@@ -677,12 +1167,14 @@ def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
         active_branches = [
             cid
             for cid, meta in state.get("subagents", {}).items()
-            if meta.get("active_branch")
+            if isinstance(meta, dict)
+            and (meta.get("active_worktree") or meta.get("active_branch"))
         ]
         active_pending = [
             p.get("role", "implementer")
             for p in state.get("pending_spawns", [])
-            if p.get("active_branch")
+            if isinstance(p, dict)
+            and (p.get("active_worktree") or p.get("active_branch"))
         ]
 
         if active_branches or active_pending:
@@ -726,6 +1218,8 @@ def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         cb = _get_circuit_breaker(state, payload)
         if cb.get("tripped"):
+            if _is_known_subagent(payload, state):
+                _finalize_subagent_stop_sync(payload, state, cb_tripped=True)
             return {"decision": "allow"}
 
         inv_key = _current_invocation_key(payload, state)
@@ -765,9 +1259,7 @@ def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
                 }
 
         if _is_known_subagent(payload, state):
-            cid = (payload.get("conversationId") or "").strip().lower()
-            if cid:
-                _mark_subagent_status_in_parent_brain(payload, state, cid, "completed")
+            _finalize_subagent_stop_sync(payload, state, cb_tripped=False)
         elif payload.get("fullyIdle") is True and state.get("plan_execute_phase"):
             has_active_subagents = any(
                 isinstance(p, dict) and p.get("status", "active") == "active"

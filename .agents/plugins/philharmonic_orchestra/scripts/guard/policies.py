@@ -1,6 +1,7 @@
 """Tool-call policies, direct execution fast-path budget, and pre-tool validation."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,19 +13,23 @@ from guard.constants import (
     ALLOWED_FILES_HEADER_RE,
     ALLOWED_SUBAGENT_MODELS,
     ALLOWED_VERIFIER_REVIEWER_MODELS,
+    COHORT_HEADER_RE,
     DEFAULT_MODEL_BY_TYPE,
     DEFAULT_UNBOUNDED_READ_BYTES,
     DEFAULT_UNBOUNDED_READ_LINES,
     DIR_LIST_TOOLS,
+    EVAL_CMD_HEADER_RE,
     FORBIDDEN_DIRECT_READ_RE,
     GROUNDED_SPEC_SECTION_PATTERNS,
     HIGH_REASONING_READONLY_TYPES,
+    ISOLATED_WORKSPACES,
     MAX_DIRECT_COMMANDS,
     MAX_DIRECT_MUTATION_FILES,
     MAX_DIRECT_READ_BYTES,
     MAX_DIRECT_READ_FILES,
     MAX_DIRECT_READ_LINES,
     MAX_REPLAN_ATTEMPTS,
+    MODE_HEADER_RE,
     MUTATION_TOOLS,
     MUTATION_VERBS_RE,
     NUMBERED_RULE_RE,
@@ -40,6 +45,7 @@ from guard.constants import (
     SPEC_FILE_HEADER_RE,
     STAGE_HEADER_RE,
     STRICT_READONLY_SUBAGENT_TYPES,
+    TRIVIAL_EVAL_CMD_RE,
     _extract_call_id,
     _is_git_only_command,
     _is_test_command,
@@ -185,6 +191,152 @@ def _normalize_review_lens(lens: str) -> str:
     """Normalize a review lens string so spaces, hyphens, and underscores collide cleanly."""
     cleaned = re.sub(r"[\s_-]+", "-", (lens or "").strip().lower())
     return cleaned.strip("-")
+
+
+def _parse_mode_header(prompt_text: str) -> Optional[str]:
+    """Parse MODE: header from a subagent prompt, normalizing Best-of-N variants."""
+    if not prompt_text:
+        return None
+    match = MODE_HEADER_RE.search(prompt_text)
+    if not match:
+        return None
+    raw_val = match.group(1).strip().strip("`'\"")
+    if not raw_val:
+        return None
+    cleaned = re.sub(r"[\s\-]+", "_", raw_val.lower()).strip("_")
+    if cleaned in {"best_of_n", "bestofn"}:
+        return "best_of_n"
+    return cleaned or None
+
+
+def _parse_cohort_header(prompt_text: str) -> Optional[str]:
+    """Parse COHORT: header from a subagent prompt, returning None if omitted."""
+    if not prompt_text:
+        return None
+    match = COHORT_HEADER_RE.search(prompt_text)
+    if not match:
+        return None
+    raw_val = match.group(1).strip().strip("`'\"")
+    if not raw_val or raw_val.upper() == "NONE":
+        return None
+    cleaned = re.sub(r"[\s_-]+", "-", raw_val.lower()).strip("-")
+    return cleaned or None
+
+
+def _compute_prompt_hash(prompt_text: str) -> str:
+    """Return a short deterministic SHA-256 prefix for non-empty subagent prompts."""
+    if not prompt_text:
+        return ""
+    return hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:12]
+
+
+def _parse_eval_cmd_header(prompt_text: str) -> Optional[str]:
+    """Parse EVAL_CMD: header from a prompt or plan, returning None if omitted."""
+    if not prompt_text:
+        return None
+    match = EVAL_CMD_HEADER_RE.search(prompt_text)
+    if not match:
+        return None
+    raw_val = match.group(1).strip()
+    if (
+        len(raw_val) >= 2
+        and raw_val[0] == raw_val[-1]
+        and raw_val[0] in {"`", "'", '"'}
+    ):
+        raw_val = raw_val[1:-1].strip()
+    if not raw_val or raw_val.upper() == "NONE":
+        return None
+    return raw_val
+
+
+def _has_unquoted_or_operator(cmd: str) -> bool:
+    """Return True if cmd contains an unquoted shell '||' operator."""
+    in_single = False
+    in_double = False
+    escaped = False
+    i = 0
+    n = len(cmd)
+    while i < n:
+        ch = cmd[i]
+        if escaped:
+            escaped = False
+            i += 1
+            continue
+        if ch == "\\" and not in_single:
+            escaped = True
+            i += 1
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if not in_single and not in_double and cmd[i : i + 2] == "||":
+            return True
+        i += 1
+    return False
+
+
+def _is_trivial_eval_command(eval_cmd: str) -> bool:
+    """Return True if eval_cmd is empty, masks failure with '||', or runs only trivial no-ops."""
+    if not eval_cmd or not eval_cmd.strip():
+        return True
+    if _has_unquoted_or_operator(eval_cmd):
+        return True
+    parts = _split_shell_commands(eval_cmd)
+    if not parts:
+        return True
+    return all(bool(TRIVIAL_EVAL_CMD_RE.match(part)) for part in parts)
+
+
+def _strip_leading_env_assignments(cmd: str) -> str:
+    return re.sub(r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)+", "", cmd).strip()
+
+
+def _is_declared_eval_command(
+    cmd: str, state: Dict[str, Any], payload: Dict[str, Any]
+) -> bool:
+    """Return True if cmd invokes a non-trivial declared EVAL_CMD without shell-chaining bypasses."""
+    if not cmd or "$(" in cmd or "`" in cmd or _has_unquoted_or_operator(cmd):
+        return False
+
+    declared_raw: List[str] = []
+    cid = (payload.get("conversationId") or "").strip().lower()
+    sub_entry = (state.get("subagents") or {}).get(cid)
+    if isinstance(sub_entry, dict) and sub_entry.get("eval_cmd"):
+        declared_raw.append(str(sub_entry["eval_cmd"]))
+    self_meta = state.get("self_subagent_meta")
+    if isinstance(self_meta, dict) and self_meta.get("eval_cmd"):
+        declared_raw.append(str(self_meta["eval_cmd"]))
+    if state.get("active_eval_cmd"):
+        declared_raw.append(str(state["active_eval_cmd"]))
+    for cohort_entry in (state.get("cohorts") or {}).values():
+        if isinstance(cohort_entry, dict) and cohort_entry.get("eval_cmd"):
+            declared_raw.append(str(cohort_entry["eval_cmd"]))
+
+    declared = [
+        _strip_leading_env_assignments(d)
+        for d in declared_raw
+        if isinstance(d, str) and d.strip()
+    ]
+    declared = [d for d in declared if d and not _is_trivial_eval_command(d)]
+    if not declared:
+        return False
+
+    sub_cmds = _split_shell_commands(cmd)
+    if not sub_cmds:
+        return False
+    for sc in sub_cmds:
+        stripped = _strip_leading_env_assignments(sc)
+        if not stripped or _is_trivial_eval_command(stripped):
+            continue
+        for decl in declared:
+            if stripped == decl or stripped.startswith(decl + " "):
+                return True
+    return False
 
 
 def _normalize_allowlist_entry(entry: str) -> Optional[Path]:
@@ -369,6 +521,7 @@ def _validate_and_prepare_subagent_entry(
     state: Optional[Dict[str, Any]] = None,
     batch_entries: Optional[List[Dict[str, Any]]] = None,
     exclude_call_sigs: Optional[Set[str]] = None,
+    inv_key: str = "0",
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[str]]:
     """Validate a single subagent spec and return (denial, spawn_record, target_model)."""
     type_name = (entry.get("TypeName") or "").strip()
@@ -393,11 +546,51 @@ def _validate_and_prepare_subagent_entry(
             None,
         )
 
+    mode = _parse_mode_header(prompt_text)
+    cohort_id = _parse_cohort_header(prompt_text)
+    if cohort_id and mode is None:
+        mode = "best_of_n"
+    if mode == "best_of_n" and not cohort_id:
+        cohort_id = f"best-of-n-{inv_key}"
+
+    eval_cmd = _parse_eval_cmd_header(prompt_text)
+    if eval_cmd is not None and _is_trivial_eval_command(eval_cmd):
+        return (
+            {
+                "decision": "deny",
+                "reason": (
+                    f"[ORCHESTRATOR GUARD] Trivial or no-op EVAL_CMD rejected: '{eval_cmd}'. "
+                    "Provide a real test or evaluation script command."
+                ),
+            },
+            None,
+            None,
+        )
+
     raw_model = (entry.get("Model") or "").strip()
     role_label = (entry.get("Role") or type_name or "subagent").strip()
+    workspace_mode = (entry.get("Workspace") or "inherit").strip()
+
+    if mode == "best_of_n" and workspace_mode.lower() not in ISOLATED_WORKSPACES:
+        return (
+            {
+                "decision": "deny",
+                "reason": (
+                    f"[ORCHESTRATOR GUARD] MODE: BEST_OF_N requires isolated Workspace='branch' or "
+                    f"Workspace='share' for candidate '{role_label}' (got '{workspace_mode}')."
+                ),
+            },
+            None,
+            None,
+        )
 
     if norm_type in HIGH_REASONING_READONLY_TYPES:
         if raw_model in ALLOWED_VERIFIER_REVIEWER_MODELS:
+            target_model = raw_model
+        else:
+            target_model = DEFAULT_MODEL_BY_TYPE.get(norm_type, "flash")
+    elif mode == "best_of_n":
+        if raw_model in {"pro", "flash"}:
             target_model = raw_model
         else:
             target_model = DEFAULT_MODEL_BY_TYPE.get(norm_type, "flash")
@@ -423,7 +616,6 @@ def _validate_and_prepare_subagent_entry(
         if target_model == "flash" and _is_simple_readonly_task(norm_type, prompt_text):
             target_model = "flash_lite"
 
-    workspace_mode = (entry.get("Workspace") or "inherit").strip()
     allowed_files = _parse_allowed_files_header(prompt_text)
 
     normalized_lens: Optional[str] = None
@@ -514,7 +706,8 @@ def _validate_and_prepare_subagent_entry(
         "type_name": type_name,
         "model": target_model,
         "workspace": workspace_mode,
-        "active_branch": workspace_mode == "branch",
+        "active_branch": workspace_mode.lower() == "branch",
+        "active_worktree": workspace_mode.lower() in ISOLATED_WORKSPACES,
         "status": "active",
         "spawned_mutation_epoch": mutation_epoch,
     }
@@ -522,6 +715,15 @@ def _validate_and_prepare_subagent_entry(
         spawn_record["review_lens"] = normalized_lens
     if allowed_files is not None:
         spawn_record["allowed_files"] = allowed_files
+    if mode is not None:
+        spawn_record["mode"] = mode
+    if cohort_id is not None:
+        spawn_record["cohort"] = cohort_id
+    if eval_cmd is not None:
+        spawn_record["eval_cmd"] = eval_cmd
+    prompt_hash = _compute_prompt_hash(prompt_text)
+    if prompt_hash:
+        spawn_record["prompt_hash"] = prompt_hash
 
     replan_if_match = REPLAN_IF_HEADER_RE.search(prompt_text)
     if replan_if_match:
@@ -570,9 +772,10 @@ def _handle_invoke_subagent(
         t_name = (item.get("TypeName") or "").strip()
         r_label = (item.get("Role") or t_name or "subagent").strip()
         ws_mode = (item.get("Workspace") or "inherit").strip()
+        p_hash = _compute_prompt_hash(str(item.get("Prompt") or ""))
         entry_call_sigs.append(
             json.dumps(
-                [caller_cid, inv_key, exec_num, sig_call_id, t_name, r_label, ws_mode],
+                [caller_cid, inv_key, exec_num, sig_call_id, t_name, r_label, ws_mode, p_hash],
                 sort_keys=True,
             )
         )
@@ -588,6 +791,7 @@ def _handle_invoke_subagent(
             state=state,
             batch_entries=batch_entries,
             exclude_call_sigs=existing_retry_sigs,
+            inv_key=inv_key,
         )
         if denial is not None or spawn_record is None or target_model is None:
             return denial or {
@@ -618,7 +822,29 @@ def _handle_invoke_subagent(
 
         if call_sig not in recorded_calls:
             recorded_calls.append(call_sig)
+            if spawn_record.get("mode") == "best_of_n" and spawn_record.get("cohort"):
+                c_id = spawn_record["cohort"]
+                cohorts = state.setdefault("cohorts", {})
+                cohort_entry = cohorts.setdefault(
+                    c_id,
+                    {
+                        "total_spawned": 0,
+                        "succeeded": [],
+                        "failed": [],
+                        "created_at": time.time(),
+                    },
+                )
+                cohort_entry["total_spawned"] = (
+                    int(cohort_entry.get("total_spawned", 0) or 0) + 1
+                )
+                spawn_record["candidate_id"] = (
+                    f"{c_id}#{cohort_entry['total_spawned']}"
+                )
+                if spawn_record.get("eval_cmd"):
+                    cohort_entry["eval_cmd"] = spawn_record["eval_cmd"]
             state.setdefault("pending_spawns", []).append(spawn_record)
+            if spawn_record.get("eval_cmd"):
+                state["active_eval_cmd"] = spawn_record["eval_cmd"]
             state_changed = True
         new_item = dict(item)
         if item.get("Model") != target_model:
@@ -833,10 +1059,12 @@ def _handle_manage_subagents(
         for meta in subagents.values():
             if isinstance(meta, dict):
                 meta["active_branch"] = False
+                meta["active_worktree"] = False
                 meta["status"] = "killed"
         for pending in state.get("pending_spawns", []):
             if isinstance(pending, dict):
                 pending["active_branch"] = False
+                pending["active_worktree"] = False
                 pending["status"] = "killed"
         state["pending_spawns"] = []
         _save_state(payload, state)
@@ -853,12 +1081,14 @@ def _handle_manage_subagents(
         for cid in target_ids:
             if cid in subagents and isinstance(subagents[cid], dict):
                 subagents[cid]["active_branch"] = False
+                subagents[cid]["active_worktree"] = False
                 subagents[cid]["status"] = "killed"
         remaining_pending = []
         killed_left = len(target_ids)
         for pending in state.get("pending_spawns", []):
-            if pending.get("active_branch") and killed_left > 0:
+            if (pending.get("active_worktree") or pending.get("active_branch")) and killed_left > 0:
                 pending["active_branch"] = False
+                pending["active_worktree"] = False
                 killed_left -= 1
             remaining_pending.append(pending)
         state["pending_spawns"] = remaining_pending
@@ -1190,7 +1420,9 @@ def _check_and_record_direct_budget(
             return None
 
         mutated_files = budget.get("mutated_files", [])
-        is_test = _is_test_command(cmd)
+        is_test = _is_test_command(cmd) or _is_declared_eval_command(
+            cmd, state, payload
+        )
         if mutated_files and is_test:
             if budget.get("test_runs_after_edit", 0) >= 1:
                 return {
@@ -1232,6 +1464,7 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         from guard.verification import (
             _check_test_tampering_in_edit,
+            _current_subagent_meta,
             _get_circuit_breaker,
             _get_test_receipt,
             _is_code_file,
@@ -1243,6 +1476,16 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
         args = tool_call.get("args", {}) or {}
 
         if tool_name == "exit_plan_mode" and _is_root_orchestrator(payload, state):
+            plan_text = str(args.get("plan") or args.get("Plan") or "")
+            plan_eval = _parse_eval_cmd_header(plan_text)
+            if plan_eval is not None and _is_trivial_eval_command(plan_eval):
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"[ORCHESTRATOR GUARD] Trivial or no-op EVAL_CMD rejected in plan: '{plan_eval}'. "
+                        "Provide a real test or evaluation script command."
+                    ),
+                }
             state["active"] = True
             state["session_evaluated"] = True
             state["plan_execute_phase"] = True
@@ -1251,8 +1494,8 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                 str(payload.get("lastUserInput") or "").strip() or None
             )
             state["plan_execute_turn_finished"] = False
-            plan_text = str(args.get("plan") or args.get("Plan") or "")
             state["plan_allowed_files"] = _parse_allowed_files_header(plan_text)
+            state["active_eval_cmd"] = plan_eval
             _save_state(payload, state)
             return {"decision": "allow"}
 
@@ -1262,6 +1505,7 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
             state["plan_execute_user_input"] = None
             state["plan_execute_turn_finished"] = False
             state["plan_allowed_files"] = None
+            state["active_eval_cmd"] = None
             _save_state(payload, state)
             return {"decision": "allow"}
 
@@ -1302,7 +1546,7 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                             "and report STATUS: BLOCKED."
                         ),
                     }
-            elif tool_name in {"invoke_subagent", "send_message"}:
+            elif tool_name in {"invoke_subagent", "send_message", "run_workflow"}:
                 if tool_name == "send_message" and not _is_root_orchestrator(payload, state):
                     msg_text = str(args.get("Message") or "")
                     if re.search(r"(?m)^\s*STATUS:\s*(?:BLOCKED|FAILED|NEEDS_REPLAN)\b", msg_text):
@@ -1335,6 +1579,11 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                     elif tool_name == "send_message":
                         replan_found = bool(
                             REPLAN_HEADER_RE.search(str(args.get("Message") or ""))
+                        )
+                    elif tool_name == "run_workflow":
+                        replan_found = bool(
+                            REPLAN_HEADER_RE.search(str(args.get("Description") or ""))
+                            or REPLAN_HEADER_RE.search(str(args.get("Script") or ""))
                         )
 
                     replan_count = cb.get("replan_count", 0)
@@ -1541,6 +1790,32 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                 }
             return {"decision": "ask"}
 
+        if tool_name == "run_workflow":
+            cwd = args.get("Cwd")
+            if cwd and not _is_within_allowed_roots(str(cwd), roots):
+                return {"decision": "ask"}
+            script_path = args.get("ScriptPath")
+            if script_path and not _is_within_allowed_roots(str(script_path), roots):
+                return {"decision": "ask"}
+            eval_cmd = _parse_eval_cmd_header(str(args.get("Description") or ""))
+            if eval_cmd is None and args.get("Script"):
+                uncommented_script = re.sub(
+                    r"(?m)^[ \t]*#+[ \t]*", "", str(args.get("Script") or "")
+                )
+                eval_cmd = _parse_eval_cmd_header(uncommented_script)
+            if eval_cmd is not None and _is_trivial_eval_command(eval_cmd):
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"[ORCHESTRATOR GUARD] Trivial or no-op EVAL_CMD rejected in run_workflow: '{eval_cmd}'. "
+                        "Provide a real test or evaluation script command."
+                    ),
+                }
+            if eval_cmd:
+                state["active_eval_cmd"] = eval_cmd
+                _save_state(payload, state)
+            return {"decision": "allow"}
+
         target_path = _extract_any_path_arg(tool_name, args)
         if target_path is not None:
             if _is_within_allowed_roots(target_path, roots):
@@ -1564,7 +1839,11 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                         except OSError:
                             receipt["last_mutated_file"] = target_path
                         _save_state(payload, state)
-                        if not _is_root_orchestrator(payload, state):
+                        if (
+                            not _is_root_orchestrator(payload, state)
+                            and _current_subagent_meta(payload, state).get("mode")
+                            != "best_of_n"
+                        ):
                             _propagate_receipt_to_parent_brain(
                                 payload,
                                 dirty=True,

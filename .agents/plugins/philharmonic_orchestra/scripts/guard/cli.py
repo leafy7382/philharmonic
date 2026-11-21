@@ -51,6 +51,8 @@ def _cli_status(payload: Dict[str, Any]) -> Dict[str, Any]:
         "currentInvocation": inv_key,
         "activeSubagents": subagents_summary,
         "pendingSpawns": state.get("pending_spawns", []),
+        "cohorts": state.get("cohorts", {}),
+        "activeEvalCmd": state.get("active_eval_cmd"),
         "directBudget": state.get("direct_budget", {}).get(inv_key, {}),
         "testReceipt": receipt,
         "circuitBreaker": _get_circuit_breaker(state, payload),
