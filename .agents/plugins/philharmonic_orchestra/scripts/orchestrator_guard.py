@@ -10,16 +10,20 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
-import guard as _guard_pkg
-from guard import __all__ as _guard_all, main
+if __name__ != "__main__":
+    import guard as _guard_pkg
+    from guard import __all__ as _guard_all, main
 
-for _sym in _guard_all:
-    globals()[_sym] = getattr(_guard_pkg, _sym)
+    for _sym in _guard_all:
+        globals()[_sym] = getattr(_guard_pkg, _sym)
 
 
 def _safe_entrypoint() -> None:
     try:
-        main()
+        main_fn = globals().get("main")
+        if main_fn is None:
+            from guard import main as main_fn
+        main_fn()
     except Exception as exc:
         mode = sys.argv[1].lower() if len(sys.argv) > 1 else "pre-tool"
         if mode in ("pre-tool", "stop"):

@@ -16,14 +16,17 @@ from guard.constants import (
     MAX_REPORT_BULLET_LINES,
     MAX_SUBAGENT_REPORT_CHARS,
     PROJECT_ROOT,
+    READONLY_NON_VERIFICATION_TYPES,
     REPORT_BULLET_RE,
     REPORT_LINE_PATTERNS,
     REPORT_LOG_URI_RE,
     SCOUT_COMPACT_LINE_PATTERNS,
+    SUBAGENT_SPAWN_RE,
     TAMPER_SKIP_RE,
     TEST_DEF_RE,
     TEST_FILE_RE,
     TRIVIAL_ASSERT_RE,
+    UUID_RE,
     _extract_call_id,
     _is_git_only_command,
     _is_sandbox_boundary_error,
@@ -35,6 +38,7 @@ from guard.identity import (
     _is_known_subagent,
     _is_root_orchestrator,
     _is_scout_subagent,
+    _mark_subagent_status_in_parent_brain,
     _sync_subagents_from_transcript,
     _workspaces_compatible,
 )
@@ -240,6 +244,7 @@ def _get_test_receipt(
 ) -> Dict[str, Any]:
     receipt_root = state.setdefault("test_receipt", {})
     if "dirty" not in receipt_root:
+        prev_epoch = receipt_root.get("mutation_epoch", 0)
         receipt_root.clear()
         receipt_root.update(
             {
@@ -247,8 +252,10 @@ def _get_test_receipt(
                 "verified": False,
                 "last_mutated_file": "",
                 "last_test_cmd": "",
+                "mutation_epoch": prev_epoch,
             }
         )
+    receipt_root.setdefault("mutation_epoch", 0)
     return receipt_root
 
 
@@ -293,6 +300,10 @@ def _propagate_receipt_to_parent_brain(
                     parent_receipt = _get_test_receipt(sib_data)
                     parent_receipt["dirty"] = dirty
                     parent_receipt["verified"] = verified
+                    if dirty:
+                        parent_receipt["mutation_epoch"] = (
+                            parent_receipt.get("mutation_epoch", 0) + 1
+                        )
                     if last_mutated_file is not None:
                         parent_receipt["last_mutated_file"] = last_mutated_file
                     if last_test_cmd is not None:
@@ -315,6 +326,9 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         if tool_name == "exit_plan_mode" and payload.get("error"):
             state["plan_execute_phase"] = False
+            state["plan_execute_consumed"] = False
+            state["plan_execute_user_input"] = None
+            state["plan_execute_turn_finished"] = False
             state["plan_allowed_files"] = None
 
         if tool_name == "invoke_subagent" and payload.get("error"):
@@ -422,12 +436,53 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                     and re.search(r"Created the following subagents?\b", output_text)
                     and not re.search(r"(?m)^\s*STATUS:\s*COMPLETED\b", output_text)
                 )
+                if tool_name == "invoke_subagent" and not is_async_spawn_ack:
+                    matched_cids = {
+                        m.group(1).lower()
+                        for m in SUBAGENT_SPAWN_RE.finditer(output_text)
+                    } | {
+                        m.group(1).lower()
+                        for m in UUID_RE.finditer(output_text)
+                    }
+                    for sub_cid, sub_meta in (state.get("subagents") or {}).items():
+                        if not isinstance(sub_meta, dict):
+                            continue
+                        if sub_cid.lower() in matched_cids or (
+                            call_id and sub_meta.get("call_id") == call_id
+                        ):
+                            sub_meta["status"] = "completed"
+
+                    pending_list = state.get("pending_spawns") or []
+                    if call_id:
+                        for pending_entry in pending_list:
+                            if (
+                                isinstance(pending_entry, dict)
+                                and pending_entry.get("status", "active") == "active"
+                                and pending_entry.get("call_id") == call_id
+                            ):
+                                pending_entry["status"] = "completed"
+                    else:
+                        remaining_types = [t for t in invoked_types if t]
+                        for pending_entry in pending_list:
+                            if (
+                                isinstance(pending_entry, dict)
+                                and pending_entry.get("status", "active") == "active"
+                            ):
+                                p_type = str(
+                                    pending_entry.get("type_name")
+                                    or pending_entry.get("type")
+                                    or ""
+                                ).strip().lower()
+                                if p_type in remaining_types:
+                                    pending_entry["status"] = "completed"
+                                    remaining_types.remove(p_type)
+
                 is_verification_subagent = (
                     tool_name == "invoke_subagent"
                     and not subagent_non_final
                     and not is_async_spawn_ack
                     and any(
-                        t not in {"scout", "research", "researcher"} for t in invoked_types
+                        t not in READONLY_NON_VERIFICATION_TYPES for t in invoked_types
                     )
                 )
                 if is_test_cmd or (is_verification_subagent and receipt.get("dirty")):
@@ -708,5 +763,21 @@ def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
                         "recorded in PostToolUse. Run the test suite to verify changes before finishing."
                     ),
                 }
+
+        if _is_known_subagent(payload, state):
+            cid = (payload.get("conversationId") or "").strip().lower()
+            if cid:
+                _mark_subagent_status_in_parent_brain(payload, state, cid, "completed")
+        elif payload.get("fullyIdle") is True and state.get("plan_execute_phase"):
+            has_active_subagents = any(
+                isinstance(p, dict) and p.get("status", "active") == "active"
+                for p in (state.get("pending_spawns") or [])
+            ) or any(
+                isinstance(s, dict) and s.get("status") == "active"
+                for s in (state.get("subagents") or {}).values()
+            )
+            if not has_active_subagents:
+                state["plan_execute_turn_finished"] = True
+                _save_state(payload, state)
 
         return {"decision": "allow"}

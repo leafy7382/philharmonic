@@ -13,6 +13,7 @@ from guard.constants import (
     PENDING_SPAWN_TTL_SECONDS,
     PROJECT_ROOT,
     SLASH_COMMAND_RE,
+    STRICT_READONLY_SUBAGENT_TYPES,
     SUBAGENT_SPAWN_RE,
     UUID_RE,
 )
@@ -257,12 +258,14 @@ def _is_known_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
                                             claimed = _normalize_subagent_meta(
                                                 fresh_pending.pop(0)
                                             )
+                                            claimed.setdefault("status", "active")
                                             claimed["parent_conversation_id"] = parent_cid
                                             fresh_sib_data["pending_spawns"] = fresh_pending
                                             fresh_sib_data.setdefault("subagents", {})[cid] = claimed
                                             _save_state(sibling_state_path, fresh_sib_data)
                                         else:
                                             claimed = _normalize_subagent_meta(fresh_pending[0])
+                                            claimed.setdefault("status", "active")
                                             claimed["parent_conversation_id"] = parent_cid
                                         state["self_subagent_meta"] = claimed
                                         _save_state(payload, state)
@@ -346,6 +349,9 @@ def _sync_subagents_from_transcript(
                     continue
                 if pending:
                     spawn_meta = pending.pop(0)
+                    if isinstance(spawn_meta, dict):
+                        spawn_meta = _normalize_subagent_meta(spawn_meta)
+                        spawn_meta.setdefault("status", "active")
                     subagents[cid] = spawn_meta
                     changed = True
     except OSError:
@@ -434,16 +440,31 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
 
             user_input = str(payload.get("lastUserInput") or "")
             if state.get("plan_execute_phase"):
-                if "[plan review]" in user_input.lower() or (
-                    bool(user_input.strip()) and state.get("plan_execute_consumed")
-                ):
+                norm_input = user_input.strip()
+                should_reset = (
+                    "[plan review]" in user_input.lower()
+                    or (bool(norm_input) and bool(state.get("plan_execute_turn_finished")))
+                    or (
+                        bool(norm_input)
+                        and bool(state.get("plan_execute_consumed"))
+                        and state.get("plan_execute_user_input") is not None
+                        and norm_input != state.get("plan_execute_user_input")
+                    )
+                )
+                if should_reset:
                     state["plan_execute_phase"] = False
                     state["plan_execute_consumed"] = False
+                    state["plan_execute_user_input"] = None
+                    state["plan_execute_turn_finished"] = False
                     state["plan_allowed_files"] = None
                     changed = True
                 else:
-                    state["plan_execute_consumed"] = True
-                    changed = True
+                    if not state.get("plan_execute_consumed"):
+                        state["plan_execute_consumed"] = True
+                        changed = True
+                    if norm_input and not state.get("plan_execute_user_input"):
+                        state["plan_execute_user_input"] = norm_input
+                        changed = True
 
             wps = [
                 str(Path(wp).resolve())
@@ -543,6 +564,72 @@ def _is_scout_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
     return _get_subagent_type(payload, state) == "scout"
 
 
+def _is_strict_readonly_subagent(payload: Dict[str, Any], state: Dict[str, Any]) -> bool:
+    """Return True if the active caller is a strictly read-only subagent (scout, verifier, reviewer)."""
+    return _get_subagent_type(payload, state) in STRICT_READONLY_SUBAGENT_TYPES
+
+
+def _mark_subagent_status_in_parent_brain(
+    payload: Dict[str, Any],
+    state: Dict[str, Any],
+    child_cid: str,
+    status: str,
+) -> None:
+    """Update a subagent's status in its own state and parent brain state if present."""
+    norm_cid = (child_cid or "").strip().lower()
+    if not norm_cid:
+        return
+    local_changed = False
+    subagents = state.get("subagents")
+    if (
+        isinstance(subagents, dict)
+        and norm_cid in subagents
+        and isinstance(subagents[norm_cid], dict)
+        and subagents[norm_cid].get("status") != status
+    ):
+        subagents[norm_cid]["status"] = status
+        local_changed = True
+    self_meta = state.get("self_subagent_meta")
+    if isinstance(self_meta, dict) and self_meta.get("status") != status:
+        self_meta["status"] = status
+        local_changed = True
+    if local_changed:
+        _save_state(payload, state)
+
+    artifact_dir = payload.get("artifactDirectoryPath")
+    if not artifact_dir:
+        return
+    try:
+        resolved_art = Path(artifact_dir).resolve()
+        if resolved_art.parent.name != "brain":
+            return
+        meta = state.get("self_subagent_meta") or {}
+        parent_cid = str(meta.get("parent_conversation_id") or "").strip().lower()
+        for sibling_state_path in resolved_art.parent.glob("*/orchestrator_state.json"):
+            if sibling_state_path.parent == resolved_art:
+                continue
+            with state_transaction(sibling_state_path):
+                sib_data = _load_state(sibling_state_path)
+                sib_subagents = sib_data.get("subagents") or {}
+                root_cid = str(sib_data.get("root_conversation_id") or "").strip().lower()
+                dir_name = sibling_state_path.parent.name.lower()
+                matches_subagent = norm_cid in sib_subagents
+                matches_parent = bool(
+                    parent_cid and (root_cid == parent_cid or dir_name == parent_cid)
+                )
+                if (
+                    (matches_subagent or matches_parent)
+                    and _workspaces_compatible(payload, sib_data)
+                    and norm_cid in sib_subagents
+                    and isinstance(sib_subagents[norm_cid], dict)
+                    and sib_subagents[norm_cid].get("status") != status
+                ):
+                    sib_subagents[norm_cid]["status"] = status
+                    _save_state(sibling_state_path, sib_data)
+    except OSError:
+        pass
+
+
 def _is_root_orchestrator(
     payload: Dict[str, Any], state: Optional[Dict[str, Any]] = None
 ) -> bool:
@@ -560,6 +647,9 @@ def register_subagent(
     workspace: str = "inherit",
     role: str = "",
     allowed_files: Optional[List[str]] = None,
+    status: Optional[str] = None,
+    spawned_mutation_epoch: Optional[int] = None,
+    review_lens: Optional[str] = None,
 ) -> None:
     """Helper for explicitly registering a subagent conversationId -> tier mapping."""
     with state_transaction(payload):
@@ -574,5 +664,11 @@ def register_subagent(
         }
         if allowed_files is not None:
             record["allowed_files"] = list(allowed_files)
+        if status is not None:
+            record["status"] = status
+        if spawned_mutation_epoch is not None:
+            record["spawned_mutation_epoch"] = spawned_mutation_epoch
+        if review_lens is not None:
+            record["review_lens"] = review_lens
         state.setdefault("subagents", {})[cid] = _normalize_subagent_meta(record)
         _save_state(payload, state)

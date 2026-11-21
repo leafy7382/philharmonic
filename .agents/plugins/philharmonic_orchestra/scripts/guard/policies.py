@@ -6,17 +6,19 @@ import os
 from pathlib import Path
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from guard.constants import (
     ALLOWED_FILES_HEADER_RE,
     ALLOWED_SUBAGENT_MODELS,
+    ALLOWED_VERIFIER_REVIEWER_MODELS,
     DEFAULT_MODEL_BY_TYPE,
     DEFAULT_UNBOUNDED_READ_BYTES,
     DEFAULT_UNBOUNDED_READ_LINES,
     DIR_LIST_TOOLS,
     FORBIDDEN_DIRECT_READ_RE,
     GROUNDED_SPEC_SECTION_PATTERNS,
+    HIGH_REASONING_READONLY_TYPES,
     MAX_DIRECT_COMMANDS,
     MAX_DIRECT_MUTATION_FILES,
     MAX_DIRECT_READ_BYTES,
@@ -27,14 +29,17 @@ from guard.constants import (
     MUTATION_VERBS_RE,
     NUMBERED_RULE_RE,
     PATH_ARG_KEYS,
+    PENDING_SPAWN_TTL_SECONDS,
     PROJECT_ROOT,
     READ_TOOLS,
     REPLAN_HEADER_RE,
     REPLAN_IF_HEADER_RE,
+    REVIEW_LENS_HEADER_RE,
     SAFE_GIT_INSPECTION_RE,
     SEARCH_TOOLS,
     SPEC_FILE_HEADER_RE,
     STAGE_HEADER_RE,
+    STRICT_READONLY_SUBAGENT_TYPES,
     _extract_call_id,
     _is_git_only_command,
     _is_test_command,
@@ -44,10 +49,12 @@ from guard.identity import (
     _allowed_roots,
     _command_stays_in_workspace,
     _ensure_session_active,
+    _get_subagent_type,
     _is_known_subagent,
     _is_research_subagent,
     _is_root_orchestrator,
     _is_scout_subagent,
+    _is_strict_readonly_subagent,
     _is_within_allowed_roots,
     _normalize_subagent_meta,
     _sync_subagents_from_transcript,
@@ -164,6 +171,119 @@ def _is_target_in_allowed_files(
     return False
 
 
+def _parse_review_lens_header(prompt_text: str) -> Optional[str]:
+    """Parse REVIEW_LENS: header from a subagent prompt, returning None if omitted."""
+    if not prompt_text:
+        return None
+    match = REVIEW_LENS_HEADER_RE.search(prompt_text)
+    if not match:
+        return None
+    return match.group(1).strip().strip("`'\"")
+
+
+def _normalize_review_lens(lens: str) -> str:
+    """Normalize a review lens string so spaces, hyphens, and underscores collide cleanly."""
+    cleaned = re.sub(r"[\s_-]+", "-", (lens or "").strip().lower())
+    return cleaned.strip("-")
+
+
+def _normalize_allowlist_entry(entry: str) -> Optional[Path]:
+    """Normalize an ALLOWED_FILES entry relative to PROJECT_ROOT, stripping glob tails."""
+    cleaned = str(entry or "").strip().strip("`'\"")
+    if not cleaned or cleaned.upper() == "NONE":
+        return None
+    cleaned = cleaned.replace("\\", "/")
+    while cleaned.endswith("/**") or cleaned.endswith("/*"):
+        if cleaned.endswith("/**"):
+            cleaned = cleaned[:-3]
+        elif cleaned.endswith("/*"):
+            cleaned = cleaned[:-2]
+    if len(cleaned) > 1:
+        cleaned = cleaned.rstrip("/")
+    if not cleaned:
+        return None
+    try:
+        raw_path = Path(os.path.expanduser(cleaned))
+        return (
+            raw_path if raw_path.is_absolute() else (PROJECT_ROOT / raw_path)
+        ).resolve()
+    except OSError:
+        return None
+
+
+def _find_allowed_files_overlap(
+    files_a: List[str], files_b: List[str]
+) -> Optional[Tuple[str, str]]:
+    """Return the first conflicting pair (entry_a, entry_b) if two allowlists overlap."""
+    if not files_a or not files_b:
+        return None
+    norm_a: List[Tuple[str, Path]] = []
+    for item in files_a:
+        p = _normalize_allowlist_entry(item)
+        if p is not None:
+            norm_a.append((item, p))
+    norm_b: List[Tuple[str, Path]] = []
+    for item in files_b:
+        p = _normalize_allowlist_entry(item)
+        if p is not None:
+            norm_b.append((item, p))
+    for raw_a, path_a in norm_a:
+        for raw_b, path_b in norm_b:
+            if path_a == path_b:
+                return (raw_a, raw_b)
+            try:
+                path_a.relative_to(path_b)
+                return (raw_a, raw_b)
+            except ValueError:
+                pass
+            try:
+                path_b.relative_to(path_a)
+                return (raw_a, raw_b)
+            except ValueError:
+                pass
+    return None
+
+
+def _iter_active_subagents(
+    state: Dict[str, Any],
+    batch_entries: Optional[List[Dict[str, Any]]] = None,
+    exclude_cid: Optional[str] = None,
+    exclude_call_sigs: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Collect active worker records from batch_entries, non-expired pending_spawns, and active subagents."""
+    active: List[Dict[str, Any]] = []
+    for entry in batch_entries or []:
+        if isinstance(entry, dict):
+            active.append(entry)
+
+    now = time.time()
+    for pending in (state.get("pending_spawns") or []):
+        if not isinstance(pending, dict):
+            continue
+        if exclude_call_sigs and pending.get("call_sig") in exclude_call_sigs:
+            continue
+        if pending.get("status", "active") != "active":
+            continue
+        spawned_at = pending.get("spawned_at")
+        if spawned_at is not None:
+            try:
+                if (now - float(spawned_at)) > PENDING_SPAWN_TTL_SECONDS:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        active.append(pending)
+
+    norm_exclude = (exclude_cid or "").strip().lower()
+    for cid, entry in (state.get("subagents") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        if norm_exclude and str(cid).strip().lower() == norm_exclude:
+            continue
+        if entry.get("status") == "active":
+            active.append(entry)
+    return active
+
+
 def _handle_define_subagent(args: Dict[str, Any]) -> Dict[str, Any]:
     overwrite: Dict[str, Any] = {}
     if args.get("EnableSubagentTools") is True:
@@ -171,12 +291,12 @@ def _handle_define_subagent(args: Dict[str, Any]) -> Dict[str, Any]:
     if args.get("enable_subagent_tools") is True:
         overwrite["enable_subagent_tools"] = False
     sub_name = str(args.get("Name") or args.get("name") or "").strip().lower()
-    if sub_name == "scout":
+    if sub_name in STRICT_READONLY_SUBAGENT_TYPES:
         if args.get("EnableWriteTools") is True:
             overwrite["EnableWriteTools"] = False
         if args.get("enable_write_tools") is True:
             overwrite["enable_write_tools"] = False
-    if sub_name in {"scout", "implementer"}:
+    if sub_name in {"scout", "implementer", "verifier", "reviewer"}:
         if args.get("EnableMCPTools") is True:
             overwrite["EnableMCPTools"] = False
         if args.get("enable_mcp_tools") is True:
@@ -191,7 +311,10 @@ def _handle_define_subagent(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def _is_simple_readonly_task(type_name: str, prompt_text: str) -> bool:
     """Return True if a read-only subagent prompt has <= 3 rules and no mutation verbs."""
-    if type_name not in {"scout", "research", "researcher"}:
+    norm_type = (type_name or "").strip().lower()
+    if norm_type in HIGH_REASONING_READONLY_TYPES:
+        return False
+    if norm_type not in {"scout", "research", "researcher"}:
         return False
     rule_count = len(NUMBERED_RULE_RE.findall(prompt_text))
     cleaned_prompt = re.sub(
@@ -243,9 +366,13 @@ def _validate_spec_file_header(
 
 def _validate_and_prepare_subagent_entry(
     entry: Dict[str, Any],
+    state: Optional[Dict[str, Any]] = None,
+    batch_entries: Optional[List[Dict[str, Any]]] = None,
+    exclude_call_sigs: Optional[Set[str]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[str]]:
     """Validate a single subagent spec and return (denial, spawn_record, target_model)."""
     type_name = (entry.get("TypeName") or "").strip()
+    norm_type = type_name.lower()
     prompt_text = entry.get("Prompt") or ""
     if not type_name:
         return (
@@ -266,30 +393,121 @@ def _validate_and_prepare_subagent_entry(
             None,
         )
 
-    requested_model = (entry.get("Model") or "inherit").strip()
+    raw_model = (entry.get("Model") or "").strip()
     role_label = (entry.get("Role") or type_name or "subagent").strip()
 
-    if requested_model == "pro":
-        return (
-            {
-                "decision": "deny",
-                "reason": (
-                    f"Subagent '{role_label}' requested Model='pro'. "
-                    "Subagents must use 'flash' or 'flash_lite'."
-                ),
-            },
-            None,
-            None,
-        )
+    if norm_type in HIGH_REASONING_READONLY_TYPES:
+        if raw_model in ALLOWED_VERIFIER_REVIEWER_MODELS:
+            target_model = raw_model
+        else:
+            target_model = DEFAULT_MODEL_BY_TYPE.get(norm_type, "flash")
+    else:
+        requested_model = raw_model or "inherit"
+        if requested_model == "pro":
+            return (
+                {
+                    "decision": "deny",
+                    "reason": (
+                        f"Subagent '{role_label}' requested Model='pro'. "
+                        "Subagents must use 'flash' or 'flash_lite'."
+                    ),
+                },
+                None,
+                None,
+            )
 
-    target_model = requested_model
-    if target_model not in ALLOWED_SUBAGENT_MODELS:
-        target_model = DEFAULT_MODEL_BY_TYPE.get(type_name, "flash")
+        target_model = requested_model
+        if target_model not in ALLOWED_SUBAGENT_MODELS:
+            target_model = DEFAULT_MODEL_BY_TYPE.get(norm_type, "flash")
 
-    if target_model == "flash" and _is_simple_readonly_task(type_name, prompt_text):
-        target_model = "flash_lite"
+        if target_model == "flash" and _is_simple_readonly_task(norm_type, prompt_text):
+            target_model = "flash_lite"
 
     workspace_mode = (entry.get("Workspace") or "inherit").strip()
+    allowed_files = _parse_allowed_files_header(prompt_text)
+
+    normalized_lens: Optional[str] = None
+    if norm_type == "reviewer":
+        raw_lens = _parse_review_lens_header(prompt_text)
+        normalized_lens = _normalize_review_lens(raw_lens or "")
+        if not normalized_lens:
+            return (
+                {
+                    "decision": "deny",
+                    "reason": (
+                        f"[ORCHESTRATOR GUARD] Reviewer '{role_label}' requires a non-empty "
+                        "'REVIEW_LENS: <lens>' header (e.g., 'REVIEW_LENS: security')."
+                    ),
+                },
+                None,
+                None,
+            )
+
+    active_workers = (
+        _iter_active_subagents(
+            state,
+            batch_entries=batch_entries,
+            exclude_call_sigs=exclude_call_sigs,
+        )
+        if state is not None or batch_entries
+        else []
+    )
+
+    if norm_type == "reviewer" and normalized_lens:
+        for other in active_workers:
+            other_type = str(
+                other.get("type_name") or other.get("type") or ""
+            ).strip().lower()
+            if other_type != "reviewer":
+                continue
+            other_lens = _normalize_review_lens(str(other.get("review_lens") or ""))
+            if other_lens and other_lens == normalized_lens:
+                return (
+                    {
+                        "decision": "deny",
+                        "reason": (
+                            f"[ORCHESTRATOR GUARD] Duplicate REVIEW_LENS '{normalized_lens}' "
+                            f"for reviewer '{role_label}'. Each concurrent reviewer must hold "
+                            "a distinct REVIEW_LENS."
+                        ),
+                    },
+                    None,
+                    None,
+                )
+
+    if norm_type == "implementer" and allowed_files:
+        for other in active_workers:
+            other_type = str(
+                other.get("type_name") or other.get("type") or ""
+            ).strip().lower()
+            if other_type != "implementer":
+                continue
+            other_allowed = other.get("allowed_files")
+            if not other_allowed:
+                continue
+            other_ws = str(other.get("workspace") or "inherit").strip().lower()
+            if workspace_mode.lower() != "inherit" and other_ws != "inherit":
+                continue
+            overlap = _find_allowed_files_overlap(allowed_files, other_allowed)
+            if overlap is not None:
+                return (
+                    {
+                        "decision": "deny",
+                        "reason": (
+                            f"[ORCHESTRATOR GUARD] Overlapping ALLOWED_FILES between concurrent "
+                            f"implementers sharing 'inherit' workspace ('{overlap[0]}' vs '{overlap[1]}'). "
+                            "Assign disjoint ALLOWED_FILES or isolate lanes in 'branch'/'share' workspaces."
+                        ),
+                    },
+                    None,
+                    None,
+                )
+
+    mutation_epoch = (
+        state.get("test_receipt", {}).get("mutation_epoch", 0)
+        if isinstance(state, dict)
+        else 0
+    )
     spawn_record: Dict[str, Any] = {
         "role": role_label,
         "type": type_name,
@@ -297,8 +515,11 @@ def _validate_and_prepare_subagent_entry(
         "model": target_model,
         "workspace": workspace_mode,
         "active_branch": workspace_mode == "branch",
+        "status": "active",
+        "spawned_mutation_epoch": mutation_epoch,
     }
-    allowed_files = _parse_allowed_files_header(prompt_text)
+    if normalized_lens is not None:
+        spawn_record["review_lens"] = normalized_lens
     if allowed_files is not None:
         spawn_record["allowed_files"] = allowed_files
 
@@ -338,10 +559,36 @@ def _handle_invoke_subagent(
         }
 
     entries = args["Subagents"] if is_list_schema else [args]
-    validated_items: List[Tuple[int, Dict[str, Any], Dict[str, Any], str]] = []
+    inv_key = _current_invocation_key(payload, state)
+    exec_num = payload.get("executionNum", 0)
+    caller_cid = payload.get("conversationId", "")
+
+    entry_call_sigs: List[str] = []
     for idx, raw_item in enumerate(entries):
         item = raw_item if isinstance(raw_item, dict) else {}
-        denial, spawn_record, target_model = _validate_and_prepare_subagent_entry(item)
+        sig_call_id = f"{call_id}:{idx}" if is_list_schema else call_id
+        t_name = (item.get("TypeName") or "").strip()
+        r_label = (item.get("Role") or t_name or "subagent").strip()
+        ws_mode = (item.get("Workspace") or "inherit").strip()
+        entry_call_sigs.append(
+            json.dumps(
+                [caller_cid, inv_key, exec_num, sig_call_id, t_name, r_label, ws_mode],
+                sort_keys=True,
+            )
+        )
+    existing_retry_sigs = {sig for sig in entry_call_sigs if sig in recorded_calls}
+
+    validated_items: List[Tuple[int, Dict[str, Any], Dict[str, Any], str, str]] = []
+    batch_entries: List[Dict[str, Any]] = []
+    for idx, raw_item in enumerate(entries):
+        item = raw_item if isinstance(raw_item, dict) else {}
+        call_sig = entry_call_sigs[idx]
+        denial, spawn_record, target_model = _validate_and_prepare_subagent_entry(
+            item,
+            state=state,
+            batch_entries=batch_entries,
+            exclude_call_sigs=existing_retry_sigs,
+        )
         if denial is not None or spawn_record is None or target_model is None:
             return denial or {
                 "decision": "deny",
@@ -349,7 +596,8 @@ def _handle_invoke_subagent(
                 if is_list_schema
                 else "Invalid invoke_subagent arguments.",
             }
-        validated_items.append((idx, item, spawn_record, target_model))
+        batch_entries.append(spawn_record)
+        validated_items.append((idx, item, spawn_record, target_model, call_sig))
 
     workspace_roots = [
         str(Path(wp).resolve())
@@ -361,20 +609,7 @@ def _handle_invoke_subagent(
     updated_list: List[Dict[str, Any]] = []
     any_model_overwritten = False
     state_changed = False
-    for idx, item, spawn_record, target_model in validated_items:
-        sig_call_id = f"{call_id}:{idx}" if is_list_schema else call_id
-        call_sig = json.dumps(
-            [
-                payload.get("conversationId", ""),
-                _current_invocation_key(payload, state),
-                payload.get("executionNum", 0),
-                sig_call_id,
-                spawn_record["type_name"],
-                spawn_record["role"],
-                spawn_record["workspace"],
-            ],
-            sort_keys=True,
-        )
+    for idx, item, spawn_record, target_model, call_sig in validated_items:
         if workspace_roots:
             spawn_record["workspace_roots"] = workspace_roots
         spawn_record["call_id"] = call_id
@@ -401,6 +636,33 @@ def _handle_invoke_subagent(
             else {"Model": updated_list[0]["Model"]},
         }
     return {"decision": "allow"}
+
+
+def _lookup_recipient_meta(
+    payload: Dict[str, Any], state: Dict[str, Any], recipient: str
+) -> Optional[Dict[str, Any]]:
+    """Resolve recipient subagent metadata from local state or sibling brain state."""
+    if not recipient:
+        return None
+    sub_info = state.get("subagents", {}).get(recipient)
+    if isinstance(sub_info, dict):
+        return sub_info
+    artifact_dir = payload.get("artifactDirectoryPath")
+    if artifact_dir:
+        try:
+            resolved_art = Path(artifact_dir).resolve()
+            if resolved_art.parent.name == "brain":
+                sib_state_file = (
+                    resolved_art.parent / recipient / "orchestrator_state.json"
+                )
+                if sib_state_file.exists():
+                    sib_state = _load_state(sib_state_file)
+                    meta = sib_state.get("self_subagent_meta")
+                    if isinstance(meta, dict):
+                        return meta
+        except OSError:
+            pass
+    return None
 
 
 def _handle_send_message(
@@ -435,7 +697,26 @@ def _handle_send_message(
             _save_state(payload, state)
 
     subagent_info = state.get("subagents", {}).get(recipient)
-    recipient_type = str(subagent_info.get("type_name") or subagent_info.get("type") or "") if subagent_info else ""
+    recipient_meta = subagent_info if isinstance(subagent_info, dict) else _lookup_recipient_meta(payload, state, recipient)
+    recipient_type = (
+        str(recipient_meta.get("type_name") or recipient_meta.get("type") or "").strip().lower()
+        if recipient_meta
+        else ""
+    )
+
+    if recipient_meta and recipient_type in HIGH_REASONING_READONLY_TYPES:
+        current_epoch = state.get("test_receipt", {}).get("mutation_epoch", 0)
+        spawned_epoch = recipient_meta.get("spawned_mutation_epoch", 0)
+        if current_epoch > spawned_epoch:
+            return {
+                "decision": "deny",
+                "reason": (
+                    f"[ORCHESTRATOR GUARD] Stale {recipient_type} '{recipient}': workspace code was "
+                    f"mutated since spawn (epoch {spawned_epoch} -> {current_epoch}). "
+                    f"Spawn a fresh '{recipient_type}' via invoke_subagent instead of reusing via send_message."
+                ),
+            }
+
     spec_file, spec_err = _validate_spec_file_header(message, recipient_type, payload)
     if spec_err:
         return {"decision": "deny", "reason": spec_err}
@@ -470,12 +751,46 @@ def _handle_send_message(
                 }
 
     parsed_allowed = _parse_allowed_files_header(message)
+    if recipient_type == "implementer" and recipient_meta:
+        effective_allowed = (
+            parsed_allowed
+            if parsed_allowed is not None
+            else recipient_meta.get("allowed_files")
+        )
+        target_ws = str(recipient_meta.get("workspace") or "inherit").strip().lower()
+        if effective_allowed:
+            for other in _iter_active_subagents(state, exclude_cid=recipient):
+                other_type = str(
+                    other.get("type_name") or other.get("type") or ""
+                ).strip().lower()
+                if other_type != "implementer":
+                    continue
+                other_allowed = other.get("allowed_files")
+                if not other_allowed:
+                    continue
+                other_ws = str(other.get("workspace") or "inherit").strip().lower()
+                if target_ws != "inherit" and other_ws != "inherit":
+                    continue
+                overlap = _find_allowed_files_overlap(effective_allowed, other_allowed)
+                if overlap is not None:
+                    return {
+                        "decision": "deny",
+                        "reason": (
+                            f"[ORCHESTRATOR GUARD] Overlapping ALLOWED_FILES when reactivating "
+                            f"implementer '{recipient}' in 'inherit' workspace ('{overlap[0]}' vs '{overlap[1]}'). "
+                            "Wait for conflicting implementer to complete or assign disjoint ALLOWED_FILES."
+                        ),
+                    }
+        if subagent_info is not None:
+            subagent_info["status"] = "active"
+            _save_state(payload, state)
+
     if parsed_allowed is not None:
         if subagent_info:
             subagent_info["allowed_files"] = parsed_allowed
             _save_state(payload, state)
 
-    if parsed_allowed is not None or stage_match is not None:
+    if parsed_allowed is not None or stage_match is not None or (recipient_type == "implementer" and recipient_meta):
         artifact_dir = payload.get("artifactDirectoryPath")
         if artifact_dir and recipient:
             try:
@@ -494,6 +809,8 @@ def _handle_send_message(
                                 stage_val = stage_match.group(1).strip()
                                 meta["stage"] = stage_val
                                 meta.setdefault("stage_history", []).append(stage_val)
+                            if recipient_type == "implementer":
+                                meta["status"] = "active"
                             _save_state(sib_state_file, sib_state)
             except OSError:
                 pass
@@ -514,9 +831,13 @@ def _handle_manage_subagents(
 
     if action == "kill_all":
         for meta in subagents.values():
-            meta["active_branch"] = False
+            if isinstance(meta, dict):
+                meta["active_branch"] = False
+                meta["status"] = "killed"
         for pending in state.get("pending_spawns", []):
-            pending["active_branch"] = False
+            if isinstance(pending, dict):
+                pending["active_branch"] = False
+                pending["status"] = "killed"
         state["pending_spawns"] = []
         _save_state(payload, state)
     elif action == "kill":
@@ -530,8 +851,9 @@ def _handle_manage_subagents(
             raw_ids = [raw_ids]
         target_ids = {str(cid).strip().lower() for cid in raw_ids if cid}
         for cid in target_ids:
-            if cid in subagents:
+            if cid in subagents and isinstance(subagents[cid], dict):
                 subagents[cid]["active_branch"] = False
+                subagents[cid]["status"] = "killed"
         remaining_pending = []
         killed_left = len(target_ids)
         for pending in state.get("pending_spawns", []):
@@ -925,6 +1247,10 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
             state["session_evaluated"] = True
             state["plan_execute_phase"] = True
             state["plan_execute_consumed"] = False
+            state["plan_execute_user_input"] = (
+                str(payload.get("lastUserInput") or "").strip() or None
+            )
+            state["plan_execute_turn_finished"] = False
             plan_text = str(args.get("plan") or args.get("Plan") or "")
             state["plan_allowed_files"] = _parse_allowed_files_header(plan_text)
             _save_state(payload, state)
@@ -933,6 +1259,8 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
         if tool_name == "enter_plan_mode" and _is_root_orchestrator(payload, state):
             state["plan_execute_phase"] = False
             state["plan_execute_consumed"] = False
+            state["plan_execute_user_input"] = None
+            state["plan_execute_turn_finished"] = False
             state["plan_allowed_files"] = None
             _save_state(payload, state)
             return {"decision": "allow"}
@@ -1064,13 +1392,21 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
             return _handle_manage_subagents(payload, args, state)
 
         if tool_name in MUTATION_TOOLS:
-            if _is_scout_subagent(payload, state):
-                return {
-                    "decision": "deny",
-                    "reason": (
+            if _is_strict_readonly_subagent(payload, state):
+                sub_type = _get_subagent_type(payload, state) or "readonly"
+                if sub_type == "scout":
+                    reason = (
                         "[ORCHESTRATOR GUARD] Scout subagents (Model='flash_lite') are strictly "
                         "read-only. File mutations are prohibited."
-                    ),
+                    )
+                else:
+                    reason = (
+                        f"[ORCHESTRATOR GUARD] {sub_type.capitalize()} subagents are strictly "
+                        "read-only. File mutations are prohibited."
+                    )
+                return {
+                    "decision": "deny",
+                    "reason": reason,
                 }
             if _is_research_subagent(payload, state):
                 target = _extract_target_path(tool_name, args)
@@ -1113,7 +1449,7 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
             cmd = args.get("CommandLine", "") or ""
             sub_cmds = _split_shell_commands(cmd)
 
-            if _is_scout_subagent(payload, state):
+            if _is_strict_readonly_subagent(payload, state):
                 has_write_redir = False
                 for m in re.finditer(r"(?:^|[^0-9&])>{1,2}\s*([^\s;&|><]+)", cmd):
                     target_sink = m.group(1).strip().strip("`'\"")
@@ -1128,12 +1464,20 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                         has_mutating_cmd = True
                         break
                 if has_write_redir or has_mutating_cmd:
-                    return {
-                        "decision": "deny",
-                        "reason": (
+                    sub_type = _get_subagent_type(payload, state) or "readonly"
+                    if sub_type == "scout":
+                        reason = (
                             "[ORCHESTRATOR GUARD] Scout subagents (Model='flash_lite') are strictly "
                             "read-only. Shell file mutations are prohibited."
-                        ),
+                        )
+                    else:
+                        reason = (
+                            f"[ORCHESTRATOR GUARD] {sub_type.capitalize()} subagents are strictly "
+                            "read-only. Shell file mutations are prohibited."
+                        )
+                    return {
+                        "decision": "deny",
+                        "reason": reason,
                     }
 
             allowed_files = _get_subagent_allowed_files(payload, state)
@@ -1212,6 +1556,7 @@ def handle_pre_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                         receipt = _get_test_receipt(state, payload)
                         receipt["dirty"] = True
                         receipt["verified"] = False
+                        receipt["mutation_epoch"] = receipt.get("mutation_epoch", 0) + 1
                         try:
                             receipt["last_mutated_file"] = str(
                                 Path(os.path.expanduser(target_path)).resolve()

@@ -9,11 +9,23 @@ from typing import Any, Dict, List, Optional
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 
 ALLOWED_SUBAGENT_MODELS = {"flash", "flash_lite"}
+STRICT_READONLY_SUBAGENT_TYPES = {"scout", "verifier", "reviewer"}
+HIGH_REASONING_READONLY_TYPES = {"verifier", "reviewer"}
+READONLY_NON_VERIFICATION_TYPES = {
+    "scout",
+    "research",
+    "researcher",
+    "verifier",
+    "reviewer",
+}
+ALLOWED_VERIFIER_REVIEWER_MODELS = {"flash", "pro", "inherit"}
 DEFAULT_MODEL_BY_TYPE = {
     "scout": "flash_lite",
     "research": "flash",
     "researcher": "flash",
     "implementer": "flash",
+    "verifier": "flash",
+    "reviewer": "flash",
 }
 
 MUTATION_VERBS_RE = re.compile(
@@ -26,6 +38,7 @@ REPLAN_IF_HEADER_RE = re.compile(r"(?m)^\s*REPLAN_IF:\s*(.+)$", re.I)
 REPLAN_HEADER_RE = re.compile(r"(?m)^\s*REPLAN:\s*(.+)$", re.I)
 SPEC_FILE_HEADER_RE = re.compile(r"(?m)^\s*SPEC_FILE:\s*(.+)$", re.I)
 STAGE_HEADER_RE = re.compile(r"(?m)^\s*STAGE:\s*(.+)$", re.I)
+REVIEW_LENS_HEADER_RE = re.compile(r"(?m)^[ \t]*REVIEW_LENS:[ \t]*([^\r\n]+)$", re.I)
 GROUNDED_SPEC_SECTION_PATTERNS = (
     re.compile(r"(?im)(?:^|[^A-Za-z0-9])signatures?(?:$|[^A-Za-z0-9])"),
     re.compile(r"(?im)(?:^|[^A-Za-z0-9])(?:pitfalls?|invariants?)(?:$|[^A-Za-z0-9])"),

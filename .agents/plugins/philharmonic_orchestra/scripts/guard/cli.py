@@ -30,6 +30,18 @@ from guard.verification import (
 def _cli_status(payload: Dict[str, Any]) -> Dict[str, Any]:
     state = _load_state(payload)
     inv_key = _current_invocation_key(payload, state)
+    subagents_summary: Dict[str, Any] = {}
+    for cid, meta in (state.get("subagents") or {}).items():
+        if isinstance(meta, dict):
+            entry = dict(meta)
+            entry.setdefault("status", "unknown")
+            if entry.get("review_lens") and "reviewLens" not in entry:
+                entry["reviewLens"] = entry["review_lens"]
+            subagents_summary[cid] = entry
+        else:
+            subagents_summary[cid] = meta
+    receipt = dict(_get_test_receipt(state, payload))
+    receipt.setdefault("mutationEpoch", receipt.get("mutation_epoch", 0))
     return {
         "projectRoot": str(PROJECT_ROOT),
         "stateFile": str(_state_file_path(payload)),
@@ -37,10 +49,10 @@ def _cli_status(payload: Dict[str, Any]) -> Dict[str, Any]:
         "planExecutePhase": bool(state.get("plan_execute_phase", False)),
         "rootConversationId": state.get("root_conversation_id"),
         "currentInvocation": inv_key,
-        "activeSubagents": state.get("subagents", {}),
+        "activeSubagents": subagents_summary,
         "pendingSpawns": state.get("pending_spawns", []),
         "directBudget": state.get("direct_budget", {}).get(inv_key, {}),
-        "testReceipt": _get_test_receipt(state, payload),
+        "testReceipt": receipt,
         "circuitBreaker": _get_circuit_breaker(state, payload),
     }
 

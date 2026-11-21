@@ -4659,6 +4659,1091 @@ orchestrator_guard.register_subagent(
         self.assertEqual(cb_real_2.get("failure_streak", 0), 2)
         self.assertTrue(cb_real_2.get("tripped", False))
 
+    def test_phase1_define_subagent_verifier_and_reviewer_permissions(self) -> None:
+        # 1. PascalCase define_subagent strips write, MCP, and subagent tools for verifier & reviewer
+        for role_name in ("verifier", "reviewer"):
+            res = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={
+                        "name": "define_subagent",
+                        "args": {
+                            "Name": role_name,
+                            "EnableWriteTools": True,
+                            "EnableMCPTools": True,
+                            "EnableSubagentTools": True,
+                        },
+                    },
+                )
+            )
+            self.assertEqual(res["decision"], "allow")
+            self.assertEqual(
+                res["overwrite"],
+                {
+                    "EnableSubagentTools": False,
+                    "EnableWriteTools": False,
+                    "EnableMCPTools": False,
+                },
+            )
+
+        # 2. snake_case define_subagent strips write, MCP, and subagent tools for verifier & reviewer
+        for role_name in ("verifier", "reviewer"):
+            res_snake = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={
+                        "name": "define_subagent",
+                        "args": {
+                            "name": role_name,
+                            "enable_write_tools": True,
+                            "enable_mcp_tools": True,
+                            "enable_subagent_tools": True,
+                        },
+                    },
+                )
+            )
+            self.assertEqual(res_snake["decision"], "allow")
+            self.assertEqual(
+                res_snake["overwrite"],
+                {
+                    "enable_subagent_tools": False,
+                    "enable_write_tools": False,
+                    "enable_mcp_tools": False,
+                },
+            )
+
+    def test_phase1_verifier_reviewer_model_policy_and_regressions(self) -> None:
+        short_readonly_prompt = (
+            "TASK: Inspect module changes.\n"
+            "REVIEW_LENS: security\n"
+            "RULES:\n1. Read changed files.\n2. Run git diff.\n"
+            "REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: ok\nNOTES: done"
+        )
+        # Verifier and reviewer model policy: omitted -> flash, flash -> flash, pro -> pro,
+        # inherit -> inherit, flash_lite -> flash, short readonly prompt NOT downgraded to flash_lite.
+        for type_name in ("verifier", "reviewer"):
+            # Omitted Model -> overwritten to flash
+            res_omitted = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={
+                        "id": f"m_omit_{type_name}",
+                        "name": "invoke_subagent",
+                        "args": {
+                            "TypeName": type_name,
+                            "Prompt": short_readonly_prompt,
+                        },
+                    },
+                )
+            )
+            self.assertEqual(res_omitted["decision"], "allow")
+            self.assertEqual(res_omitted["overwrite"]["Model"], "flash")
+
+            # Explicit flash -> kept as flash (no overwrite)
+            res_flash = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={
+                        "id": f"m_flash_{type_name}",
+                        "name": "invoke_subagent",
+                        "args": {
+                            "TypeName": type_name,
+                            "Model": "flash",
+                            "Prompt": short_readonly_prompt.replace("security", f"flash-{type_name}"),
+                        },
+                    },
+                )
+            )
+            self.assertEqual(res_flash, {"decision": "allow"})
+
+            # Explicit pro -> allowed & preserved
+            res_pro = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={
+                        "id": f"m_pro_{type_name}",
+                        "name": "invoke_subagent",
+                        "args": {
+                            "TypeName": type_name,
+                            "Model": "pro",
+                            "Prompt": short_readonly_prompt.replace("security", f"pro-{type_name}"),
+                        },
+                    },
+                )
+            )
+            self.assertEqual(res_pro, {"decision": "allow"})
+
+            # Explicit inherit -> allowed & preserved
+            res_inherit = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={
+                        "id": f"m_inh_{type_name}",
+                        "name": "invoke_subagent",
+                        "args": {
+                            "TypeName": type_name,
+                            "Model": "inherit",
+                            "Prompt": short_readonly_prompt.replace("security", f"inh-{type_name}"),
+                        },
+                    },
+                )
+            )
+            self.assertEqual(res_inherit, {"decision": "allow"})
+
+            # Explicit flash_lite -> rewritten to flash
+            res_lite = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={
+                        "id": f"m_lite_{type_name}",
+                        "name": "invoke_subagent",
+                        "args": {
+                            "TypeName": type_name,
+                            "Model": "flash_lite",
+                            "Prompt": short_readonly_prompt.replace("security", f"lite-{type_name}"),
+                        },
+                    },
+                )
+            )
+            self.assertEqual(res_lite["decision"], "allow")
+            self.assertEqual(res_lite["overwrite"]["Model"], "flash")
+
+        # Regression guard: scout, research, implementer still deny pro and rewrite inherit
+        for std_type in ("scout", "research", "implementer"):
+            res_std_pro = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={
+                        "id": f"std_pro_{std_type}",
+                        "name": "invoke_subagent",
+                        "args": {
+                            "TypeName": std_type,
+                            "Model": "pro",
+                            "Prompt": VALID_PROMPT,
+                        },
+                    },
+                )
+            )
+            self.assertEqual(res_std_pro["decision"], "deny")
+            self.assertIn("Model='pro'", res_std_pro["reason"])
+
+            res_std_inh = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={
+                        "id": f"std_inh_{std_type}",
+                        "name": "invoke_subagent",
+                        "args": {
+                            "TypeName": std_type,
+                            "Model": "inherit",
+                            "Prompt": VALID_PROMPT,
+                        },
+                    },
+                )
+            )
+            self.assertEqual(res_std_inh["decision"], "allow")
+            expected_default = "flash_lite" if std_type == "scout" else "flash"
+            self.assertEqual(res_std_inh["overwrite"]["Model"], expected_default)
+
+    def test_phase1_verifier_reviewer_strict_readonly_and_dirty_receipt(self) -> None:
+        brain_base = Path(self.artifact_dir) / "brain"
+        parent_brain = brain_base / "parent-ro-test"
+        verifier_cid = "sub-verifier-ro-01"
+        reviewer_cid = "sub-reviewer-ro-02"
+        for d in (parent_brain, brain_base / verifier_cid, brain_base / reviewer_cid):
+            d.mkdir(parents=True, exist_ok=True)
+
+        parent_payload = dict(
+            self.base_payload,
+            conversationId="parent-ro-test",
+            artifactDirectoryPath=str(parent_brain),
+        )
+        orchestrator_guard._cli_activate(parent_payload)
+        orchestrator_guard.register_subagent(
+            parent_payload,
+            conversation_id=verifier_cid,
+            type_name="verifier",
+            model="flash",
+            status="active",
+        )
+        orchestrator_guard.register_subagent(
+            parent_payload,
+            conversation_id=reviewer_cid,
+            type_name="reviewer",
+            model="pro",
+            status="active",
+            review_lens="security",
+        )
+
+        target_code = str(orchestrator_guard.PROJECT_ROOT / "src" / "app.py")
+        for sub_cid, sub_type in ((verifier_cid, "verifier"), (reviewer_cid, "reviewer")):
+            sub_payload = dict(
+                self.base_payload,
+                conversationId=sub_cid,
+                artifactDirectoryPath=str(brain_base / sub_cid),
+            )
+            # MUTATION_TOOLS blocked
+            for tool_name, tool_args in (
+                ("write_file", {"Path": target_code, "Content": "x = 1"}),
+                ("edit_file", {"Path": target_code, "Target": "a", "Replacement": "b"}),
+                ("replace_file_content", {"TargetFile": target_code, "TargetContent": "a", "ReplacementContent": "b"}),
+            ):
+                res_mut = orchestrator_guard.handle_pre_tool(
+                    dict(sub_payload, toolCall={"name": tool_name, "args": tool_args})
+                )
+                self.assertEqual(res_mut["decision"], "deny")
+                self.assertIn("strictly read-only", res_mut["reason"])
+
+            # Mutating shell commands blocked
+            for bad_cmd in ("echo hi > out.txt", "rm -f foo.py", "sed -i 's/a/b/' foo.py", "touch new.py"):
+                res_cmd = orchestrator_guard.handle_pre_tool(
+                    dict(
+                        sub_payload,
+                        toolCall={
+                            "name": "run_command",
+                            "args": {"CommandLine": bad_cmd, "Cwd": str(orchestrator_guard.PROJECT_ROOT)},
+                        },
+                    )
+                )
+                self.assertEqual(res_cmd["decision"], "deny")
+                self.assertIn("strictly read-only", res_cmd["reason"])
+
+            # read_file and git diff allowed
+            res_read = orchestrator_guard.handle_pre_tool(
+                dict(
+                    sub_payload,
+                    toolCall={
+                        "name": "read_file",
+                        "args": {"Path": str(orchestrator_guard.PROJECT_ROOT / "README.md"), "StartLine": 1, "EndLine": 10},
+                    },
+                )
+            )
+            self.assertEqual(res_read["decision"], "allow")
+            res_git = orchestrator_guard.handle_pre_tool(
+                dict(
+                    sub_payload,
+                    toolCall={
+                        "name": "run_command",
+                        "args": {"CommandLine": "git diff HEAD", "Cwd": str(orchestrator_guard.PROJECT_ROOT)},
+                    },
+                )
+            )
+            self.assertEqual(res_git["decision"], "allow")
+
+        # Synchronous invoke_subagent completion for verifier/reviewer NEVER clears dirty test_receipt
+        parent_state = orchestrator_guard._load_state(parent_payload)
+        parent_receipt = orchestrator_guard._get_test_receipt(parent_state, parent_payload)
+        parent_receipt["dirty"] = True
+        parent_receipt["verified"] = False
+        orchestrator_guard._save_state(parent_payload, parent_state)
+
+        for ro_type in ("verifier", "reviewer"):
+            orchestrator_guard.handle_post_tool(
+                dict(
+                    parent_payload,
+                    toolCall={
+                        "id": f"sync_{ro_type}",
+                        "name": "invoke_subagent",
+                        "args": {"TypeName": ro_type, "Role": ro_type.title()},
+                    },
+                    output="STATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: inspected\nNOTES: VERDICT: PASS",
+                    error="",
+                )
+            )
+            st_after = orchestrator_guard._load_state(parent_payload)
+            rec_after = orchestrator_guard._get_test_receipt(st_after, parent_payload)
+            self.assertTrue(rec_after["dirty"])
+            self.assertFalse(rec_after["verified"])
+
+    def test_phase1_verifier_reviewer_require_4_header_report(self) -> None:
+        compact_report = "STATUS: COMPLETED\nNOTES: Looks good to me"
+        valid_4_header = (
+            "STATUS: COMPLETED\n"
+            "FILES_CHANGED: NONE\n"
+            "VERIFICATION: Ran git diff and inspected tests\n"
+            "NOTES: VERDICT: APPROVE"
+        )
+        brain_base = Path(self.artifact_dir) / "brain"
+        parent_brain = brain_base / "parent-report-test"
+        parent_brain.mkdir(parents=True, exist_ok=True)
+        parent_payload = dict(
+            self.base_payload,
+            conversationId="parent-report-test",
+            artifactDirectoryPath=str(parent_brain),
+        )
+        orchestrator_guard._cli_activate(parent_payload)
+
+        for idx, role_type in enumerate(("verifier", "reviewer"), start=1):
+            sub_cid = f"sub-{role_type}-report-{idx}"
+            (brain_base / sub_cid).mkdir(parents=True, exist_ok=True)
+            orchestrator_guard.register_subagent(
+                parent_payload,
+                conversation_id=sub_cid,
+                type_name=role_type,
+                model="flash",
+                status="active",
+                review_lens="security" if role_type == "reviewer" else None,
+            )
+            sub_payload = dict(
+                self.base_payload,
+                conversationId=sub_cid,
+                artifactDirectoryPath=str(brain_base / sub_cid),
+            )
+            # 2-header shorthand rejected in send_message
+            res_msg = orchestrator_guard.handle_pre_tool(
+                dict(
+                    sub_payload,
+                    toolCall={
+                        "name": "send_message",
+                        "args": {"Recipient": "parent-report-test", "Message": compact_report},
+                    },
+                )
+            )
+            self.assertEqual(res_msg["decision"], "deny")
+            self.assertIn("Expected 4 header lines", res_msg["reason"])
+
+            # 2-header shorthand triggers continue in handle_stop
+            res_stop_bad = orchestrator_guard.handle_stop(
+                dict(
+                    sub_payload,
+                    executionNum=1,
+                    lastAssistantMessage=compact_report,
+                    fullyIdle=True,
+                )
+            )
+            self.assertEqual(res_stop_bad["decision"], "continue")
+            self.assertIn("Expected 4 header lines", res_stop_bad["reason"])
+
+            # 4-header report passes handle_stop and marks status completed in parent brain
+            res_stop_ok = orchestrator_guard.handle_stop(
+                dict(
+                    sub_payload,
+                    executionNum=2,
+                    lastAssistantMessage=valid_4_header,
+                    fullyIdle=True,
+                )
+            )
+            self.assertEqual(res_stop_ok["decision"], "allow")
+            parent_state = orchestrator_guard._load_state(parent_payload)
+            self.assertEqual(parent_state["subagents"][sub_cid]["status"], "completed")
+
+    def test_phase1_freshness_gate_mutation_epoch_root_and_implementer(self) -> None:
+        brain_base = Path(self.artifact_dir) / "brain"
+        parent_brain = brain_base / "parent-epoch-test"
+        impl_cid = "sub-impl-epoch-01"
+        verifier_cid = "sub-verifier-epoch-02"
+        reviewer_cid = "sub-reviewer-epoch-03"
+        for d in (
+            parent_brain,
+            brain_base / impl_cid,
+            brain_base / verifier_cid,
+            brain_base / reviewer_cid,
+        ):
+            d.mkdir(parents=True, exist_ok=True)
+
+        parent_payload = dict(
+            self.base_payload,
+            conversationId="parent-epoch-test",
+            artifactDirectoryPath=str(parent_brain),
+        )
+        orchestrator_guard._cli_activate(parent_payload)
+        orchestrator_guard.handle_pre_invocation(parent_payload)
+
+        orchestrator_guard.register_subagent(
+            parent_payload,
+            conversation_id=impl_cid,
+            type_name="implementer",
+            model="flash",
+            status="active",
+        )
+        orchestrator_guard.register_subagent(
+            parent_payload,
+            conversation_id=verifier_cid,
+            type_name="verifier",
+            model="flash",
+            status="active",
+            spawned_mutation_epoch=0,
+        )
+        orchestrator_guard.register_subagent(
+            parent_payload,
+            conversation_id=reviewer_cid,
+            type_name="reviewer",
+            model="pro",
+            status="active",
+            spawned_mutation_epoch=0,
+            review_lens="security",
+        )
+
+        # Clarifying send_message BEFORE any code mutation is allowed
+        for target_cid in (verifier_cid, reviewer_cid):
+            res_before = orchestrator_guard.handle_pre_tool(
+                dict(
+                    parent_payload,
+                    toolCall={
+                        "name": "send_message",
+                        "args": {"Recipient": target_cid, "Message": "Please also check input bounds."},
+                    },
+                )
+            )
+            self.assertEqual(res_before["decision"], "allow")
+
+        # Implementer mutates workspace file -> propagates dirty=True and bumps parent mutation_epoch
+        impl_payload = dict(
+            self.base_payload,
+            conversationId=impl_cid,
+            artifactDirectoryPath=str(brain_base / impl_cid),
+            toolCall={
+                "name": "edit_file",
+                "args": {
+                    "Path": str(orchestrator_guard.PROJECT_ROOT / "src_mod.py"),
+                    "Target": "a",
+                    "Replacement": "b",
+                },
+            },
+        )
+        res_impl_edit = orchestrator_guard.handle_pre_tool(impl_payload)
+        self.assertEqual(res_impl_edit["decision"], "allow")
+
+        parent_state = orchestrator_guard._load_state(parent_payload)
+        self.assertEqual(
+            orchestrator_guard._get_test_receipt(parent_state, parent_payload).get("mutation_epoch"),
+            1,
+        )
+
+        # send_message to stale verifier & reviewer is now DENIED
+        for target_cid, r_type in ((verifier_cid, "verifier"), (reviewer_cid, "reviewer")):
+            res_stale = orchestrator_guard.handle_pre_tool(
+                dict(
+                    parent_payload,
+                    toolCall={
+                        "name": "send_message",
+                        "args": {"Recipient": target_cid, "Message": "Re-verify after fix."},
+                    },
+                )
+            )
+            self.assertEqual(res_stale["decision"], "deny")
+            self.assertIn(f"Stale {r_type}", res_stale["reason"])
+
+        # Spawn fresh verifier at epoch 1 -> send_message allowed until root edit bumps epoch to 2
+        fresh_verifier_cid = "sub-verifier-fresh-04"
+        orchestrator_guard.register_subagent(
+            parent_payload,
+            conversation_id=fresh_verifier_cid,
+            type_name="verifier",
+            model="flash",
+            status="active",
+            spawned_mutation_epoch=1,
+        )
+        res_fresh_ok = orchestrator_guard.handle_pre_tool(
+            dict(
+                parent_payload,
+                toolCall={
+                    "name": "send_message",
+                    "args": {"Recipient": fresh_verifier_cid, "Message": "Clarification at epoch 1."},
+                },
+            )
+        )
+        self.assertEqual(res_fresh_ok["decision"], "allow")
+
+        # Root edit bumps mutation_epoch to 2 -> fresh_verifier becomes stale too
+        res_root_edit = orchestrator_guard.handle_pre_tool(
+            dict(
+                parent_payload,
+                toolCall={
+                    "name": "write_file",
+                    "args": {
+                        "Path": str(orchestrator_guard.PROJECT_ROOT / "root_mod.py"),
+                        "Content": "x = 2\n",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_root_edit["decision"], "allow")
+        status_out = orchestrator_guard._cli_status(parent_payload)
+        self.assertEqual(status_out["testReceipt"]["mutationEpoch"], 2)
+
+        res_stale_root = orchestrator_guard.handle_pre_tool(
+            dict(
+                parent_payload,
+                toolCall={
+                    "name": "send_message",
+                    "args": {"Recipient": fresh_verifier_cid, "Message": "Verify root edit."},
+                },
+            )
+        )
+        self.assertEqual(res_stale_root["decision"], "deny")
+        self.assertIn("Stale verifier", res_stale_root["reason"])
+
+    def test_phase1_disjoint_implementer_lanes_and_lifecycle_release(self) -> None:
+        def _impl_entry(allowed_line: str, workspace: str = "inherit", role: str = "Lane") -> dict:
+            header = f"ALLOWED_FILES: {allowed_line}\n" if allowed_line else ""
+            return {
+                "TypeName": "implementer",
+                "Role": role,
+                "Model": "flash",
+                "Workspace": workspace,
+                "Prompt": (
+                    f"TASK: Implement {role}.\n"
+                    f"{header}"
+                    "RULES:\n1. Edit assigned files.\n2. Run tests.\n"
+                    "REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: a.py\nVERIFICATION: ok\nNOTES: done"
+                ),
+            }
+
+        # 1. Atomic Subagents batch: exact & directory-prefix overlap denied WITHOUT mutating pending_spawns
+        res_batch_overlap = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "batch_overlap_1",
+                    "name": "invoke_subagent",
+                    "args": {
+                        "Subagents": [
+                            _impl_entry("web/", role="Lane Web"),
+                            _impl_entry("web/App.tsx", role="Lane App"),
+                        ]
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_batch_overlap["decision"], "deny")
+        self.assertIn("Overlapping ALLOWED_FILES", res_batch_overlap["reason"])
+        st_atomic = orchestrator_guard._load_state(self.base_payload)
+        self.assertEqual(st_atomic.get("pending_spawns"), [])
+        self.assertEqual(st_atomic.get("recorded_spawn_calls"), [])
+
+        # 2. Disjoint lanes in a batch are allowed
+        res_disjoint = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "batch_disjoint_1",
+                    "name": "invoke_subagent",
+                    "args": {
+                        "Subagents": [
+                            _impl_entry("web/", role="Lane Web"),
+                            _impl_entry("api/", role="Lane API"),
+                            _impl_entry("docs/", role="Lane Docs"),
+                        ]
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_disjoint["decision"], "allow")
+
+        # 3. Local CLI sequential pending_spawns overlap is denied
+        res_pending_conflict = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "cli_conflict_1",
+                    "name": "invoke_subagent",
+                    "args": _impl_entry("api/routes.py", role="Lane API Routes"),
+                },
+            )
+        )
+        self.assertEqual(res_pending_conflict["decision"], "deny")
+        self.assertIn("Overlapping ALLOWED_FILES", res_pending_conflict["reason"])
+
+        # 4. Synchronous PostToolUse completion releases pending_spawns lane locks
+        orchestrator_guard.handle_post_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "batch_disjoint_1",
+                    "name": "invoke_subagent",
+                    "args": {
+                        "Subagents": [
+                            _impl_entry("web/", role="Lane Web"),
+                            _impl_entry("api/", role="Lane API"),
+                            _impl_entry("docs/", role="Lane Docs"),
+                        ]
+                    },
+                },
+                output="STATUS: COMPLETED\nFILES_CHANGED: web/a.ts\nVERIFICATION: ok\nNOTES: done",
+                error="",
+            )
+        )
+        res_after_post = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "cli_after_post_1",
+                    "name": "invoke_subagent",
+                    "args": _impl_entry("api/routes.py", role="Lane API Routes"),
+                },
+            )
+        )
+        self.assertEqual(res_after_post["decision"], "allow")
+
+        # 5. Active subagents overlap check + release via handle_stop and manage_subagents(kill)
+        brain_base = Path(self.artifact_dir) / "brain"
+        parent_brain = brain_base / "parent-lane-test"
+        lane_a = "sub-lane-a-01"
+        lane_b = "sub-lane-b-02"
+        for d in (parent_brain, brain_base / lane_a, brain_base / lane_b):
+            d.mkdir(parents=True, exist_ok=True)
+        parent_payload = dict(
+            self.base_payload,
+            conversationId="parent-lane-test",
+            artifactDirectoryPath=str(parent_brain),
+        )
+        orchestrator_guard._cli_activate(parent_payload)
+        orchestrator_guard.register_subagent(
+            parent_payload,
+            conversation_id=lane_a,
+            type_name="implementer",
+            model="flash",
+            allowed_files=["src/a.py"],
+            status="active",
+        )
+        res_sub_overlap = orchestrator_guard.handle_pre_tool(
+            dict(
+                parent_payload,
+                toolCall={
+                    "id": "sub_overlap_1",
+                    "name": "invoke_subagent",
+                    "args": _impl_entry("src/a.py", role="Conflicting Worker"),
+                },
+            )
+        )
+        self.assertEqual(res_sub_overlap["decision"], "deny")
+        self.assertIn("Overlapping ALLOWED_FILES", res_sub_overlap["reason"])
+
+        # Overlapping files ARE allowed when isolated in separate branch/share workspaces
+        orchestrator_guard.register_subagent(
+            parent_payload,
+            conversation_id=lane_b,
+            type_name="implementer",
+            model="flash",
+            workspace="branch",
+            allowed_files=["src/shared.py"],
+            status="active",
+        )
+        res_isolated = orchestrator_guard.handle_pre_tool(
+            dict(
+                parent_payload,
+                toolCall={
+                    "id": "sub_isolated_share",
+                    "name": "invoke_subagent",
+                    "args": _impl_entry("src/shared.py", workspace="share", role="Share Worker"),
+                },
+            )
+        )
+        self.assertEqual(res_isolated["decision"], "allow")
+
+        # Omitted ALLOWED_FILES stays backward-compatible
+        res_omitted = orchestrator_guard.handle_pre_tool(
+            dict(
+                parent_payload,
+                toolCall={
+                    "id": "sub_omitted_allowed",
+                    "name": "invoke_subagent",
+                    "args": _impl_entry("", role="Unrestricted Legacy Worker"),
+                },
+            )
+        )
+        self.assertEqual(res_omitted["decision"], "allow")
+
+        # Sequential reuse allowed after handle_stop marks lane_a completed
+        res_stop_a = orchestrator_guard.handle_stop(
+            dict(
+                self.base_payload,
+                conversationId=lane_a,
+                artifactDirectoryPath=str(brain_base / lane_a),
+                lastAssistantMessage=(
+                    "STATUS: COMPLETED\nFILES_CHANGED: src/a.py\nVERIFICATION: pytest ok\nNOTES: done"
+                ),
+                fullyIdle=True,
+            )
+        )
+        self.assertEqual(res_stop_a["decision"], "allow")
+        res_reuse_a = orchestrator_guard.handle_pre_tool(
+            dict(
+                parent_payload,
+                toolCall={
+                    "id": "sub_reuse_after_stop",
+                    "name": "invoke_subagent",
+                    "args": _impl_entry("src/a.py", role="Follow-up Worker"),
+                },
+            )
+        )
+        self.assertEqual(res_reuse_a["decision"], "allow")
+
+        # Reactivating lane_a via send_message while another active worker holds src/c.py is blocked
+        lane_c = "sub-lane-c-03"
+        orchestrator_guard.register_subagent(
+            parent_payload,
+            conversation_id=lane_c,
+            type_name="implementer",
+            model="flash",
+            allowed_files=["src/c.py"],
+            status="active",
+        )
+        res_reactivate_conflict = orchestrator_guard.handle_pre_tool(
+            dict(
+                parent_payload,
+                toolCall={
+                    "name": "send_message",
+                    "args": {
+                        "Recipient": lane_a,
+                        "Message": "ALLOWED_FILES: src/c.py\nContinue work on c.py.",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_reactivate_conflict["decision"], "deny")
+        self.assertIn("Overlapping ALLOWED_FILES", res_reactivate_conflict["reason"])
+
+        # manage_subagents(Action='kill') marks lane_c killed and releases src/c.py
+        orchestrator_guard.handle_pre_tool(
+            dict(
+                parent_payload,
+                toolCall={
+                    "name": "manage_subagents",
+                    "args": {"Action": "kill", "ConversationIds": [lane_c]},
+                },
+            )
+        )
+        res_reactivate_ok = orchestrator_guard.handle_pre_tool(
+            dict(
+                parent_payload,
+                toolCall={
+                    "name": "send_message",
+                    "args": {
+                        "Recipient": lane_a,
+                        "Message": "ALLOWED_FILES: src/c.py\nContinue work on c.py.",
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_reactivate_ok["decision"], "allow")
+
+    def test_phase1_reviewer_lens_enforcement_and_round2_release(self) -> None:
+        def _rev_entry(lens_line: str, role: str = "Reviewer") -> dict:
+            header = f"REVIEW_LENS: {lens_line}\n" if lens_line is not None else ""
+            return {
+                "TypeName": "reviewer",
+                "Role": role,
+                "Model": "flash",
+                "Prompt": (
+                    f"TASK: Review changes.\n"
+                    f"{header}"
+                    "RULES:\n1. Inspect diff.\n2. Report findings.\n"
+                    "REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: git diff\nNOTES: VERDICT: APPROVE"
+                ),
+            }
+
+        # 1. Missing or blank REVIEW_LENS denied
+        for bad_lens in (None, '""', "---"):
+            res_missing = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={
+                        "id": f"rev_bad_{bad_lens}",
+                        "name": "invoke_subagent",
+                        "args": _rev_entry(bad_lens),
+                    },
+                )
+            )
+            self.assertEqual(res_missing["decision"], "deny")
+            self.assertIn("REVIEW_LENS", res_missing["reason"])
+
+        # Blank REVIEW_LENS followed by newline must not match across newline onto next line
+        for idx, blank_prompt in enumerate(
+            (
+                "TASK: Review changes.\nREVIEW_LENS:\nRULES:\n1. Review.\n",
+                "REVIEW_LENS:   \nTASK: Review changes.\nRULES:\n1. Review.\n",
+            )
+        ):
+            res_blank = orchestrator_guard.handle_pre_tool(
+                dict(
+                    self.base_payload,
+                    toolCall={
+                        "id": f"rev_blank_{idx}",
+                        "name": "invoke_subagent",
+                        "args": {
+                            "TypeName": "reviewer",
+                            "Role": "Reviewer",
+                            "Model": "flash",
+                            "Prompt": (
+                                f"{blank_prompt}"
+                                "REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: git diff\nNOTES: VERDICT: APPROVE"
+                            ),
+                        },
+                    },
+                )
+            )
+            self.assertEqual(res_blank["decision"], "deny")
+            self.assertIn("REVIEW_LENS", res_blank["reason"])
+
+        # 2. Duplicate normalized lens in atomic Subagents batch denied without mutating pending_spawns
+        res_dup_batch = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "rev_dup_batch",
+                    "name": "invoke_subagent",
+                    "args": {
+                        "Subagents": [
+                            _rev_entry("edge cases", role="Reviewer 1"),
+                            _rev_entry("edge_cases", role="Reviewer 2"),
+                        ]
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_dup_batch["decision"], "deny")
+        self.assertIn("Duplicate REVIEW_LENS 'edge-cases'", res_dup_batch["reason"])
+        st_atomic = orchestrator_guard._load_state(self.base_payload)
+        self.assertEqual(st_atomic.get("pending_spawns"), [])
+
+        # 3. Distinct lenses allowed in parallel batch
+        res_distinct = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "rev_distinct_batch",
+                    "name": "invoke_subagent",
+                    "args": {
+                        "Subagents": [
+                            _rev_entry("ux", role="UX Reviewer"),
+                            _rev_entry("simplicity", role="Simplicity Reviewer"),
+                            _rev_entry("edge-cases", role="Edge Cases Reviewer"),
+                            _rev_entry("security", role="Security Reviewer"),
+                        ]
+                    },
+                },
+            )
+        )
+        self.assertEqual(res_distinct["decision"], "allow")
+
+        # Duplicate against pending_spawns denied
+        res_dup_pending = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                toolCall={
+                    "id": "rev_dup_pending",
+                    "name": "invoke_subagent",
+                    "args": _rev_entry("Edge Cases", role="Dup Reviewer"),
+                },
+            )
+        )
+        self.assertEqual(res_dup_pending["decision"], "deny")
+        self.assertIn("Duplicate REVIEW_LENS 'edge-cases'", res_dup_pending["reason"])
+
+        # 4. Round-1 active reviewer blocks duplicate lens; round-2 allowed after handle_stop completes round-1
+        brain_base = Path(self.artifact_dir) / "brain"
+        parent_brain = brain_base / "parent-rev-round2"
+        rev1_cid = "sub-rev-sec-r1"
+        for d in (parent_brain, brain_base / rev1_cid):
+            d.mkdir(parents=True, exist_ok=True)
+        parent_payload = dict(
+            self.base_payload,
+            conversationId="parent-rev-round2",
+            artifactDirectoryPath=str(parent_brain),
+        )
+        orchestrator_guard._cli_activate(parent_payload)
+        orchestrator_guard.register_subagent(
+            parent_payload,
+            conversation_id=rev1_cid,
+            type_name="reviewer",
+            model="pro",
+            status="active",
+            review_lens="security",
+        )
+        status_r1 = orchestrator_guard._cli_status(parent_payload)
+        self.assertEqual(status_r1["activeSubagents"][rev1_cid]["status"], "active")
+        self.assertEqual(status_r1["activeSubagents"][rev1_cid]["reviewLens"], "security")
+
+        res_dup_active = orchestrator_guard.handle_pre_tool(
+            dict(
+                parent_payload,
+                toolCall={
+                    "id": "rev_dup_active",
+                    "name": "invoke_subagent",
+                    "args": _rev_entry("security", role="Round 2 Early"),
+                },
+            )
+        )
+        self.assertEqual(res_dup_active["decision"], "deny")
+        self.assertIn("Duplicate REVIEW_LENS 'security'", res_dup_active["reason"])
+
+        # Round-1 reviewer completes via handle_stop
+        res_stop_r1 = orchestrator_guard.handle_stop(
+            dict(
+                self.base_payload,
+                conversationId=rev1_cid,
+                artifactDirectoryPath=str(brain_base / rev1_cid),
+                lastAssistantMessage=(
+                    "STATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: git diff\nNOTES: VERDICT: REQUEST_CHANGES"
+                ),
+                fullyIdle=True,
+            )
+        )
+        self.assertEqual(res_stop_r1["decision"], "allow")
+
+        # Round-2 fresh reviewer reusing "security" is now allowed
+        res_r2 = orchestrator_guard.handle_pre_tool(
+            dict(
+                parent_payload,
+                toolCall={
+                    "id": "rev_r2_ok",
+                    "name": "invoke_subagent",
+                    "args": _rev_entry("security", role="Round 2 Fresh Security"),
+                },
+            )
+        )
+        self.assertEqual(res_r2["decision"], "allow")
+
+    def test_orchestrator_guard_failsafe_catches_import_indentation_error(self) -> None:
+        import shutil
+        import subprocess
+
+        scripts_copy = Path(self.artifact_dir) / "scripts_copy"
+        guard_copy = scripts_copy / "guard"
+        guard_copy.mkdir(parents=True, exist_ok=True)
+        src_script = Path(orchestrator_guard.__file__).resolve()
+        dst_script = scripts_copy / "orchestrator_guard.py"
+        shutil.copy2(src_script, dst_script)
+        (guard_copy / "__init__.py").write_text(
+            "def broken():\n  pass\n   bad_indent = 1\n",
+            encoding="utf-8",
+        )
+
+        for mode in ("pre-tool", "stop", "post-tool"):
+            proc = subprocess.run(
+                [sys.executable, str(dst_script), mode],
+                input="{}",
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, f"mode={mode} stderr={proc.stderr}")
+            out = json.loads(proc.stdout.strip())
+            if mode in ("pre-tool", "stop"):
+                self.assertEqual(out.get("decision"), "allow")
+                self.assertIn("Guard fail-safe:", out.get("reason", ""))
+            else:
+                self.assertEqual(out, {})
+
+    def test_plan_execute_phase_persists_across_steps_and_subagent_wakeups(self) -> None:
+        orchestrator_guard._cli_activate(self.base_payload)
+        plan_text = "ALLOWED_FILES: file_a.py, file_b.py, file_c.py\n1. Implement feature"
+        res_exit = orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                lastUserInput="Implement feature",
+                toolCall={"name": "exit_plan_mode", "args": {"plan": plan_text}},
+            )
+        )
+        self.assertEqual(res_exit["decision"], "allow")
+        st = orchestrator_guard._load_state(self.base_payload)
+        self.assertTrue(st.get("plan_execute_phase"))
+        self.assertEqual(st.get("plan_execute_user_input"), "Implement feature")
+        self.assertFalse(st.get("plan_execute_turn_finished"))
+
+        # Repeated PreInvocation calls with identical lastUserInput preserve plan_execute_phase
+        for inv_num in (2, 3):
+            orchestrator_guard.handle_pre_invocation(
+                dict(self.base_payload, invocationNum=inv_num, lastUserInput="Implement feature")
+            )
+            st_step = orchestrator_guard._load_state(self.base_payload)
+            self.assertTrue(st_step.get("plan_execute_phase"))
+            self.assertTrue(st_step.get("plan_execute_consumed"))
+            self.assertEqual(
+                st_step.get("plan_allowed_files"),
+                ["file_a.py", "file_b.py", "file_c.py"],
+            )
+
+        # Active subagent prevents idle stop from marking plan_execute_turn_finished
+        orchestrator_guard.register_subagent(
+            self.base_payload,
+            conversation_id="sub-active-plan-1",
+            type_name="implementer",
+            model="flash",
+            status="active",
+        )
+        res_stop_active = orchestrator_guard.handle_stop(
+            dict(self.base_payload, fullyIdle=True)
+        )
+        self.assertEqual(res_stop_active["decision"], "allow")
+        st_after_active_stop = orchestrator_guard._load_state(self.base_payload)
+        self.assertFalse(st_after_active_stop.get("plan_execute_turn_finished"))
+        orchestrator_guard.handle_pre_invocation(
+            dict(self.base_payload, invocationNum=4, lastUserInput="Implement feature")
+        )
+        self.assertTrue(
+            orchestrator_guard._load_state(self.base_payload).get("plan_execute_phase")
+        )
+
+        # Active pending_spawn also preserves plan_execute_phase across idle stop & wakeup
+        st_pending = orchestrator_guard._load_state(self.base_payload)
+        st_pending["subagents"]["sub-active-plan-1"]["status"] = "completed"
+        st_pending["pending_spawns"] = [
+            {"type": "implementer", "role": "worker", "status": "active"}
+        ]
+        orchestrator_guard._save_state(self.base_payload, st_pending)
+        orchestrator_guard.handle_stop(dict(self.base_payload, fullyIdle=True))
+        self.assertFalse(
+            orchestrator_guard._load_state(self.base_payload).get("plan_execute_turn_finished")
+        )
+        orchestrator_guard.handle_pre_invocation(
+            dict(self.base_payload, invocationNum=5, lastUserInput="Implement feature")
+        )
+        self.assertTrue(
+            orchestrator_guard._load_state(self.base_payload).get("plan_execute_phase")
+        )
+
+        # A new lastUserInput resets plan_execute_phase and plan_allowed_files
+        orchestrator_guard.handle_pre_invocation(
+            dict(self.base_payload, invocationNum=6, lastUserInput="Next task")
+        )
+        st_new_input = orchestrator_guard._load_state(self.base_payload)
+        self.assertFalse(st_new_input.get("plan_execute_phase"))
+        self.assertIsNone(st_new_input.get("plan_allowed_files"))
+        self.assertIsNone(st_new_input.get("plan_execute_user_input"))
+        self.assertFalse(st_new_input.get("plan_execute_turn_finished"))
+
+        # Idle root handle_stop with no active subagents marks turn finished; same lastUserInput then resets
+        st_clear = orchestrator_guard._load_state(self.base_payload)
+        st_clear["pending_spawns"] = []
+        orchestrator_guard._save_state(self.base_payload, st_clear)
+        orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                lastUserInput="Implement feature 2",
+                toolCall={"name": "exit_plan_mode", "args": {"plan": plan_text}},
+            )
+        )
+        orchestrator_guard.handle_pre_invocation(
+            dict(self.base_payload, invocationNum=7, lastUserInput="Implement feature 2")
+        )
+        orchestrator_guard.handle_stop(dict(self.base_payload, fullyIdle=True))
+        st_turn_done = orchestrator_guard._load_state(self.base_payload)
+        self.assertTrue(st_turn_done.get("plan_execute_turn_finished"))
+        orchestrator_guard.handle_pre_invocation(
+            dict(self.base_payload, invocationNum=8, lastUserInput="Implement feature 2")
+        )
+        st_after_done = orchestrator_guard._load_state(self.base_payload)
+        self.assertFalse(st_after_done.get("plan_execute_phase"))
+        self.assertIsNone(st_after_done.get("plan_allowed_files"))
+
+        # [plan review] still resets immediately
+        orchestrator_guard.handle_pre_tool(
+            dict(
+                self.base_payload,
+                lastUserInput="Implement feature 3",
+                toolCall={"name": "exit_plan_mode", "args": {"plan": plan_text}},
+            )
+        )
+        orchestrator_guard.handle_pre_invocation(
+            dict(self.base_payload, invocationNum=9, lastUserInput="Please run [plan review]")
+        )
+        st_review = orchestrator_guard._load_state(self.base_payload)
+        self.assertFalse(st_review.get("plan_execute_phase"))
+        self.assertIsNone(st_review.get("plan_allowed_files"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -58,7 +58,7 @@ def _default_state() -> Dict[str, Any]:
         "subagents": {},
         "stop_reminded_executions": [],
         "direct_budget": {},
-        "test_receipt": {},
+        "test_receipt": {"mutation_epoch": 0},
         "circuit_breaker": {
             "failure_streak": 0,
             "tripped": False,
@@ -68,6 +68,8 @@ def _default_state() -> Dict[str, Any]:
         },
         "plan_execute_phase": False,
         "plan_execute_consumed": False,
+        "plan_execute_user_input": None,
+        "plan_execute_turn_finished": False,
         "plan_allowed_files": None,
         "current_invocation_num": 0,
     }
@@ -193,6 +195,8 @@ def _load_state(payload_or_path: Any) -> Dict[str, Any]:
                 )
                 if isinstance(data.get("circuit_breaker"), dict):
                     data["circuit_breaker"].setdefault("replan_count", 0)
+                if isinstance(data.get("test_receipt"), dict):
+                    data["test_receipt"].setdefault("mutation_epoch", 0)
                 return data
         return _default_state()
 
