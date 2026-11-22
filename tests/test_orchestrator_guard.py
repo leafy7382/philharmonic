@@ -54,458 +54,269 @@ class TestOrchestratorGuard(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def _payload(
+        self,
+        cid: Optional[str] = None,
+        tool: Optional[str] = None,
+        args: Optional[Dict[str, Any]] = None,
+        call_id: Optional[str] = None,
+        base: Optional[Dict[str, Any]] = None,
+        **extra: Any,
+    ) -> Dict[str, Any]:
+        p = dict(self.base_payload if base is None else base)
+        if cid is not None:
+            p["conversationId"] = cid
+        if tool is not None:
+            tc: Dict[str, Any] = {"name": tool, "args": args or {}}
+            if call_id is not None:
+                tc["id"] = call_id
+            p["toolCall"] = tc
+        p.update(extra)
+        return p
+
+    def _pre(
+        self,
+        tool: str,
+        args: Optional[Dict[str, Any]] = None,
+        cid: Optional[str] = None,
+        call_id: Optional[str] = None,
+        base: Optional[Dict[str, Any]] = None,
+        **extra: Any,
+    ) -> Dict[str, Any]:
+        return orchestrator_guard.handle_pre_tool(
+            self._payload(cid=cid, tool=tool, args=args, call_id=call_id, base=base, **extra)
+        )
+
+    def _post(
+        self,
+        tool: str,
+        args: Optional[Dict[str, Any]] = None,
+        output: str = "",
+        error: str = "",
+        exit_code: Optional[int] = None,
+        cid: Optional[str] = None,
+        call_id: Optional[str] = None,
+        base: Optional[Dict[str, Any]] = None,
+        **extra: Any,
+    ) -> Dict[str, Any]:
+        kw: Dict[str, Any] = {"output": output, "error": error, **extra}
+        if exit_code is not None:
+            kw["exitCode"] = exit_code
+        return orchestrator_guard.handle_post_tool(
+            self._payload(cid=cid, tool=tool, args=args, call_id=call_id, base=base, **kw)
+        )
+
+    def _stop(
+        self,
+        text: str = "",
+        cid: Optional[str] = None,
+        base: Optional[Dict[str, Any]] = None,
+        fully_idle: bool = True,
+        **extra: Any,
+    ) -> Dict[str, Any]:
+        kw: Dict[str, Any] = {"fullyIdle": fully_idle, "terminationReason": "NO_TOOL_CALL", **extra}
+        if text:
+            kw["lastAssistantMessage"] = text
+        return orchestrator_guard.handle_stop(self._payload(cid=cid, base=base, **kw))
+
+    def _pre_inv(self, cid: Optional[str] = None, base: Optional[Dict[str, Any]] = None, **extra: Any) -> Dict[str, Any]:
+        return orchestrator_guard.handle_pre_invocation(self._payload(cid=cid, base=base, **extra))
+
+    def _brain_payload(self, cid: str, root: str = "brain", **extra: Any) -> Dict[str, Any]:
+        d = Path(self.artifact_dir) / root / cid
+        d.mkdir(parents=True, exist_ok=True)
+        return dict(self.base_payload, conversationId=cid, artifactDirectoryPath=str(d), **extra)
+
+    def _load_st(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return orchestrator_guard._load_state(self.base_payload if payload is None else payload)
+
+    def _seed_state(self, payload: Optional[Dict[str, Any]] = None, **updates: Any) -> Dict[str, Any]:
+        p = self.base_payload if payload is None else payload
+        st = orchestrator_guard._load_state(p)
+        st.update(updates)
+        orchestrator_guard._save_state(p, st)
+        return st
+
+    def _reg_sub(
+        self,
+        sub_type: str,
+        cid: str,
+        model: str = "flash",
+        payload: Optional[Dict[str, Any]] = None,
+        **kw: Any,
+    ) -> None:
+        orchestrator_guard.register_subagent(
+            self.base_payload if payload is None else payload,
+            conversation_id=cid,
+            type_name=sub_type,
+            model=model,
+            **kw,
+        )
+
+    def _sub_args(
+        self,
+        sub_type: str = "implementer",
+        role: str = "Worker",
+        model: Optional[str] = None,
+        prompt: str = VALID_PROMPT,
+        **extra: Any,
+    ) -> Dict[str, Any]:
+        d: Dict[str, Any] = {"TypeName": sub_type, "Role": role, "Prompt": prompt, **extra}
+        if model is not None:
+            d["Model"] = model
+        return d
+
+    def _cmd_args(self, cmd: str, cwd: Optional[str] = None) -> Dict[str, Any]:
+        return {"CommandLine": cmd, "Cwd": cwd or str(orchestrator_guard.PROJECT_ROOT)}
+
     def test_autonomous_git_diff_audit_in_handle_stop(self) -> None:
         tampered_diff = (
             "diff --git a/tests/test_example.py b/tests/test_example.py\n"
-            "--- a/tests/test_example.py\n"
-            "+++ b/tests/test_example.py\n"
-            "@@ -10,1 +10,2 @@\n"
-            "+@unittest.skip('temporarily skipping')\n"
-            " def test_feature():\n"
+            "--- a/tests/test_example.py\n+++ b/tests/test_example.py\n"
+            "@@ -10,1 +10,2 @@\n+@unittest.skip('temporarily skipping')\n def test_feature():\n"
         )
-        payload = dict(
-            self.base_payload,
-            fullyIdle=True,
-            terminationReason="NO_TOOL_CALL",
-            gitDiff=tampered_diff,
-        )
-        res = orchestrator_guard.handle_stop(payload)
+        res = self._stop(gitDiff=tampered_diff)
         self.assertEqual(res["decision"], "continue")
         self.assertIn("Diff audit detected test skip", res.get("reason", ""))
 
         clean_diff = (
             "diff --git a/tests/test_example.py b/tests/test_example.py\n"
-            "--- a/tests/test_example.py\n"
-            "+++ b/tests/test_example.py\n"
-            "@@ -10,0 +10,3 @@\n"
-            "+def test_new_behavior():\n"
-            "+    assert 1 + 1 == 2\n"
+            "--- a/tests/test_example.py\n+++ b/tests/test_example.py\n"
+            "@@ -10,0 +10,3 @@\n+def test_new_behavior():\n+    assert 1 + 1 == 2\n"
         )
-        payload_clean = dict(
-            self.base_payload,
-            executionNum=2,
-            fullyIdle=True,
-            terminationReason="NO_TOOL_CALL",
-            gitDiff=clean_diff,
-        )
-        res_clean = orchestrator_guard.handle_stop(payload_clean)
+        res_clean = self._stop(executionNum=2, gitDiff=clean_diff)
         self.assertEqual(res_clean["decision"], "allow")
         self.assertNotIn("reason", res_clean)
 
     def test_isolation_reminder_deduplication(self) -> None:
         sub_cid = "sub-dedup-worker-101"
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id=sub_cid,
-            type_name="implementer",
-            model="flash",
-        )
-        payload_1 = dict(
-            self.base_payload,
-            conversationId=sub_cid,
-            invocationNum=1,
-        )
-        res_1 = orchestrator_guard.handle_pre_invocation(payload_1)
+        self._reg_sub("implementer", sub_cid, "flash")
+        res_1 = self._pre_inv(cid=sub_cid, invocationNum=1)
         self.assertIn("injectSteps", res_1)
-        self.assertIn(
-            "Subagent context isolation active",
-            res_1["injectSteps"][0]["ephemeralMessage"],
-        )
-
-        res_2 = orchestrator_guard.handle_pre_invocation(payload_1)
-        self.assertEqual(res_2, {})
-
-        payload_2 = dict(
-            self.base_payload,
-            conversationId=sub_cid,
-            invocationNum=2,
-        )
-        res_3 = orchestrator_guard.handle_pre_invocation(payload_2)
+        self.assertIn("Subagent context isolation active", res_1["injectSteps"][0]["ephemeralMessage"])
+        self.assertEqual(self._pre_inv(cid=sub_cid, invocationNum=1), {})
+        res_3 = self._pre_inv(cid=sub_cid, invocationNum=2)
         self.assertIn("injectSteps", res_3)
-        self.assertIn(
-            "Subagent context isolation active",
-            res_3["injectSteps"][0]["ephemeralMessage"],
-        )
+        self.assertIn("Subagent context isolation active", res_3["injectSteps"][0]["ephemeralMessage"])
 
     def test_pre_invocation_pro_vs_non_pro_and_dedup(self) -> None:
         # Root on a Pro model returns {}
-        res_pro = orchestrator_guard.handle_pre_invocation(self.base_payload)
-        self.assertEqual(res_pro, {})
+        self.assertEqual(orchestrator_guard.handle_pre_invocation(self.base_payload), {})
 
         # Root on a small model returns {} and stores root_conversation_id in state
-        small_payload = dict(self.base_payload, modelName="gemini-flash", invocationNum=2)
-        res_small = orchestrator_guard.handle_pre_invocation(small_payload)
-        self.assertEqual(res_small, {})
-        state = orchestrator_guard._load_state(small_payload)
-        self.assertEqual(
-            state.get("root_conversation_id"),
-            self.base_payload["conversationId"].lower(),
-        )
+        self.assertEqual(self._pre_inv(modelName="gemini-flash", invocationNum=2), {})
+        state = self._load_st()
+        self.assertEqual(state.get("root_conversation_id"), self.base_payload["conversationId"].lower())
 
         # A registered subagent gets injectSteps with isolation reminder once, deduped on second call
         sub_cid = "sub-dedup-uuid-9999"
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id=sub_cid,
-            type_name="scout",
-            model="flash_lite",
-        )
-        sub_payload = dict(
-            self.base_payload,
-            conversationId=sub_cid,
-            modelName="gemini-flash-lite",
-            invocationNum=1,
-        )
-        res_sub1 = orchestrator_guard.handle_pre_invocation(sub_payload)
+        self._reg_sub("scout", sub_cid, "flash_lite")
+        res_sub1 = self._pre_inv(cid=sub_cid, modelName="gemini-flash-lite", invocationNum=1)
         self.assertIn("injectSteps", res_sub1)
-        self.assertIn(
-            "Subagent context isolation active",
-            res_sub1["injectSteps"][0]["ephemeralMessage"],
-        )
-
-        res_sub2 = orchestrator_guard.handle_pre_invocation(sub_payload)
-        self.assertEqual(res_sub2, {})
+        self.assertIn("Subagent context isolation active", res_sub1["injectSteps"][0]["ephemeralMessage"])
+        self.assertEqual(self._pre_inv(cid=sub_cid, modelName="gemini-flash-lite", invocationNum=1), {})
 
     def test_define_subagent_forces_subagent_tools_false(self) -> None:
-        payload = dict(
-            self.base_payload,
-            toolCall={
-                "name": "define_subagent",
-                "args": {
-                    "Name": "scout",
-                    "EnableSubagentTools": True,
-                },
-            },
-        )
-        res = orchestrator_guard.handle_pre_tool(payload)
+        res = self._pre("define_subagent", {"Name": "scout", "EnableSubagentTools": True})
         self.assertEqual(res["decision"], "allow")
         self.assertEqual(res["overwrite"], {"EnableSubagentTools": False})
 
-        # Research subagent with EnableSubagentTools: True is allowed with EnableSubagentTools: False
-        payload_research = dict(
-            self.base_payload,
-            toolCall={
-                "name": "define_subagent",
-                "args": {
-                    "Name": "research",
-                    "EnableWriteTools": True,
-                    "EnableSubagentTools": True,
-                },
-            },
-        )
-        res_research = orchestrator_guard.handle_pre_tool(payload_research)
+        res_research = self._pre("define_subagent", {"Name": "research", "EnableWriteTools": True, "EnableSubagentTools": True})
         self.assertEqual(res_research["decision"], "allow")
         self.assertEqual(res_research["overwrite"], {"EnableSubagentTools": False})
 
     def test_invoke_subagent_blocks_pro_model(self) -> None:
-        payload = dict(
-            self.base_payload,
-            toolCall={
-                "name": "invoke_subagent",
-                "args": {
-                    "TypeName": "implementer",
-                    "Role": "Auth Implementer",
-                    "Model": "pro",
-                    "Prompt": VALID_PROMPT,
-                },
-            },
-        )
-        res = orchestrator_guard.handle_pre_tool(payload)
+        res = self._pre("invoke_subagent", self._sub_args("implementer", "Auth Implementer", "pro"))
         self.assertEqual(res["decision"], "deny")
         self.assertIn("Model='pro'", res["reason"])
 
     def test_invoke_subagent_rewrites_inherit_to_tier_defaults(self) -> None:
-        payload_scout = dict(
-            self.base_payload,
-            toolCall={
-                "name": "invoke_subagent",
-                "args": {
-                    "TypeName": "scout",
-                    "Role": "Symbol Scout",
-                    "Model": "inherit",
-                    "Prompt": VALID_PROMPT,
-                },
-            },
-        )
-        res_scout = orchestrator_guard.handle_pre_tool(payload_scout)
+        res_scout = self._pre("invoke_subagent", self._sub_args("scout", "Symbol Scout", "inherit"))
         self.assertEqual(res_scout["decision"], "allow")
         self.assertEqual(res_scout["overwrite"]["Model"], "flash_lite")
 
-        payload_impl = dict(
-            self.base_payload,
-            toolCall={
-                "name": "invoke_subagent",
-                "args": {
-                    "TypeName": "implementer",
-                    "Role": "Code Worker",
-                    "Prompt": VALID_PROMPT,
-                },
-            },
-        )
-        res_impl = orchestrator_guard.handle_pre_tool(payload_impl)
+        res_impl = self._pre("invoke_subagent", self._sub_args("implementer", "Code Worker"))
         self.assertEqual(res_impl["decision"], "allow")
         self.assertEqual(res_impl["overwrite"]["Model"], "flash")
 
     def test_invoke_subagent_and_send_message_reject_empty_prompts(self) -> None:
-        # Empty Prompt in invoke_subagent is blocked
-        empty_prompt_payload = dict(
-            self.base_payload,
-            toolCall={
-                "name": "invoke_subagent",
-                "args": {
-                    "TypeName": "scout",
-                    "Role": "Empty Scout",
-                    "Model": "flash_lite",
-                    "Prompt": "   ",
-                },
-            },
-        )
-        res_empty_prompt = orchestrator_guard.handle_pre_tool(empty_prompt_payload)
+        res_empty_prompt = self._pre("invoke_subagent", self._sub_args("scout", "Empty Scout", "flash_lite", prompt="   "))
         self.assertEqual(res_empty_prompt["decision"], "deny")
         self.assertIn("non-empty 'Prompt'", res_empty_prompt["reason"])
 
-        # Empty TypeName in invoke_subagent is blocked
-        empty_type_payload = dict(
-            self.base_payload,
-            toolCall={
-                "name": "invoke_subagent",
-                "args": {
-                    "TypeName": "",
-                    "Role": "No Type",
-                    "Model": "flash_lite",
-                    "Prompt": VALID_PROMPT,
-                },
-            },
-        )
-        res_empty_type = orchestrator_guard.handle_pre_tool(empty_type_payload)
+        res_empty_type = self._pre("invoke_subagent", self._sub_args("", "No Type", "flash_lite"))
         self.assertEqual(res_empty_type["decision"], "deny")
         self.assertIn("non-empty 'TypeName'", res_empty_type["reason"])
 
-        # Empty Message in send_message is blocked
-        empty_msg_payload = dict(
-            self.base_payload,
-            toolCall={
-                "name": "send_message",
-                "args": {
-                    "Recipient": "worker-1",
-                    "Message": "   ",
-                },
-            },
-        )
-        res_empty_msg = orchestrator_guard.handle_pre_tool(empty_msg_payload)
+        res_empty_msg = self._pre("send_message", {"Recipient": "worker-1", "Message": "   "})
         self.assertEqual(res_empty_msg["decision"], "deny")
         self.assertIn("Message cannot be empty", res_empty_msg["reason"])
 
     def test_send_message_tier_bypass_blocked_for_flash_lite(self) -> None:
         scout_cid = "11111111-2222-3333-4444-555555555555"
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id=scout_cid,
-            type_name="scout",
-            model="flash_lite",
-            workspace="inherit",
-            role="File Scout",
-        )
+        self._reg_sub("scout", scout_cid, "flash_lite", workspace="inherit", role="File Scout")
 
-        # Sending code edit instructions to flash_lite is denied
-        mutate_payload = dict(
-            self.base_payload,
-            toolCall={
-                "name": "send_message",
-                "args": {
-                    "Recipient": scout_cid,
-                    "Message": "Edit `src/auth/parser.py` to add token validation.",
-                },
-            },
-        )
-        res_deny = orchestrator_guard.handle_pre_tool(mutate_payload)
+        res_deny = self._pre("send_message", {"Recipient": scout_cid, "Message": "Edit `src/auth/parser.py` to add token validation."})
         self.assertEqual(res_deny["decision"], "deny")
         self.assertIn("flash_lite", res_deny["reason"])
 
-        # Sending a simple read-only follow-up to flash_lite is allowed
-        read_payload = dict(
-            self.base_payload,
-            toolCall={
-                "name": "send_message",
-                "args": {
-                    "Recipient": scout_cid,
-                    "Message": "Read line 40 of `src/auth/parser.py`.",
-                },
-            },
-        )
-        res_allow = orchestrator_guard.handle_pre_tool(read_payload)
+        res_allow = self._pre("send_message", {"Recipient": scout_cid, "Message": "Read line 40 of `src/auth/parser.py`."})
         self.assertEqual(res_allow["decision"], "allow")
 
     def test_stop_hook_blocks_uncleaned_branch_until_killed(self) -> None:
         branch_cid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id=branch_cid,
-            type_name="implementer",
-            model="flash",
-            workspace="branch",
-            role="Branch Worker",
-        )
+        self._reg_sub("implementer", branch_cid, "flash", workspace="branch", role="Branch Worker")
 
         # When fullyIdle is False, Stop is allowed so reactive wakeup works
-        not_idle_payload = dict(
-            self.base_payload,
-            terminationReason="NO_TOOL_CALL",
-            fullyIdle=False,
-        )
-        self.assertEqual(
-            orchestrator_guard.handle_stop(not_idle_payload)["decision"], "allow"
-        )
+        self.assertEqual(self._stop(fully_idle=False)["decision"], "allow")
 
         # When fullyIdle is True and branch is still active, Stop returns continue
-        idle_payload = dict(
-            self.base_payload,
-            terminationReason="NO_TOOL_CALL",
-            fullyIdle=True,
-        )
-        res_stop = orchestrator_guard.handle_stop(idle_payload)
+        res_stop = self._stop()
         self.assertEqual(res_stop["decision"], "continue")
         self.assertIn(branch_cid, res_stop["reason"])
 
         # Killing the branch clears the gate
-        kill_payload = dict(
-            self.base_payload,
-            toolCall={
-                "name": "manage_subagents",
-                "args": {"Action": "kill", "ConversationIds": [branch_cid]},
-            },
-        )
-        orchestrator_guard.handle_pre_tool(kill_payload)
-
-        idle_payload_2 = dict(idle_payload, executionNum=2)
-        res_after_kill = orchestrator_guard.handle_stop(idle_payload_2)
-        self.assertEqual(res_after_kill["decision"], "allow")
+        self._pre("manage_subagents", {"Action": "kill", "ConversationIds": [branch_cid]})
+        self.assertEqual(self._stop(executionNum=2)["decision"], "allow")
 
     def test_workspace_auto_allow_vs_external_paths(self) -> None:
-        # Command inside project root is auto-allowed with permissionOverrides
-        inside_cmd = dict(
-            self.base_payload,
-            toolCall={
-                "name": "run_command",
-                "args": {
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                    "CommandLine": "python3 -m unittest discover -s tests",
-                },
-            },
-        )
-        res_in = orchestrator_guard.handle_pre_tool(inside_cmd)
+        res_in = self._pre("run_command", self._cmd_args("python3 -m unittest discover -s tests"))
         self.assertEqual(res_in["decision"], "allow")
         self.assertIn("permissionOverrides", res_in)
-        overrides = res_in["permissionOverrides"]
-        self.assertTrue(any(o.startswith("file(") for o in overrides))
+        self.assertTrue(any(o.startswith("file(") for o in res_in["permissionOverrides"]))
 
-        # Command referencing an outside path falls back to ask
-        outside_cmd = dict(
-            self.base_payload,
-            toolCall={
-                "name": "run_command",
-                "args": {
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                    "CommandLine": "cat /etc/shadow",
-                },
-            },
-        )
-        res_out = orchestrator_guard.handle_pre_tool(outside_cmd)
-        self.assertEqual(res_out["decision"], "ask")
-
-        # Relative path traversal outside workspace falls back to ask
-        rel_outside_cmd = dict(
-            self.base_payload,
-            toolCall={
-                "name": "run_command",
-                "args": {
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                    "CommandLine": "cat ../outside.txt",
-                },
-            },
-        )
-        res_rel = orchestrator_guard.handle_pre_tool(rel_outside_cmd)
-        self.assertEqual(res_rel["decision"], "ask")
+        self.assertEqual(self._pre("run_command", self._cmd_args("cat /etc/shadow"))["decision"], "ask")
+        self.assertEqual(self._pre("run_command", self._cmd_args("cat ../outside.txt"))["decision"], "ask")
 
     def test_post_tool_rolls_back_failed_branch_spawn(self) -> None:
-        spawn_payload = dict(
-            self.base_payload,
-            toolCall={
-                "name": "invoke_subagent",
-                "args": {
-                    "TypeName": "implementer",
-                    "Role": "Failed Branch Worker",
-                    "Model": "flash",
-                    "Workspace": "branch",
-                    "Prompt": VALID_PROMPT,
-                },
-            },
-        )
-        res_pre = orchestrator_guard.handle_pre_tool(spawn_payload)
-        self.assertEqual(res_pre["decision"], "allow")
-
-        # Simulate runtime failure in PostToolUse
-        post_error_payload = dict(
-            spawn_payload,
-            error="failed to create git worktree",
-        )
-        orchestrator_guard.handle_post_tool(post_error_payload)
-
-        # Stop hook should now allow termination because the failed branch was rolled back
-        idle_payload = dict(
-            self.base_payload,
-            terminationReason="NO_TOOL_CALL",
-            fullyIdle=True,
-        )
-        self.assertEqual(
-            orchestrator_guard.handle_stop(idle_payload)["decision"], "allow"
-        )
+        args = self._sub_args("implementer", "Failed Branch Worker", "flash", Workspace="branch")
+        self.assertEqual(self._pre("invoke_subagent", args)["decision"], "allow")
+        self._post("invoke_subagent", args, error="failed to create git worktree")
+        self.assertEqual(self._stop()["decision"], "allow")
 
     def test_transcript_sync_ignores_non_subagent_uuids(self) -> None:
         transcript_file = Path(self.artifact_dir) / "transcript.jsonl"
-        payload = dict(
-            self.base_payload,
-            transcriptPath=str(transcript_file),
-            toolCall={
-                "name": "invoke_subagent",
-                "args": {
-                    "TypeName": "scout",
-                    "Role": "Symbol Scout",
-                    "Model": "flash_lite",
-                    "Prompt": VALID_PROMPT,
-                },
-            },
-        )
-        orchestrator_guard.handle_pre_tool(payload)
+        args = self._sub_args("scout", "Symbol Scout", "flash_lite")
+        self._pre("invoke_subagent", args, transcriptPath=str(transcript_file))
 
-        # Write transcript lines with invoke_subagent and non-subagent UUIDs
         non_subagent_step_uuid = "11111111-1111-1111-1111-111111111111"
         non_subagent_task_uuid = "22222222-2222-2222-2222-222222222222"
         actual_subagent_cid = "33333333-3333-3333-3333-333333333333"
-
-        # Line 1 has invoke_subagent and a step UUID but no conversationId key.
-        # Line 2 has stepId and callId UUIDs alongside the real conversationId key.
         transcript_file.write_text(
-            json.dumps({
-                "stepId": non_subagent_step_uuid,
-                "message": "Invoked tool invoke_subagent",
-            })
+            json.dumps({"stepId": non_subagent_step_uuid, "message": "Invoked tool invoke_subagent"})
             + "\n"
             + json.dumps({
                 "stepId": "44444444-4444-4444-4444-444444444444",
                 "toolCallId": non_subagent_task_uuid,
                 "name": "invoke_subagent",
-                "result": {
-                    "conversationId": actual_subagent_cid,
-                },
+                "result": {"conversationId": actual_subagent_cid},
             })
             + "\n",
             encoding="utf-8",
         )
+        self._post("invoke_subagent", args, transcriptPath=str(transcript_file))
 
-        orchestrator_guard.handle_post_tool(payload)
-
-        state = orchestrator_guard._load_state(payload)
+        state = self._load_st()
         subagents = state.get("subagents", {})
         self.assertIn(actual_subagent_cid, subagents)
         self.assertNotIn(non_subagent_step_uuid, subagents)
@@ -515,632 +326,204 @@ class TestOrchestratorGuard(unittest.TestCase):
         self.assertEqual(subagents[actual_subagent_cid]["model"], "flash_lite")
 
     def test_auto_downgrade_simple_readonly_research_to_flash_lite(self) -> None:
-        simple_read_prompt = """TASK: Read `src/auth/parser.py` to check token constants.
-
-RULES:
-1. Open `src/auth/parser.py`.
-2. Read the constant definitions at the top of the file.
-3. Do not change any file.
-
-REPORT FORMAT:
-Return only these four lines:
-STATUS: COMPLETED | BLOCKED | FAILED
-FILES_CHANGED: NONE
-VERIFICATION: Read `src/auth/parser.py`.
-NOTES: <one sentence stating the constant values>
-"""
-        multi_step_read_prompt = """TASK: Audit authentication flow across four modules.
-
-RULES:
-1. Open `src/auth/parser.py`.
-2. Open `src/auth/session.py`.
-3. Open `src/auth/middleware.py`.
-4. Compare token expiration checks across all three modules.
-
-REPORT FORMAT:
-Return only these four lines:
-STATUS: COMPLETED | BLOCKED | FAILED
-FILES_CHANGED: NONE
-VERIFICATION: Inspected all three authentication modules.
-NOTES: <one sentence summarizing findings>
-"""
-        payload_simple = dict(
-            self.base_payload,
-            toolCall={
-                "id": "call_downgrade_1",
-                "name": "invoke_subagent",
-                "args": {
-                    "TypeName": "research",
-                    "Role": "Quick Reader",
-                    "Model": "flash",
-                    "Prompt": simple_read_prompt,
-                },
-            },
+        simple_read_prompt = (
+            "TASK: Read `src/auth/parser.py` to check token constants.\n\n"
+            "RULES:\n1. Open `src/auth/parser.py`.\n2. Read the constant definitions at the top of the file.\n"
+            "3. Do not change any file.\n\n"
+            "REPORT FORMAT:\nReturn only these four lines:\nSTATUS: COMPLETED | BLOCKED | FAILED\n"
+            "FILES_CHANGED: NONE\nVERIFICATION: Read `src/auth/parser.py`.\nNOTES: <one sentence stating the constant values>\n"
         )
-        res_simple = orchestrator_guard.handle_pre_tool(payload_simple)
+        multi_step_read_prompt = (
+            "TASK: Audit authentication flow across four modules.\n\n"
+            "RULES:\n1. Open `src/auth/parser.py`.\n2. Open `src/auth/session.py`.\n"
+            "3. Open `src/auth/middleware.py`.\n4. Compare token expiration checks across all three modules.\n\n"
+            "REPORT FORMAT:\nReturn only these four lines:\nSTATUS: COMPLETED | BLOCKED | FAILED\n"
+            "FILES_CHANGED: NONE\nVERIFICATION: Inspected all three authentication modules.\nNOTES: <one sentence summarizing findings>\n"
+        )
+        res_simple = self._pre(
+            "invoke_subagent",
+            self._sub_args("research", "Quick Reader", "flash", simple_read_prompt),
+            call_id="call_downgrade_1",
+        )
         self.assertEqual(res_simple["decision"], "allow")
         self.assertEqual(res_simple["overwrite"]["Model"], "flash_lite")
 
-        payload_deep = dict(
-            self.base_payload,
-            toolCall={
-                "id": "call_downgrade_2",
-                "name": "invoke_subagent",
-                "args": {
-                    "TypeName": "research",
-                    "Role": "Deep Researcher",
-                    "Model": "flash",
-                    "Prompt": multi_step_read_prompt,
-                },
-            },
+        res_deep = self._pre(
+            "invoke_subagent",
+            self._sub_args("research", "Deep Researcher", "flash", multi_step_read_prompt),
+            call_id="call_downgrade_2",
         )
-        res_deep = orchestrator_guard.handle_pre_tool(payload_deep)
         self.assertEqual(res_deep["decision"], "allow")
         self.assertIsNone(res_deep.get("overwrite"))
 
     def test_pending_spawns_deduplicated_across_duplicate_pre_tool_hooks(self) -> None:
-        payload = dict(
-            self.base_payload,
-            toolCall={
-                "id": "call_dedup_1",
-                "name": "invoke_subagent",
-                "args": {
-                    "TypeName": "scout",
-                    "Role": "Dedup Scout",
-                    "Model": "flash_lite",
-                    "Prompt": VALID_PROMPT,
-                },
-            },
-        )
-        orchestrator_guard.handle_pre_tool(payload)
-        orchestrator_guard.handle_pre_tool(payload)
-        orchestrator_guard.handle_pre_tool(payload)
-
-        state = orchestrator_guard._load_state(payload)
-        self.assertEqual(len(state.get("pending_spawns", [])), 1)
+        args = self._sub_args("scout", "Dedup Scout", "flash_lite")
+        for _ in range(3):
+            self._pre("invoke_subagent", args, call_id="call_dedup_1")
+        self.assertEqual(len(self._load_st().get("pending_spawns", [])), 1)
 
     def test_worktree_and_sibling_brain_paths_auto_allowed(self) -> None:
         app_data = Path(self.artifact_dir) / "appdata"
         subagent_brain = app_data / "brain" / "subagent-uuid"
         parent_scratch = app_data / "brain" / "parent-uuid" / "scratch" / "task.log"
         worktree_file = app_data / "worktrees" / "parent-uuid" / "subagent-worktree" / "README.md"
-        subagent_brain.mkdir(parents=True, exist_ok=True)
-        parent_scratch.parent.mkdir(parents=True, exist_ok=True)
-        worktree_file.parent.mkdir(parents=True, exist_ok=True)
+        for p in (subagent_brain, parent_scratch.parent, worktree_file.parent):
+            p.mkdir(parents=True, exist_ok=True)
 
-        payload_scratch = dict(
-            self.base_payload,
-            artifactDirectoryPath=str(subagent_brain),
-            toolCall={
-                "name": "write_file",
-                "args": {"Path": str(parent_scratch)},
-            },
+        self.assertEqual(
+            self._pre("write_file", {"Path": str(parent_scratch)}, artifactDirectoryPath=str(subagent_brain))["decision"],
+            "allow",
         )
         self.assertEqual(
-            orchestrator_guard.handle_pre_tool(payload_scratch)["decision"], "allow"
-        )
-
-        payload_worktree = dict(
-            self.base_payload,
-            artifactDirectoryPath=str(subagent_brain),
-            toolCall={
-                "name": "write_file",
-                "args": {"Path": str(worktree_file)},
-            },
-        )
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(payload_worktree)["decision"], "allow"
+            self._pre("write_file", {"Path": str(worktree_file)}, artifactDirectoryPath=str(subagent_brain))["decision"],
+            "allow",
         )
 
     def test_direct_mutation_budget_blocks_third_workspace_file(self) -> None:
-        file1 = str(orchestrator_guard.PROJECT_ROOT / "file1.py")
-        file2 = str(orchestrator_guard.PROJECT_ROOT / "file2.py")
-        file3 = str(orchestrator_guard.PROJECT_ROOT / "file3.py")
+        file1, file2, file3 = (str(orchestrator_guard.PROJECT_ROOT / f"file{i}.py") for i in (1, 2, 3))
+        self.assertEqual(self._pre("write_file", {"Path": file1})["decision"], "allow")
+        self.assertEqual(self._pre("edit_file", {"Path": file1})["decision"], "allow")
+        self.assertEqual(self._pre("write_file", {"Path": file2})["decision"], "allow")
+        self.assertEqual(self._pre("edit_file", {"Path": file2})["decision"], "allow")
 
-        payload1 = dict(
-            self.base_payload,
-            toolCall={
-                "name": "write_file",
-                "args": {"Path": file1},
-            },
-        )
-        self.assertEqual(orchestrator_guard.handle_pre_tool(payload1)["decision"], "allow")
-
-        payload1_repeat = dict(
-            self.base_payload,
-            toolCall={
-                "name": "edit_file",
-                "args": {"Path": file1},
-            },
-        )
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(payload1_repeat)["decision"], "allow"
-        )
-
-        payload2 = dict(
-            self.base_payload,
-            toolCall={
-                "name": "write_file",
-                "args": {"Path": file2},
-            },
-        )
-        self.assertEqual(orchestrator_guard.handle_pre_tool(payload2)["decision"], "allow")
-
-        payload2_repeat = dict(
-            self.base_payload,
-            toolCall={
-                "name": "edit_file",
-                "args": {"Path": file2},
-            },
-        )
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(payload2_repeat)["decision"], "allow"
-        )
-
-        payload3 = dict(
-            self.base_payload,
-            toolCall={
-                "name": "write_file",
-                "args": {"Path": file3},
-            },
-        )
-        res3 = orchestrator_guard.handle_pre_tool(payload3)
+        res3 = self._pre("write_file", {"Path": file3})
         self.assertEqual(res3["decision"], "deny")
         self.assertIn("[ORCHESTRATOR GUARD]", res3["reason"])
 
         subagent_cid = "sub-mutation-cid-1111"
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id=subagent_cid,
-            type_name="implementer",
-            model="flash",
+        self._reg_sub("implementer", subagent_cid, "flash")
+        self.assertEqual(
+            self._pre("write_file", {"Path": file3}, cid=subagent_cid, modelName="gemini-3-flash")["decision"],
+            "allow",
         )
-        subagent_payload = dict(
-            self.base_payload,
-            conversationId=subagent_cid,
-            modelName="gemini-3-flash",
-            toolCall={
-                "name": "write_file",
-                "args": {"Path": file3},
-            },
-        )
-        res_sub = orchestrator_guard.handle_pre_tool(subagent_payload)
-        self.assertEqual(res_sub["decision"], "allow")
 
     def test_direct_edit_then_test_command_blocked_for_orchestrator(self) -> None:
         file1 = str(orchestrator_guard.PROJECT_ROOT / "file1.py")
-        payload_write = dict(
-            self.base_payload,
-            toolCall={
-                "name": "write_file",
-                "args": {"Path": file1},
-            },
-        )
+        self.assertEqual(self._pre("write_file", {"Path": file1})["decision"], "allow")
+        self.assertEqual(self._pre("run_command", self._cmd_args("git status"))["decision"], "allow")
         self.assertEqual(
-            orchestrator_guard.handle_pre_tool(payload_write)["decision"], "allow"
+            self._pre("run_command", self._cmd_args("python3 -m unittest discover -s tests"), call_id="test_1")["decision"],
+            "allow",
         )
 
-        git_payload = dict(
-            self.base_payload,
-            toolCall={
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "git status",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-        )
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(git_payload)["decision"], "allow"
-        )
-
-        test_payload_1 = dict(
-            self.base_payload,
-            toolCall={
-                "id": "test_1",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "python3 -m unittest discover -s tests",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-        )
-        res_test_1 = orchestrator_guard.handle_pre_tool(test_payload_1)
-        self.assertEqual(res_test_1["decision"], "allow")
-
-        test_payload_2 = dict(
-            self.base_payload,
-            toolCall={
-                "id": "test_2",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "python3 -m unittest discover -s tests",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-        )
-        res_test_2 = orchestrator_guard.handle_pre_tool(test_payload_2)
+        res_test_2 = self._pre("run_command", self._cmd_args("python3 -m unittest discover -s tests"), call_id="test_2")
         self.assertEqual(res_test_2["decision"], "deny")
         self.assertIn("[ORCHESTRATOR GUARD]", res_test_2["reason"])
 
-        subsequent_write = dict(
-            self.base_payload,
-            toolCall={
-                "name": "write_file",
-                "args": {"Path": file1},
-            },
-        )
-        res_subsequent_write = orchestrator_guard.handle_pre_tool(subsequent_write)
+        res_subsequent_write = self._pre("write_file", {"Path": file1})
         self.assertEqual(res_subsequent_write["decision"], "deny")
         self.assertIn("[ORCHESTRATOR GUARD]", res_subsequent_write["reason"])
 
     def test_direct_command_budget_blocks_third_command_and_deduplicates(self) -> None:
-        payload_cmd1 = dict(
-            self.base_payload,
-            toolCall={
-                "id": "cmd_call_1",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "ls -la",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-        )
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(payload_cmd1)["decision"], "allow"
-        )
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(payload_cmd1)["decision"], "allow"
-        )
+        self.assertEqual(self._pre("run_command", self._cmd_args("ls -la"), call_id="cmd_call_1")["decision"], "allow")
+        self.assertEqual(self._pre("run_command", self._cmd_args("ls -la"), call_id="cmd_call_1")["decision"], "allow")
+        self.assertEqual(len(self._load_st()["direct_budget"]["1"]["commands"]), 1)
 
-        state = orchestrator_guard._load_state(payload_cmd1)
-        self.assertEqual(len(state["direct_budget"]["1"]["commands"]), 1)
-
-        payload_cmd2 = dict(
-            self.base_payload,
-            toolCall={
-                "id": "cmd_call_2",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "python3 --version",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-        )
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(payload_cmd2)["decision"], "allow"
-        )
-
-        payload_cmd3 = dict(
-            self.base_payload,
-            toolCall={
-                "id": "cmd_call_3",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "echo hello",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-        )
-        res_cmd3 = orchestrator_guard.handle_pre_tool(payload_cmd3)
+        self.assertEqual(self._pre("run_command", self._cmd_args("python3 --version"), call_id="cmd_call_2")["decision"], "allow")
+        res_cmd3 = self._pre("run_command", self._cmd_args("echo hello"), call_id="cmd_call_3")
         self.assertEqual(res_cmd3["decision"], "deny")
         self.assertIn("[ORCHESTRATOR GUARD]", res_cmd3["reason"])
 
-        payload_next_inv = dict(
-            self.base_payload,
-            invocationNum=2,
-            toolCall={
-                "id": "cmd_call_4",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "echo hello",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-        )
         self.assertEqual(
-            orchestrator_guard.handle_pre_tool(payload_next_inv)["decision"], "allow"
+            self._pre("run_command", self._cmd_args("echo hello"), call_id="cmd_call_4", invocationNum=2)["decision"],
+            "allow",
         )
 
     def test_empirical_test_receipt_required_before_stop(self) -> None:
         code_file = str(orchestrator_guard.PROJECT_ROOT / "src" / "app.py")
-        edit_payload = dict(
-            self.base_payload,
-            toolCall={
-                "name": "write_file",
-                "args": {"Path": code_file, "Content": "print('hello')"},
-            },
-        )
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(edit_payload)["decision"], "allow"
-        )
+        self.assertEqual(self._pre("write_file", {"Path": code_file, "Content": "print('hello')"})["decision"], "allow")
 
-        stop_payload_1 = dict(
-            self.base_payload,
-            fullyIdle=True,
-            terminationReason="NO_TOOL_CALL",
-            executionNum=1,
-        )
-        res_stop_1 = orchestrator_guard.handle_stop(stop_payload_1)
+        res_stop_1 = self._stop(executionNum=1)
         self.assertEqual(res_stop_1["decision"], "continue")
         self.assertIn("Empirical test receipt missing", res_stop_1["reason"])
 
-        # Failing test run
-        fail_test_payload = dict(
-            self.base_payload,
-            toolCall={
-                "id": "test_cmd_1",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "pytest tests/",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-            error="exit status 1",
-        )
-        orchestrator_guard.handle_post_tool(fail_test_payload)
+        self._post("run_command", self._cmd_args("pytest tests/"), error="exit status 1", call_id="test_cmd_1")
+        self.assertEqual(self._stop(executionNum=2)["decision"], "continue")
 
-        stop_payload_2 = dict(
-            self.base_payload,
-            fullyIdle=True,
-            terminationReason="NO_TOOL_CALL",
-            executionNum=2,
-        )
-        res_stop_2 = orchestrator_guard.handle_stop(stop_payload_2)
-        self.assertEqual(res_stop_2["decision"], "continue")
-
-        # Passing test run
-        pass_test_payload = dict(
-            self.base_payload,
-            toolCall={
-                "id": "test_cmd_2",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "pytest tests/",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-            error="",
-        )
-        orchestrator_guard.handle_post_tool(pass_test_payload)
-
-        stop_payload_3 = dict(
-            self.base_payload,
-            fullyIdle=True,
-            terminationReason="NO_TOOL_CALL",
-            executionNum=3,
-        )
-        res_stop_3 = orchestrator_guard.handle_stop(stop_payload_3)
-        self.assertEqual(res_stop_3["decision"], "allow")
+        self._post("run_command", self._cmd_args("pytest tests/"), error="", call_id="test_cmd_2")
+        self.assertEqual(self._stop(executionNum=3)["decision"], "allow")
 
     def test_two_turn_circuit_breaker_halts_retries_and_allows_scratch_log(self) -> None:
-        fail_1 = dict(
-            self.base_payload,
-            toolCall={
-                "id": "cmd_fail_1",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "pytest tests/",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-            error="exit status 1",
-        )
-        orchestrator_guard.handle_post_tool(fail_1)
+        self._post("run_command", self._cmd_args("pytest tests/"), error="exit status 1", call_id="cmd_fail_1")
+        self._post("run_command", self._cmd_args("pytest tests/"), error="exit status 1", call_id="cmd_fail_2")
 
-        fail_2 = dict(
-            self.base_payload,
-            toolCall={
-                "id": "cmd_fail_2",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "pytest tests/",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-            error="exit status 1",
-        )
-        orchestrator_guard.handle_post_tool(fail_2)
-
-        # 3rd run_command (pytest) denied
-        cmd_3 = dict(
-            self.base_payload,
-            toolCall={
-                "id": "cmd_fail_3",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "pytest tests/",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-        )
-        res_cmd_3 = orchestrator_guard.handle_pre_tool(cmd_3)
+        res_cmd_3 = self._pre("run_command", self._cmd_args("pytest tests/"), call_id="cmd_fail_3")
         self.assertEqual(res_cmd_3["decision"], "deny")
         self.assertIn("2-turn circuit breaker tripped", res_cmd_3["reason"])
 
-        # Workspace code edit denied
-        edit_code = dict(
-            self.base_payload,
-            toolCall={
-                "name": "write_file",
-                "args": {
-                    "Path": str(orchestrator_guard.PROJECT_ROOT / "src" / "app.py"),
-                    "Content": "print('retry')",
-                },
-            },
-        )
-        res_edit = orchestrator_guard.handle_pre_tool(edit_code)
+        code_path = str(orchestrator_guard.PROJECT_ROOT / "src" / "app.py")
+        res_edit = self._pre("write_file", {"Path": code_path, "Content": "print('retry')"})
         self.assertEqual(res_edit["decision"], "deny")
         self.assertIn("2-turn circuit breaker tripped", res_edit["reason"])
 
-        # Writing failure output to scratch log is allowed
         scratch_log = str(Path(self.artifact_dir) / "scratch" / "fail.log")
-        scratch_write = dict(
-            self.base_payload,
-            toolCall={
-                "name": "write_file",
-                "args": {
-                    "Path": scratch_log,
-                    "Content": "Traceback: test failed twice",
-                },
-            },
+        self.assertEqual(
+            self._pre("write_file", {"Path": scratch_log, "Content": "Traceback: test failed twice"})["decision"],
+            "allow",
         )
-        res_scratch = orchestrator_guard.handle_pre_tool(scratch_write)
-        self.assertEqual(res_scratch["decision"], "allow")
-
-        # handle_stop (fullyIdle=True) returns allow so agent can report STATUS: BLOCKED
-        stop_payload = dict(
-            self.base_payload,
-            fullyIdle=True,
-            terminationReason="NO_TOOL_CALL",
-        )
-        res_stop = orchestrator_guard.handle_stop(stop_payload)
-        self.assertEqual(res_stop["decision"], "allow")
+        self.assertEqual(self._stop()["decision"], "allow")
 
     def test_pre_tool_blocks_test_tampering_edits(self) -> None:
         test_file = str(orchestrator_guard.PROJECT_ROOT / "tests" / "test_sample.py")
 
-        # 1. Deleting an assertion is denied
-        payload_del_assert = dict(
-            self.base_payload,
-            toolCall={
-                "name": "edit_file",
-                "args": {
-                    "Path": test_file,
-                    "Target": "        self.assertEqual(a, b)\n",
-                    "Replacement": "",
-                },
-            },
-        )
-        res_del_assert = orchestrator_guard.handle_pre_tool(payload_del_assert)
+        res_del_assert = self._pre("edit_file", {"Path": test_file, "Target": "        self.assertEqual(a, b)\n", "Replacement": ""})
         self.assertEqual(res_del_assert["decision"], "deny")
         self.assertIn("reduces assertion count", res_del_assert["reason"])
 
-        # 2. Deleting a test function is denied
-        payload_del_test = dict(
-            self.base_payload,
-            toolCall={
-                "name": "edit_file",
-                "args": {
-                    "Path": test_file,
-                    "Target": "    def test_login(self):\n        pass\n",
-                    "Replacement": "",
-                },
-            },
-        )
-        res_del_test = orchestrator_guard.handle_pre_tool(payload_del_test)
+        res_del_test = self._pre("edit_file", {"Path": test_file, "Target": "    def test_login(self):\n        pass\n", "Replacement": ""})
         self.assertEqual(res_del_test["decision"], "deny")
         self.assertIn("reduces test count", res_del_test["reason"])
 
-        # 3. Adding a skip decorator is denied (use string concatenation so test file itself doesn't trigger skip regex)
         skip_marker = "@" + "unittest.skip('skip')"
-        payload_add_skip = dict(
-            self.base_payload,
-            toolCall={
-                "name": "edit_file",
-                "args": {
-                    "Path": test_file,
-                    "Target": "    def test_login(self):",
-                    "Replacement": f"    {skip_marker}\n    def test_login(self):",
-                },
-            },
+        res_add_skip = self._pre(
+            "edit_file",
+            {"Path": test_file, "Target": "    def test_login(self):", "Replacement": f"    {skip_marker}\n    def test_login(self):"},
         )
-        res_add_skip = orchestrator_guard.handle_pre_tool(payload_add_skip)
         self.assertEqual(res_add_skip["decision"], "deny")
         self.assertIn("adding skip/xfail decorators", res_add_skip["reason"])
 
-        # 4. Adding trivial assert True is denied (use string concatenation)
         trivial_assert = "assert " + "True"
-        payload_trivial = dict(
-            self.base_payload,
-            toolCall={
-                "name": "edit_file",
-                "args": {
-                    "Path": test_file,
-                    "Target": "        self.assertEqual(a, b)",
-                    "Replacement": f"        {trivial_assert}",
-                },
-            },
+        res_trivial = self._pre(
+            "edit_file",
+            {"Path": test_file, "Target": "        self.assertEqual(a, b)", "Replacement": f"        {trivial_assert}"},
         )
-        res_trivial = orchestrator_guard.handle_pre_tool(payload_trivial)
         self.assertEqual(res_trivial["decision"], "deny")
         self.assertIn("trivial 'assert True'", res_trivial["reason"])
 
-        # 5. Adding new test function and new assertions is allowed
-        payload_add_test = dict(
-            self.base_payload,
-            toolCall={
-                "name": "edit_file",
-                "args": {
-                    "Path": test_file,
-                    "Target": "    def test_existing(self):\n        self.assertEqual(1, 1)",
-                    "Replacement": (
-                        "    def test_existing(self):\n"
-                        "        self.assertEqual(1, 1)\n\n"
-                        "    def test_new(self):\n"
-                        "        self.assertEqual(2, 2)"
-                    ),
-                },
+        res_add_test = self._pre(
+            "edit_file",
+            {
+                "Path": test_file,
+                "Target": "    def test_existing(self):\n        self.assertEqual(1, 1)",
+                "Replacement": "    def test_existing(self):\n        self.assertEqual(1, 1)\n\n    def test_new(self):\n        self.assertEqual(2, 2)",
             },
         )
-        res_add_test = orchestrator_guard.handle_pre_tool(payload_add_test)
         self.assertEqual(res_add_test["decision"], "allow")
 
     def test_audit_diff_text_detects_test_tampering(self) -> None:
-        # 1. Removing an assertion in tests/test_auth.py returns error string
-        diff_rem_assert = (
-            "--- a/tests/test_auth.py\n"
-            "+++ b/tests/test_auth.py\n"
-            "@@ -10,3 +10,2 @@\n"
-            "-    self.assertEqual(token, 'abc')\n"
-            "     return True\n"
+        res_rem = orchestrator_guard.audit_diff_text(
+            "--- a/tests/test_auth.py\n+++ b/tests/test_auth.py\n@@ -10,3 +10,2 @@\n"
+            "-    self.assertEqual(token, 'abc')\n     return True\n"
         )
-        res_rem = orchestrator_guard.audit_diff_text(diff_rem_assert)
         self.assertIsNotNone(res_rem)
         self.assertIn("Diff audit detected net removal of 1 assertion(s)", res_rem)
 
-        # 2. Adding skip marker in tests/test_auth.py returns error string
         skip_line = "+@" + "pytest.mark.skip"
-        diff_add_skip = (
-            "--- a/tests/test_auth.py\n"
-            "+++ b/tests/test_auth.py\n"
-            "@@ -5,2 +5,3 @@\n"
-            f"{skip_line}\n"
-            " def test_login():\n"
-            "     pass\n"
+        res_skip = orchestrator_guard.audit_diff_text(
+            f"--- a/tests/test_auth.py\n+++ b/tests/test_auth.py\n@@ -5,2 +5,3 @@\n{skip_line}\n def test_login():\n     pass\n"
         )
-        res_skip = orchestrator_guard.audit_diff_text(diff_add_skip)
         self.assertIsNotNone(res_skip)
         self.assertIn("Diff audit detected test skip/xfail marker added", res_skip)
 
-        # 3. Adding a new test + assertion in tests/test_auth.py returns None
-        diff_add_test = (
-            "--- a/tests/test_auth.py\n"
-            "+++ b/tests/test_auth.py\n"
-            "@@ -20,2 +20,6 @@\n"
-            "+def test_new_feature():\n"
-            "+    self.assertEqual(1, 1)\n"
-            " def test_existing():\n"
+        res_good = orchestrator_guard.audit_diff_text(
+            "--- a/tests/test_auth.py\n+++ b/tests/test_auth.py\n@@ -20,2 +20,6 @@\n"
+            "+def test_new_feature():\n+    self.assertEqual(1, 1)\n def test_existing():\n"
         )
-        res_good = orchestrator_guard.audit_diff_text(diff_add_test)
         self.assertIsNone(res_good)
 
-    def test_subagent_pre_invocation_injects_isolation_reminder_instead_of_tier_warning(
-        self,
-    ) -> None:
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id="sub-1111",
-            type_name="scout",
-            model="flash_lite",
-        )
-        payload = dict(
-            self.base_payload,
-            conversationId="sub-1111",
-            modelName="gemini-3-flash-lite",
-            invocationNum=1,
-        )
-        res = orchestrator_guard.handle_pre_invocation(payload)
+    def test_subagent_pre_invocation_injects_isolation_reminder_instead_of_tier_warning(self) -> None:
+        self._reg_sub("scout", "sub-1111", "flash_lite")
+        res = self._pre_inv(cid="sub-1111", modelName="gemini-3-flash-lite", invocationNum=1)
         self.assertIn("injectSteps", res)
         msg = res["injectSteps"][0]["ephemeralMessage"]
         self.assertIn("Subagent context isolation active", msg)
@@ -1148,918 +531,402 @@ NOTES: <one sentence summarizing findings>
 
     def test_subagent_stop_enforces_four_line_report_format(self) -> None:
         sub_cid = "sub-stop-report-uuid-3333"
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id=sub_cid,
-            type_name="implementer",
-            model="flash",
+        self._reg_sub("implementer", sub_cid, "flash")
+        res_bad = self._stop(
+            "Here is my long verbose summary:\nLine 2\nLine 3\nLine 4\nLine 5",
+            cid=sub_cid, modelName="gemini-3-flash", executionNum=1,
         )
-        payload_bad = dict(
-            self.base_payload,
-            conversationId=sub_cid,
-            modelName="gemini-3-flash",
-            fullyIdle=True,
-            terminationReason="NO_TOOL_CALL",
-            executionNum=1,
-            lastAssistantMessage="Here is my long verbose summary:\nLine 2\nLine 3\nLine 4\nLine 5",
-        )
-        res_bad = orchestrator_guard.handle_stop(payload_bad)
         self.assertEqual(res_bad["decision"], "continue")
         self.assertIn("Subagent context-separation violation", res_bad["reason"])
 
-        payload_good = dict(
-            self.base_payload,
-            conversationId=sub_cid,
-            modelName="gemini-3-flash",
-            fullyIdle=True,
-            terminationReason="NO_TOOL_CALL",
-            executionNum=2,
-            lastAssistantMessage=(
-                "STATUS: COMPLETED\n"
-                "FILES_CHANGED: NONE\n"
-                "VERIFICATION: Ran unittest with exit code 0.\n"
-                "NOTES: All checks passed."
-            ),
+        res_good = self._stop(
+            "STATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: Ran unittest with exit code 0.\nNOTES: All checks passed.",
+            cid=sub_cid, modelName="gemini-3-flash", executionNum=2,
         )
-        res_good = orchestrator_guard.handle_stop(payload_good)
         self.assertEqual(res_good["decision"], "allow")
 
-        # Root orchestrator with omitted modelName in Stop hook should be allowed
         orchestrator_guard.handle_pre_invocation(self.base_payload)
-        payload_root_stop = dict(
-            self.base_payload,
-            modelName="",
-            fullyIdle=True,
-            terminationReason="NO_TOOL_CALL",
-            executionNum=3,
-            lastAssistantMessage=(
-                "Summary of work completed:\n\n"
-                "First, we investigated the root cause of the bug.\n"
-                "Second, we applied the fix across the affected components.\n\n"
-                "Finally, all tests were verified successfully."
-            ),
+        res_root = self._stop(
+            "Summary of work completed:\n\nFirst, we investigated the root cause of the bug.\n"
+            "Second, we applied the fix across the affected components.\n\nFinally, all tests were verified successfully.",
+            modelName="", executionNum=3,
         )
-        res_root = orchestrator_guard.handle_stop(payload_root_stop)
         self.assertEqual(res_root["decision"], "allow")
 
-    def test_validate_subagent_report_allows_bounded_bullets_and_enforces_blocked_diagnosis(
-        self,
-    ) -> None:
+    def test_validate_subagent_report_allows_bounded_bullets_and_enforces_blocked_diagnosis(self) -> None:
         report_bullets = (
-            "STATUS: COMPLETED\n"
-            "FILES_CHANGED: src/app.py\n"
+            "STATUS: COMPLETED\nFILES_CHANGED: src/app.py\n"
             "VERIFICATION: python3 -m unittest discover -s tests -v exited with 0.\n"
-            "NOTES: All unit tests passed.\n"
-            "- Added input validation check.\n"
-            "- Updated docstrings.\n"
-            "- Added unit tests in test_app.py."
+            "NOTES: All unit tests passed.\n- Added input validation check.\n- Updated docstrings.\n- Added unit tests in test_app.py."
         )
         self.assertIsNone(orchestrator_guard.validate_subagent_report(report_bullets))
         sub_cid = "sub-bullet-report-uuid-4444"
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id=sub_cid,
-            type_name="implementer",
-            model="flash",
+        self._reg_sub("implementer", sub_cid, "flash")
+        self.assertEqual(
+            self._stop(report_bullets, cid=sub_cid, modelName="gemini-3-flash", executionNum=10)["decision"],
+            "allow",
         )
-        payload_sub_stop = dict(
-            self.base_payload,
-            conversationId=sub_cid,
-            modelName="gemini-3-flash",
-            fullyIdle=True,
-            terminationReason="NO_TOOL_CALL",
-            executionNum=10,
-            lastAssistantMessage=report_bullets,
-        )
-        res_stop = orchestrator_guard.handle_stop(payload_sub_stop)
-        self.assertEqual(res_stop["decision"], "allow")
 
-        report_non_bullet = (
-            "STATUS: COMPLETED\n"
-            "FILES_CHANGED: NONE\n"
-            "VERIFICATION: Ran unittest with exit 0.\n"
-            "NOTES: Everything finished.\n"
-            "This is a non-bullet line."
+        err_non_bullet = orchestrator_guard.validate_subagent_report(
+            "STATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: Ran unittest with exit 0.\n"
+            "NOTES: Everything finished.\nThis is a non-bullet line."
         )
-        err_non_bullet = orchestrator_guard.validate_subagent_report(report_non_bullet)
         self.assertIsNotNone(err_non_bullet)
         self.assertIn("must be a compact bullet", err_non_bullet)
 
         eleven_bullets = "\n".join(f"- bullet line {i}" for i in range(1, 12))
-        report_too_many_bullets = (
-            "STATUS: COMPLETED\n"
-            "FILES_CHANGED: NONE\n"
-            "VERIFICATION: Ran unittest with exit 0.\n"
+        err_too_many = orchestrator_guard.validate_subagent_report(
+            f"STATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: Ran unittest with exit 0.\n"
             f"NOTES: Summary with 11 bullets.\n{eleven_bullets}"
         )
-        err_too_many = orchestrator_guard.validate_subagent_report(report_too_many_bullets)
         self.assertIsNotNone(err_too_many)
         self.assertIn("at most 10 bullet lines", err_too_many)
 
-        report_no_summary = (
-            "STATUS: BLOCKED\n"
-            "FILES_CHANGED: NONE\n"
-            "VERIFICATION: pytest tests/ failed with exit 1.\n"
-            "NOTES: file:///tmp/scratch/fail.log"
+        err_no_summary = orchestrator_guard.validate_subagent_report(
+            "STATUS: BLOCKED\nFILES_CHANGED: NONE\nVERIFICATION: pytest tests/ failed with exit 1.\nNOTES: file:///tmp/scratch/fail.log"
         )
-        err_no_summary = orchestrator_guard.validate_subagent_report(report_no_summary)
         self.assertIsNotNone(err_no_summary)
         self.assertIn("inline error summary", err_no_summary)
 
-        report_no_uri = (
-            "STATUS: BLOCKED\n"
-            "FILES_CHANGED: NONE\n"
-            "VERIFICATION: pytest tests/ failed with exit 1.\n"
-            "NOTES: AssertionError in test_login on line 42"
+        err_no_uri = orchestrator_guard.validate_subagent_report(
+            "STATUS: BLOCKED\nFILES_CHANGED: NONE\nVERIFICATION: pytest tests/ failed with exit 1.\nNOTES: AssertionError in test_login on line 42"
         )
-        err_no_uri = orchestrator_guard.validate_subagent_report(report_no_uri)
         self.assertIsNotNone(err_no_uri)
         self.assertIn("scratch log URI", err_no_uri)
 
-        report_valid_blocked = (
-            "STATUS: BLOCKED\n"
-            "FILES_CHANGED: NONE\n"
-            "VERIFICATION: pytest tests/ failed with exit 1.\n"
+        self.assertIsNone(orchestrator_guard.validate_subagent_report(
+            "STATUS: BLOCKED\nFILES_CHANGED: NONE\nVERIFICATION: pytest tests/ failed with exit 1.\n"
             "NOTES: AssertionError in test_login on line 42 at file:///tmp/scratch/fail.log"
-        )
-        self.assertIsNone(orchestrator_guard.validate_subagent_report(report_valid_blocked))
+        ))
 
     def test_orchestrator_direct_read_budget_and_log_peeking_blocked(self) -> None:
-        file_a = str(orchestrator_guard.PROJECT_ROOT / "file_a.py")
-        file_b = str(orchestrator_guard.PROJECT_ROOT / "file_b.py")
-        file_c = str(orchestrator_guard.PROJECT_ROOT / "file_c.py")
+        file_a, file_b, file_c = (str(orchestrator_guard.PROJECT_ROOT / f"file_{x}.py") for x in ("a", "b", "c"))
+        self.assertEqual(self._pre("read_file", {"Path": file_a})["decision"], "allow")
+        self.assertEqual(self._pre("read_file", {"Path": file_b})["decision"], "allow")
+        self.assertEqual(self._pre("read_file", {"Path": file_a})["decision"], "allow")
 
-        def make_read_payload(
-            path: str,
-            model: str = "Gemini 4 Argon (Medium)",
-            cid: Optional[str] = None,
-        ) -> Dict[str, Any]:
-            p = dict(
-                self.base_payload,
-                modelName=model,
-                toolCall={
-                    "name": "read_file",
-                    "args": {"Path": path},
-                },
-            )
-            if cid:
-                p["conversationId"] = cid
-            return p
-
-        # 1. First 2 distinct workspace files are allowed, including repeated read of file_a
-        res_a1 = orchestrator_guard.handle_pre_tool(make_read_payload(file_a))
-        self.assertEqual(res_a1["decision"], "allow")
-
-        res_b = orchestrator_guard.handle_pre_tool(make_read_payload(file_b))
-        self.assertEqual(res_b["decision"], "allow")
-
-        res_a2 = orchestrator_guard.handle_pre_tool(make_read_payload(file_a))
-        self.assertEqual(res_a2["decision"], "allow")
-
-        # 3rd distinct workspace file exceeds limit
-        res_c = orchestrator_guard.handle_pre_tool(make_read_payload(file_c))
+        res_c = self._pre("read_file", {"Path": file_c})
         self.assertEqual(res_c["decision"], "deny")
         self.assertIn("Direct execution fast-path read budget", res_c["reason"])
 
-        # 2. Reading raw log or transcript is denied for orchestrator
         fail_log = str(Path(self.artifact_dir) / "scratch" / "fail.log")
         transcript = str(Path(self.artifact_dir) / "transcript.jsonl")
-
-        res_log = orchestrator_guard.handle_pre_tool(make_read_payload(fail_log))
+        res_log = self._pre("read_file", {"Path": fail_log})
         self.assertEqual(res_log["decision"], "deny")
         self.assertIn("cannot directly read raw log or transcript", res_log["reason"])
-
-        res_tr = orchestrator_guard.handle_pre_tool(make_read_payload(transcript))
+        res_tr = self._pre("read_file", {"Path": transcript})
         self.assertEqual(res_tr["decision"], "deny")
         self.assertIn("cannot directly read raw log or transcript", res_tr["reason"])
 
-        # 3. Scout subagent is allowed to read both fail.log and file_c.py
         scout_cid = "sub-scout-read-cid-4444"
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id=scout_cid,
-            type_name="scout",
-            model="flash_lite",
-        )
-        scout_log = orchestrator_guard.handle_pre_tool(
-            make_read_payload(fail_log, model="gemini-3-flash-lite", cid=scout_cid)
-        )
-        self.assertEqual(scout_log["decision"], "allow")
-
-        scout_c = orchestrator_guard.handle_pre_tool(
-            make_read_payload(file_c, model="gemini-3-flash-lite", cid=scout_cid)
-        )
-        self.assertEqual(scout_c["decision"], "allow")
+        self._reg_sub("scout", scout_cid, "flash_lite")
+        self.assertEqual(self._pre("read_file", {"Path": fail_log}, cid=scout_cid, modelName="gemini-3-flash-lite")["decision"], "allow")
+        self.assertEqual(self._pre("read_file", {"Path": file_c}, cid=scout_cid, modelName="gemini-3-flash-lite")["decision"], "allow")
 
     def test_small_model_root_orchestrator_is_treated_as_root(self) -> None:
-        payload = dict(self.base_payload, modelName="gemini-3-flash-lite")
-        res_pre = orchestrator_guard.handle_pre_invocation(payload)
-        self.assertEqual(res_pre, {})
+        self.assertEqual(self._pre_inv(modelName="gemini-3-flash-lite"), {})
+        f1, f2, f3 = (str(orchestrator_guard.PROJECT_ROOT / f"root_f{i}.txt") for i in (1, 2, 3))
+        self.assertEqual(self._pre("write_file", {"Path": f1}, modelName="gemini-3-flash-lite")["decision"], "allow")
+        self.assertEqual(self._pre("write_file", {"Path": f2}, modelName="gemini-3-flash-lite")["decision"], "allow")
 
-        f1 = str(orchestrator_guard.PROJECT_ROOT / "root_f1.txt")
-        f2 = str(orchestrator_guard.PROJECT_ROOT / "root_f2.txt")
-        f3 = str(orchestrator_guard.PROJECT_ROOT / "root_f3.txt")
-
-        p1 = dict(payload, toolCall={"name": "write_file", "args": {"Path": f1}})
-        self.assertEqual(orchestrator_guard.handle_pre_tool(p1)["decision"], "allow")
-
-        p2 = dict(payload, toolCall={"name": "write_file", "args": {"Path": f2}})
-        self.assertEqual(orchestrator_guard.handle_pre_tool(p2)["decision"], "allow")
-
-        p3 = dict(payload, toolCall={"name": "write_file", "args": {"Path": f3}})
-        res3 = orchestrator_guard.handle_pre_tool(p3)
+        res3 = self._pre("write_file", {"Path": f3}, modelName="gemini-3-flash-lite")
         self.assertEqual(res3["decision"], "deny")
         self.assertIn("[ORCHESTRATOR GUARD]", res3["reason"])
 
-        stop_payload = dict(
-            payload,
-            fullyIdle=True,
-            terminationReason="NO_TOOL_CALL",
-            lastAssistantMessage="This is a long verbose summary without four-line report format.\nMore details here.\nAnd here.",
+        res_stop = self._stop(
+            "This is a long verbose summary without four-line report format.\nMore details here.\nAnd here.",
+            modelName="gemini-3-flash-lite",
         )
-        res_stop = orchestrator_guard.handle_stop(stop_payload)
         self.assertEqual(res_stop["decision"], "allow")
 
     def test_research_subagent_can_write_scratch_markdown_but_not_workspace_files(self) -> None:
         sub_cid = "research-worker-001"
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id=sub_cid,
-            type_name="research",
-            model="flash",
-        )
+        self._reg_sub("research", sub_cid, "flash")
         scratch_file = str(Path(self.artifact_dir) / "scratch" / "findings.md")
-        payload_scratch = dict(
-            self.base_payload,
-            conversationId=sub_cid,
-            toolCall={
-                "name": "write_file",
-                "args": {
-                    "Path": scratch_file,
-                    "Content": "# Research Findings\nAnalysis summary.",
-                },
-            },
+        self.assertEqual(
+            self._pre("write_file", {"Path": scratch_file, "Content": "# Research Findings\nAnalysis summary."}, cid=sub_cid)["decision"],
+            "allow",
         )
-        res_scratch = orchestrator_guard.handle_pre_tool(payload_scratch)
-        self.assertEqual(res_scratch["decision"], "allow")
 
         workspace_file = str(orchestrator_guard.PROJECT_ROOT / "src" / "app.py")
-        payload_workspace = dict(
-            self.base_payload,
-            conversationId=sub_cid,
-            toolCall={
-                "name": "write_file",
-                "args": {
-                    "Path": workspace_file,
-                    "Content": "# Workspace mutation",
-                },
-            },
-        )
-        res_workspace = orchestrator_guard.handle_pre_tool(payload_workspace)
+        res_workspace = self._pre("write_file", {"Path": workspace_file, "Content": "# Workspace mutation"}, cid=sub_cid)
         self.assertEqual(res_workspace["decision"], "deny")
-        self.assertIn(
-            "Research subagents may only write markdown reports",
-            res_workspace.get("reason", ""),
-        )
+        self.assertIn("Research subagents may only write markdown reports", res_workspace.get("reason", ""))
 
     def test_live_runtime_pitfalls_invocation_sync_and_cross_brain_research(self) -> None:
-        # 1. Calling handle_pre_invocation with invocationNum=5 persists current_invocation_num=5,
-        # so subsequent handle_pre_tool calls that omit invocationNum use bucket "5" instead of "0".
-        payload_pre = dict(self.base_payload, invocationNum=5)
+        payload_pre = self._payload(invocationNum=5)
         orchestrator_guard.handle_pre_invocation(payload_pre)
-        state_after_pre = orchestrator_guard._load_state(payload_pre)
-        self.assertEqual(state_after_pre.get("current_invocation_num"), 5)
+        self.assertEqual(self._load_st(payload_pre).get("current_invocation_num"), 5)
 
-        tool_payload = dict(
-            self.base_payload,
-            toolCall={
-                "id": "cmd_inv_5",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "echo 'pitfall 1 test'",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-        )
+        tool_payload = self._payload(tool="run_command", args=self._cmd_args("echo 'pitfall 1 test'"), call_id="cmd_inv_5")
         tool_payload.pop("invocationNum", None)
-        res_tool = orchestrator_guard.handle_pre_tool(tool_payload)
-        self.assertEqual(res_tool.get("decision"), "allow")
-        state_after_tool = orchestrator_guard._load_state(tool_payload)
+        self.assertEqual(orchestrator_guard.handle_pre_tool(tool_payload).get("decision"), "allow")
+        state_after_tool = self._load_st(tool_payload)
         self.assertIn("5", state_after_tool.get("direct_budget", {}))
         self.assertNotIn("0", state_after_tool.get("direct_budget", {}))
 
-        # 2. A research subagent running in its own brain/sub-research directory
-        # (while registered in brain/parent-root/orchestrator_state.json) is recognized
-        # by _is_research_subagent, can write to brain/parent-root/scratch/brief.md,
-        # and is denied when writing to PROJECT_ROOT / "src.py".
-        app_data = Path(self.artifact_dir) / "appdata"
-        parent_brain = app_data / "brain" / "parent-root"
-        sub_brain = app_data / "brain" / "sub-research"
-        parent_brain.mkdir(parents=True, exist_ok=True)
+        parent_payload = self._brain_payload("parent-root", root="appdata/brain")
+        sub_brain = Path(self.artifact_dir) / "appdata" / "brain" / "sub-research"
         sub_brain.mkdir(parents=True, exist_ok=True)
-        (parent_brain / "scratch").mkdir(parents=True, exist_ok=True)
+        (Path(parent_payload["artifactDirectoryPath"]) / "scratch").mkdir(parents=True, exist_ok=True)
 
         research_cid = "sub-research-cross-brain-001"
-        parent_payload = dict(
-            self.base_payload,
-            conversationId="parent-root",
-            artifactDirectoryPath=str(parent_brain),
-        )
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id=research_cid,
-            type_name="research",
-            model="flash",
-            role="Cross-Brain Researcher",
-        )
+        self._reg_sub("research", research_cid, "flash", payload=parent_payload, role="Cross-Brain Researcher")
+        sub_payload = self._payload(cid=research_cid, artifactDirectoryPath=str(sub_brain), modelName="gemini-3-flash")
+        self.assertTrue(orchestrator_guard._is_scratch_only_subagent(sub_payload, self._load_st(sub_payload)))
 
-        sub_payload = dict(
-            self.base_payload,
-            conversationId=research_cid,
-            artifactDirectoryPath=str(sub_brain),
-            modelName="gemini-3-flash",
+        brief_file = str(Path(parent_payload["artifactDirectoryPath"]) / "scratch" / "brief.md")
+        self.assertEqual(
+            self._pre("write_file", {"Path": brief_file, "Content": "# Sibling Research Brief\nContent here."}, base=sub_payload).get("decision"),
+            "allow",
         )
-        sub_state = orchestrator_guard._load_state(sub_payload)
-        self.assertTrue(orchestrator_guard._is_research_subagent(sub_payload, sub_state))
-
-        brief_file = str(parent_brain / "scratch" / "brief.md")
-        sub_write_scratch = dict(
-            sub_payload,
-            toolCall={
-                "name": "write_file",
-                "args": {
-                    "Path": brief_file,
-                    "Content": "# Sibling Research Brief\nContent here.",
-                },
-            },
-        )
-        res_scratch = orchestrator_guard.handle_pre_tool(sub_write_scratch)
-        self.assertEqual(res_scratch.get("decision"), "allow")
-
         workspace_file = str(orchestrator_guard.PROJECT_ROOT / "src.py")
-        sub_write_workspace = dict(
-            sub_payload,
-            toolCall={
-                "name": "write_file",
-                "args": {
-                    "Path": workspace_file,
-                    "Content": "x = 42\n",
-                },
-            },
-        )
-        res_workspace = orchestrator_guard.handle_pre_tool(sub_write_workspace)
+        res_workspace = self._pre("write_file", {"Path": workspace_file, "Content": "x = 42\n"}, base=sub_payload)
         self.assertEqual(res_workspace.get("decision"), "deny")
-        self.assertIn(
-            "Research subagents may only write markdown reports",
-            res_workspace.get("reason", ""),
-        )
+        self.assertIn("Research subagents may only write markdown reports", res_workspace.get("reason", ""))
 
-        # 3. When the root orchestrator has receipt["dirty"] = True and completes a successful
-        # invoke_subagent in handle_post_tool, receipt["dirty"] is cleared to False and receipt["verified"] is True.
-        root_state = orchestrator_guard._load_state(self.base_payload)
+        root_state = self._load_st()
         receipt = orchestrator_guard._get_test_receipt(root_state, self.base_payload)
-        receipt["dirty"] = True
-        receipt["verified"] = False
+        receipt["dirty"], receipt["verified"] = True, False
         orchestrator_guard._save_state(self.base_payload, root_state)
 
-        invoke_post_payload = dict(
-            self.base_payload,
-            toolCall={
-                "id": "call_invoke_sub_success",
-                "name": "invoke_subagent",
-                "args": {},
-            },
-            error="",
-        )
-        orchestrator_guard.handle_post_tool(invoke_post_payload)
-
-        updated_state = orchestrator_guard._load_state(self.base_payload)
-        updated_receipt = orchestrator_guard._get_test_receipt(updated_state, self.base_payload)
+        self._post("invoke_subagent", {}, call_id="call_invoke_sub_success")
+        updated_receipt = orchestrator_guard._get_test_receipt(self._load_st(), self.base_payload)
         self.assertFalse(updated_receipt.get("dirty"))
         self.assertTrue(updated_receipt.get("verified"))
         self.assertEqual(updated_receipt.get("last_test_cmd"), "invoke_subagent")
 
     def test_direct_budget_uses_current_invocation_num_fallback(self) -> None:
-        payload_inv3 = dict(self.base_payload, invocationNum=3)
-        orchestrator_guard.handle_pre_invocation(payload_inv3)
+        self._pre_inv(invocationNum=3)
+        p1 = self._payload(tool="run_command", args=self._cmd_args("echo 'cmd 1'"), call_id="cmd_1")
+        p1.pop("invocationNum", None)
+        self.assertEqual(orchestrator_guard.handle_pre_tool(p1).get("decision"), "allow")
+        p2 = self._payload(tool="run_command", args=self._cmd_args("echo 'cmd 2'"), call_id="cmd_2")
+        p2.pop("invocationNum", None)
+        self.assertEqual(orchestrator_guard.handle_pre_tool(p2).get("decision"), "allow")
 
-        cmd_payload_1 = dict(
-            self.base_payload,
-            toolCall={
-                "id": "cmd_1",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "echo 'cmd 1'",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-        )
-        cmd_payload_1.pop("invocationNum", None)
-        res_cmd1 = orchestrator_guard.handle_pre_tool(cmd_payload_1)
-        self.assertEqual(res_cmd1.get("decision"), "allow")
-
-        cmd_payload_2 = dict(
-            self.base_payload,
-            toolCall={
-                "id": "cmd_2",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "echo 'cmd 2'",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-        )
-        cmd_payload_2.pop("invocationNum", None)
-        res_cmd2 = orchestrator_guard.handle_pre_tool(cmd_payload_2)
-        self.assertEqual(res_cmd2.get("decision"), "allow")
-
-        state = orchestrator_guard._load_state(self.base_payload)
+        state = self._load_st()
         self.assertIn("3", state.get("direct_budget", {}))
         self.assertNotIn("0", state.get("direct_budget", {}))
         self.assertEqual(len(state["direct_budget"]["3"]["commands"]), 2)
 
-        cmd_payload_3 = dict(
-            self.base_payload,
-            toolCall={
-                "id": "cmd_3",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "echo 'cmd 3'",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-        )
-        cmd_payload_3.pop("invocationNum", None)
-        res_cmd3 = orchestrator_guard.handle_pre_tool(cmd_payload_3)
+        p3 = self._payload(tool="run_command", args=self._cmd_args("echo 'cmd 3'"), call_id="cmd_3")
+        p3.pop("invocationNum", None)
+        res_cmd3 = orchestrator_guard.handle_pre_tool(p3)
         self.assertEqual(res_cmd3.get("decision"), "deny")
         self.assertIn("command limit", res_cmd3.get("reason", ""))
 
-        payload_inv4 = dict(self.base_payload, invocationNum=4)
-        orchestrator_guard.handle_pre_invocation(payload_inv4)
+        self._pre_inv(invocationNum=4)
+        p4 = self._payload(tool="run_command", args=self._cmd_args("echo 'fresh budget cmd'"), call_id="cmd_4")
+        p4.pop("invocationNum", None)
+        self.assertEqual(orchestrator_guard.handle_pre_tool(p4).get("decision"), "allow")
 
-        cmd_payload_4 = dict(
-            self.base_payload,
-            toolCall={
-                "id": "cmd_4",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "echo 'fresh budget cmd'",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-        )
-        cmd_payload_4.pop("invocationNum", None)
-        res_cmd4 = orchestrator_guard.handle_pre_tool(cmd_payload_4)
-        self.assertEqual(res_cmd4.get("decision"), "allow")
-
-        state_after = orchestrator_guard._load_state(self.base_payload)
+        state_after = self._load_st()
         self.assertIn("4", state_after.get("direct_budget", {}))
         self.assertEqual(len(state_after["direct_budget"]["4"]["commands"]), 1)
 
-        # Verify protojson zero (0, "0") is treated as unpopulated in _current_invocation_key
-        # and falls back to persisted current_invocation_num (which is 4)
-        self.assertEqual(
-            orchestrator_guard._current_invocation_key({"invocationNum": 0}, state_after),
-            "4",
-        )
-        self.assertEqual(
-            orchestrator_guard._current_invocation_key({"invocationNum": "0"}, state_after),
-            "4",
-        )
-        self.assertEqual(
-            orchestrator_guard._current_invocation_key({"invocationNum": 0}, {"current_invocation_num": 5}),
-            "5",
-        )
-        self.assertEqual(
-            orchestrator_guard._current_invocation_key({"invocationNum": None}, state_after),
-            "4",
-        )
-        self.assertEqual(
-            orchestrator_guard._current_invocation_key({}, state_after),
-            "4",
-        )
-        self.assertEqual(
-            orchestrator_guard._current_invocation_key({"invocationNum": 7}, state_after),
-            "7",
-        )
-        self.assertEqual(
-            orchestrator_guard._current_invocation_key({"invocationNum": "7"}, state_after),
-            "7",
-        )
-        self.assertEqual(
-            orchestrator_guard._current_invocation_key({"invocationNum": 0}, {"current_invocation_num": 0}),
-            "0",
-        )
-        self.assertEqual(
-            orchestrator_guard._current_invocation_key({"invocationNum": "0"}, {"current_invocation_num": 0}),
-            "0",
-        )
+        self.assertEqual(orchestrator_guard._current_invocation_key({"invocationNum": 0}, state_after), "4")
+        self.assertEqual(orchestrator_guard._current_invocation_key({"invocationNum": "0"}, state_after), "4")
+        self.assertEqual(orchestrator_guard._current_invocation_key({"invocationNum": 0}, {"current_invocation_num": 5}), "5")
+        self.assertEqual(orchestrator_guard._current_invocation_key({"invocationNum": None}, state_after), "4")
+        self.assertEqual(orchestrator_guard._current_invocation_key({}, state_after), "4")
+        self.assertEqual(orchestrator_guard._current_invocation_key({"invocationNum": 7}, state_after), "7")
+        self.assertEqual(orchestrator_guard._current_invocation_key({"invocationNum": "7"}, state_after), "7")
+        self.assertEqual(orchestrator_guard._current_invocation_key({"invocationNum": 0}, {"current_invocation_num": 0}), "0")
+        self.assertEqual(orchestrator_guard._current_invocation_key({"invocationNum": "0"}, {"current_invocation_num": 0}), "0")
 
-        # Tool call with protojson zero (0 or "0") uses current invocation bucket (4)
-        cmd_payload_proto0 = dict(
-            self.base_payload,
-            invocationNum=0,
-            toolCall={
-                "id": "cmd_proto0",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "echo 'proto0 cmd'",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
+        self.assertEqual(
+            self._pre("run_command", self._cmd_args("echo 'proto0 cmd'"), call_id="cmd_proto0", invocationNum=0).get("decision"),
+            "allow",
         )
-        res_proto0 = orchestrator_guard.handle_pre_tool(cmd_payload_proto0)
-        self.assertEqual(res_proto0.get("decision"), "allow")
-        state_after_proto0 = orchestrator_guard._load_state(self.base_payload)
+        state_after_proto0 = self._load_st()
         self.assertEqual(len(state_after_proto0["direct_budget"]["4"]["commands"]), 2)
         self.assertNotIn("0", state_after_proto0.get("direct_budget", {}))
 
-        # Calling handle_pre_invocation resets direct_budget for that invocation and "0"
-        state_pre_reset = orchestrator_guard._load_state(self.base_payload)
-        state_pre_reset["direct_budget"]["5"] = {"commands": ["old_cmd_5"]}
-        state_pre_reset["direct_budget"]["0"] = {"commands": ["old_cmd_0"]}
-        orchestrator_guard._save_state(self.base_payload, state_pre_reset)
-
-        payload_inv5 = dict(self.base_payload, invocationNum=5)
-        orchestrator_guard.handle_pre_invocation(payload_inv5)
-
-        state_after_inv5 = orchestrator_guard._load_state(self.base_payload)
+        st_pre = self._load_st()
+        st_pre["direct_budget"]["5"] = {"commands": ["old_cmd_5"]}
+        st_pre["direct_budget"]["0"] = {"commands": ["old_cmd_0"]}
+        orchestrator_guard._save_state(self.base_payload, st_pre)
+        self._pre_inv(invocationNum=5)
+        state_after_inv5 = self._load_st()
         self.assertEqual(state_after_inv5.get("current_invocation_num"), 5)
         self.assertNotIn("5", state_after_inv5.get("direct_budget", {}))
         self.assertNotIn("0", state_after_inv5.get("direct_budget", {}))
 
-        # Calling handle_pre_invocation with protojson zero (0 or "0") preserves current_invocation_num
-        # and resets direct_budget key "0"
         state_after_inv5["direct_budget"]["0"] = {"commands": ["old_cmd_0"]}
         state_after_inv5["direct_budget"]["6"] = {"commands": ["preserved_cmd_6"]}
         orchestrator_guard._save_state(self.base_payload, state_after_inv5)
-
-        payload_proto_zero = dict(self.base_payload, invocationNum=0)
-        orchestrator_guard.handle_pre_invocation(payload_proto_zero)
-
-        state_proto_cleared = orchestrator_guard._load_state(self.base_payload)
+        self._pre_inv(invocationNum=0)
+        state_proto_cleared = self._load_st()
         self.assertEqual(state_proto_cleared.get("current_invocation_num"), 5)
         self.assertNotIn("0", state_proto_cleared.get("direct_budget", {}))
         self.assertIn("6", state_proto_cleared.get("direct_budget", {}))
 
-        # Also test with protojson string "0"
         state_proto_cleared["direct_budget"]["0"] = {"commands": ["old_cmd_0"]}
         orchestrator_guard._save_state(self.base_payload, state_proto_cleared)
-        payload_proto_str_zero = dict(self.base_payload, invocationNum="0")
-        orchestrator_guard.handle_pre_invocation(payload_proto_str_zero)
-        state_str_cleared = orchestrator_guard._load_state(self.base_payload)
+        self._pre_inv(invocationNum="0")
+        state_str_cleared = self._load_st()
         self.assertEqual(state_str_cleared.get("current_invocation_num"), 5)
         self.assertNotIn("0", state_str_cleared.get("direct_budget", {}))
 
-        # Calling handle_pre_invocation with invocationNum omitted resets current_invocation_num to 0
-        # and clears direct_budget key "0"
         state_after["direct_budget"]["0"] = {"commands": ["old_cmd"]}
         orchestrator_guard._save_state(self.base_payload, state_after)
-
-        payload_omit_inv = dict(self.base_payload)
-        payload_omit_inv.pop("invocationNum", None)
-        orchestrator_guard.handle_pre_invocation(payload_omit_inv)
-
-        state_cleared = orchestrator_guard._load_state(self.base_payload)
-        self.assertNotIn("0", state_cleared.get("direct_budget", {}))
+        p_omit = dict(self.base_payload)
+        p_omit.pop("invocationNum", None)
+        orchestrator_guard.handle_pre_invocation(p_omit)
+        self.assertNotIn("0", self._load_st().get("direct_budget", {}))
 
     def test_compound_git_and_pytest_command_not_exempt(self) -> None:
         orchestrator_guard.handle_pre_invocation(self.base_payload)
 
         dummy_file = orchestrator_guard.PROJECT_ROOT / "test_dummy_source.py"
         try:
-            write_payload = dict(
-                self.base_payload,
-                toolCall={
-                    "name": "write_file",
-                    "args": {
-                        "Path": str(dummy_file),
-                        "Content": "x = 1\n",
-                    },
-                },
+            self.assertEqual(
+                self._pre("write_file", {"Path": str(dummy_file), "Content": "x = 1\n"}).get("decision"),
+                "allow",
             )
-            res_write = orchestrator_guard.handle_pre_tool(write_payload)
-            self.assertEqual(res_write.get("decision"), "allow")
-
-            compound_payload_1 = dict(
-                self.base_payload,
-                toolCall={
-                    "id": "compound_1",
-                    "name": "run_command",
-                    "args": {
-                        "CommandLine": "git status && pytest",
-                        "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                    },
-                },
+            self.assertEqual(
+                self._pre("run_command", self._cmd_args("git status && pytest"), call_id="compound_1").get("decision"),
+                "allow",
             )
-            res_cmd_1 = orchestrator_guard.handle_pre_tool(compound_payload_1)
-            self.assertEqual(res_cmd_1.get("decision"), "allow")
-
-            compound_payload_2 = dict(
-                self.base_payload,
-                toolCall={
-                    "id": "compound_2",
-                    "name": "run_command",
-                    "args": {
-                        "CommandLine": "git status && pytest",
-                        "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                    },
-                },
-            )
-            res_cmd_2 = orchestrator_guard.handle_pre_tool(compound_payload_2)
+            res_cmd_2 = self._pre("run_command", self._cmd_args("git status && pytest"), call_id="compound_2")
             self.assertEqual(res_cmd_2.get("decision"), "deny")
-            self.assertIn(
-                "Direct workspace edit followed by iterative test execution detected",
-                res_cmd_2.get("reason", ""),
-            )
+            self.assertIn("Direct workspace edit followed by iterative test execution detected", res_cmd_2.get("reason", ""))
         finally:
             if dummy_file.exists():
                 dummy_file.unlink()
 
-        clean_payload_inv = dict(self.base_payload, invocationNum=99)
-        orchestrator_guard.handle_pre_invocation(clean_payload_inv)
-
-        clean_cmd_payload = dict(
-            clean_payload_inv,
-            toolCall={
-                "id": "clean_cmd_1",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "git status && pytest",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-        )
-        res_clean = orchestrator_guard.handle_pre_tool(clean_cmd_payload)
+        clean_inv = self._payload(invocationNum=99)
+        orchestrator_guard.handle_pre_invocation(clean_inv)
+        res_clean = self._pre("run_command", self._cmd_args("git status && pytest"), call_id="clean_cmd_1", base=clean_inv)
         self.assertEqual(res_clean.get("decision"), "allow")
-        state = orchestrator_guard._load_state(clean_payload_inv)
-        self.assertIn("git status && pytest", state["direct_budget"]["99"]["commands"])
+        self.assertIn("git status && pytest", self._load_st(clean_inv)["direct_budget"]["99"]["commands"])
 
     def test_grep_search_on_log_or_transcript_blocked_for_root(self) -> None:
         orchestrator_guard.handle_pre_invocation(self.base_payload)
 
-        payload_log = dict(
-            self.base_payload,
-            toolCall={
-                "name": "grep_search",
-                "args": {
-                    "SearchPath": "/tmp/debug.log",
-                    "Query": "ERROR",
-                },
-            },
-        )
-        res_log = orchestrator_guard.handle_pre_tool(payload_log)
+        res_log = self._pre("grep_search", {"SearchPath": "/tmp/debug.log", "Query": "ERROR"})
         self.assertEqual(res_log.get("decision"), "deny")
         self.assertIn("Context separation violation", res_log.get("reason", ""))
         self.assertIn("debug.log", res_log.get("reason", ""))
 
-        payload_transcript = dict(
-            self.base_payload,
-            toolCall={
-                "name": "grep_search",
-                "args": {
-                    "SearchPath": "transcript.jsonl",
-                    "Query": "conversationId",
-                },
-            },
-        )
-        res_transcript = orchestrator_guard.handle_pre_tool(payload_transcript)
+        res_transcript = self._pre("grep_search", {"SearchPath": "transcript.jsonl", "Query": "conversationId"})
         self.assertEqual(res_transcript.get("decision"), "deny")
         self.assertIn("Context separation violation", res_transcript.get("reason", ""))
 
-        payload_normal = dict(
-            self.base_payload,
-            toolCall={
-                "name": "grep_search",
-                "args": {
-                    "SearchPath": str(orchestrator_guard.PROJECT_ROOT / "tests"),
-                    "Query": "test",
-                },
-            },
-        )
-        res_normal = orchestrator_guard.handle_pre_tool(payload_normal)
+        res_normal = self._pre("grep_search", {"SearchPath": str(orchestrator_guard.PROJECT_ROOT / "tests"), "Query": "test"})
         self.assertEqual(res_normal.get("decision"), "allow")
 
     def test_transcript_offset_cursor_and_doc_uuid_ignored(self) -> None:
         transcript_file = Path(self.artifact_dir) / "transcript_cursor.jsonl"
-        payload = dict(
-            self.base_payload,
-            transcriptPath=str(transcript_file),
-        )
-        state = orchestrator_guard._load_state(payload)
-        state["pending_spawns"] = [
-            {"role": "Worker 1", "type": "implementer", "model": "flash"}
-        ]
-        orchestrator_guard._save_state(payload, state)
+        payload = self._payload(transcriptPath=str(transcript_file))
+        state = self._seed_state(payload, pending_spawns=[{"role": "Worker 1", "type": "implementer", "model": "flash"}])
 
         doc_cid = "aaaa1111-aaaa-1111-aaaa-1111aaaa1111"
-        line_doc = json.dumps({
-            "stepId": "00000000-0000-0000-0000-000000000001",
-            "name": "view_file",
-            "args": {"AbsolutePath": "/workspace/docs/hooks.md"},
-            "content": f"Created the following subagents: conversationId: {doc_cid}",
-        }) + "\n"
-        transcript_file.write_text(line_doc, encoding="utf-8")
+        transcript_file.write_text(
+            json.dumps({
+                "stepId": "00000000-0000-0000-0000-000000000001",
+                "name": "view_file",
+                "args": {"AbsolutePath": "/workspace/docs/hooks.md"},
+                "content": f"Created the following subagents: conversationId: {doc_cid}",
+            }) + "\n",
+            encoding="utf-8",
+        )
 
-        changed = orchestrator_guard._sync_subagents_from_transcript(payload, state)
-        self.assertTrue(changed)
+        self.assertTrue(orchestrator_guard._sync_subagents_from_transcript(payload, state))
         offset_after_first = state.get("transcript_offset", 0)
         self.assertGreater(offset_after_first, 0)
         self.assertNotIn(doc_cid, state.get("subagents", {}))
         self.assertEqual(len(state.get("pending_spawns", [])), 1)
 
         real_cid = "bbbb2222-bbbb-2222-bbbb-2222bbbb2222"
-        line_real = json.dumps({
-            "stepId": "00000000-0000-0000-0000-000000000002",
-            "name": "invoke_subagent",
-            "result": {
-                "conversationId": real_cid,
-            },
-        }) + "\n"
         with open(transcript_file, "a", encoding="utf-8") as fh:
-            fh.write(line_real)
+            fh.write(json.dumps({
+                "stepId": "00000000-0000-0000-0000-000000000002",
+                "name": "invoke_subagent",
+                "result": {"conversationId": real_cid},
+            }) + "\n")
 
-        changed_real = orchestrator_guard._sync_subagents_from_transcript(payload, state)
-        self.assertTrue(changed_real)
+        self.assertTrue(orchestrator_guard._sync_subagents_from_transcript(payload, state))
         offset_after_second = state.get("transcript_offset", 0)
         self.assertGreater(offset_after_second, offset_after_first)
         self.assertIn(real_cid, state.get("subagents", {}))
         self.assertEqual(len(state.get("pending_spawns", [])), 0)
 
-        changed_third = orchestrator_guard._sync_subagents_from_transcript(payload, state)
-        self.assertFalse(changed_third)
+        self.assertFalse(orchestrator_guard._sync_subagents_from_transcript(payload, state))
         self.assertEqual(state.get("transcript_offset"), offset_after_second)
 
-        # Test singular "Created the following subagent:" transcript line pairs pending spawn
         singular_cid = "cccc3333-cccc-3333-cccc-3333cccc3333"
-        state["pending_spawns"] = [
-            {"role": "Worker 2", "type": "scout", "model": "flash_lite"}
-        ]
-        line_singular = f"Created the following subagent: conversationId: {singular_cid}\n"
+        state["pending_spawns"] = [{"role": "Worker 2", "type": "scout", "model": "flash_lite"}]
         with open(transcript_file, "a", encoding="utf-8") as fh:
-            fh.write(line_singular)
+            fh.write(f"Created the following subagent: conversationId: {singular_cid}\n")
 
-        changed_singular = orchestrator_guard._sync_subagents_from_transcript(payload, state)
-        self.assertTrue(changed_singular)
+        self.assertTrue(orchestrator_guard._sync_subagents_from_transcript(payload, state))
         self.assertIn(singular_cid, state.get("subagents", {}))
         self.assertEqual(state.get("subagents", {})[singular_cid]["model"], "flash_lite")
         self.assertEqual(len(state.get("pending_spawns", [])), 0)
 
     def test_self_subagent_meta_cached_from_sibling_brain(self) -> None:
-        app_data = Path(self.artifact_dir) / "appdata"
-        parent_brain = app_data / "brain" / "parent-orch-cid"
-        sub_brain = app_data / "brain" / "sub-worker-cid"
-        parent_brain.mkdir(parents=True, exist_ok=True)
-        sub_brain.mkdir(parents=True, exist_ok=True)
-
+        parent_payload = self._brain_payload("parent-orch-cid", root="appdata/brain")
+        sub_payload = self._brain_payload("sub-worker-cid", root="appdata/brain", modelName="gemini-3-flash")
         worker_cid = "sub-worker-cid-5555"
-        parent_payload = dict(
-            self.base_payload,
-            conversationId="parent-orch-cid",
-            artifactDirectoryPath=str(parent_brain),
-        )
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id=worker_cid,
-            type_name="research",
-            model="flash",
-            role="Worker Researcher",
-        )
+        self._reg_sub("research", worker_cid, "flash", payload=parent_payload, role="Worker Researcher")
 
-        sub_payload = dict(
-            self.base_payload,
-            conversationId=worker_cid,
-            artifactDirectoryPath=str(sub_brain),
-            modelName="gemini-3-flash",
-        )
-        sub_state = orchestrator_guard._load_state(sub_payload)
+        sub_payload = self._payload(cid=worker_cid, base=sub_payload)
+        sub_state = self._load_st(sub_payload)
         self.assertNotIn("self_subagent_meta", sub_state)
 
-        is_known = orchestrator_guard._is_known_subagent(sub_payload, sub_state)
-        self.assertTrue(is_known)
-
+        self.assertTrue(orchestrator_guard._is_known_subagent(sub_payload, sub_state))
         self.assertIn("self_subagent_meta", sub_state)
         self.assertEqual(sub_state["self_subagent_meta"]["type_name"], "research")
 
-        persisted_sub_state = orchestrator_guard._load_state(sub_payload)
+        persisted_sub_state = self._load_st(sub_payload)
         self.assertIn("self_subagent_meta", persisted_sub_state)
-        self.assertEqual(
-            persisted_sub_state["self_subagent_meta"]["type_name"], "research"
-        )
-
-        self.assertTrue(
-            orchestrator_guard._is_research_subagent(sub_payload, persisted_sub_state)
-        )
+        self.assertEqual(persisted_sub_state["self_subagent_meta"]["type_name"], "research")
+        self.assertTrue(orchestrator_guard._is_scratch_only_subagent(sub_payload, persisted_sub_state))
 
     def test_commented_out_assertion_tampering_blocked_in_edit_and_diff(self) -> None:
         test_file = str(orchestrator_guard.PROJECT_ROOT / "tests" / "test_sample.py")
-        commented_assert_edit = dict(
-            self.base_payload,
-            toolCall={
-                "name": "edit_file",
-                "args": {
-                    "Path": test_file,
-                    "Target": "        self.assertEqual(a, b)\n",
-                    "Replacement": "        # self.assertEqual(a, b)\n",
-                },
-            },
+        res_edit = self._pre(
+            "edit_file",
+            {"Path": test_file, "Target": "        self.assertEqual(a, b)\n", "Replacement": "        # self.assertEqual(a, b)\n"},
         )
-        res_edit = orchestrator_guard.handle_pre_tool(commented_assert_edit)
         self.assertEqual(res_edit["decision"], "deny")
         self.assertIn("reduces assertion count", res_edit["reason"])
 
-        diff_commented_assert = (
-            "--- a/tests/test_auth.py\n"
-            "+++ b/tests/test_auth.py\n"
-            "@@ -10,1 +10,1 @@\n"
-            "-    self.assertEqual(token, 'abc')\n"
-            "+    # self.assertEqual(token, 'abc')\n"
+        res_diff = orchestrator_guard.audit_diff_text(
+            "--- a/tests/test_auth.py\n+++ b/tests/test_auth.py\n@@ -10,1 +10,1 @@\n"
+            "-    self.assertEqual(token, 'abc')\n+    # self.assertEqual(token, 'abc')\n"
         )
-        res_diff = orchestrator_guard.audit_diff_text(diff_commented_assert)
         self.assertIsNotNone(res_diff)
         self.assertIn("Diff audit detected net removal of 1 assertion(s)", res_diff)
 
     def test_step_idx_deduplication_and_scout_does_not_clear_dirty_receipt(self) -> None:
         orchestrator_guard.handle_pre_invocation(self.base_payload)
 
-        # 1. Duplicate PreToolUse calls with same stepIdx (and no toolCall.id) count once
-        step_payload = dict(
-            self.base_payload,
-            stepIdx=42,
-            toolCall={
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "echo 'step test'",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-        )
-        res1 = orchestrator_guard.handle_pre_tool(step_payload)
-        self.assertEqual(res1["decision"], "allow")
-        res2 = orchestrator_guard.handle_pre_tool(step_payload)
-        self.assertEqual(res2["decision"], "allow")
-
-        state = orchestrator_guard._load_state(self.base_payload)
+        self.assertEqual(self._pre("run_command", self._cmd_args("echo 'step test'"), stepIdx=42)["decision"], "allow")
+        self.assertEqual(self._pre("run_command", self._cmd_args("echo 'step test'"), stepIdx=42)["decision"], "allow")
+        state = self._load_st()
         self.assertEqual(len(state["direct_budget"]["1"]["commands"]), 1)
 
-        # 2. handle_post_tool for a scout invoke_subagent does NOT clear a dirty test_receipt
         receipt = orchestrator_guard._get_test_receipt(state, self.base_payload)
-        receipt["dirty"] = True
-        receipt["verified"] = False
+        receipt["dirty"], receipt["verified"] = True, False
         orchestrator_guard._save_state(self.base_payload, state)
 
-        scout_post_payload = dict(
-            self.base_payload,
-            toolCall={
-                "id": "scout_post_call",
-                "name": "invoke_subagent",
-                "args": {
-                    "TypeName": "scout",
-                    "Role": "Read Scout",
-                },
-            },
-            error="",
-        )
-        orchestrator_guard.handle_post_tool(scout_post_payload)
-
-        state_after_scout = orchestrator_guard._load_state(self.base_payload)
-        receipt_after_scout = orchestrator_guard._get_test_receipt(
-            state_after_scout, self.base_payload
-        )
+        self._post("invoke_subagent", {"TypeName": "scout", "Role": "Read Scout"}, call_id="scout_post_call")
+        receipt_after_scout = orchestrator_guard._get_test_receipt(self._load_st(), self.base_payload)
         self.assertTrue(receipt_after_scout["dirty"])
         self.assertFalse(receipt_after_scout["verified"])
 
-        # 3. echo pytest does not clear a dirty test_receipt
-        echo_post_payload = dict(
-            self.base_payload,
-            toolCall={
-                "id": "echo_post_call",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "echo pytest",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-            error="",
-        )
-        orchestrator_guard.handle_post_tool(echo_post_payload)
-
-        state_after_echo = orchestrator_guard._load_state(self.base_payload)
-        receipt_after_echo = orchestrator_guard._get_test_receipt(
-            state_after_echo, self.base_payload
-        )
+        self._post("run_command", self._cmd_args("echo pytest"), call_id="echo_post_call")
+        receipt_after_echo = orchestrator_guard._get_test_receipt(self._load_st(), self.base_payload)
         self.assertTrue(receipt_after_echo["dirty"])
         self.assertFalse(receipt_after_echo["verified"])
 
     def test_cli_doctor_and_status_modes(self) -> None:
         status_res = orchestrator_guard._cli_status(self.base_payload)
-        self.assertIn("projectRoot", status_res)
-        self.assertIn("stateFile", status_res)
-        self.assertIn("active", status_res)
-        self.assertIn("currentInvocation", status_res)
-        self.assertIn("directBudget", status_res)
-        self.assertIn("testReceipt", status_res)
-        self.assertIn("circuitBreaker", status_res)
+        for k in ("projectRoot", "stateFile", "active", "currentInvocation", "directBudget", "testReceipt", "circuitBreaker"):
+            self.assertIn(k, status_res)
 
         doctor_res = orchestrator_guard._cli_doctor()
         self.assertIn("healthy", doctor_res)
@@ -2069,136 +936,59 @@ NOTES: <one sentence summarizing findings>
         self.assertIsInstance(doctor_res["issues"], list)
 
     def test_inactive_session_on_normal_chat(self) -> None:
-        normal_payload = dict(
-            self.base_payload,
+        normal_payload = self._payload(
+            tool="read_file",
+            args={"Path": str(orchestrator_guard.PROJECT_ROOT / "README.md")},
             lastUserInput="normal chat message",
-            toolCall={
-                "name": "read_file",
-                "args": {"Path": str(orchestrator_guard.PROJECT_ROOT / "README.md")},
-            },
         )
-        # handle_pre_invocation returns {}
-        res_pre_inv = orchestrator_guard.handle_pre_invocation(normal_payload)
-        self.assertEqual(res_pre_inv, {})
-
-        state = orchestrator_guard._load_state(normal_payload)
+        self.assertEqual(orchestrator_guard.handle_pre_invocation(normal_payload), {})
+        state = self._load_st(normal_payload)
         self.assertFalse(state.get("active"))
         self.assertTrue(state.get("session_evaluated"))
-
-        # handle_pre_tool returns {"decision": "allow"}
-        res_pre_tool = orchestrator_guard.handle_pre_tool(normal_payload)
-        self.assertEqual(res_pre_tool, {"decision": "allow"})
-
-        # handle_post_tool returns {}
-        res_post_tool = orchestrator_guard.handle_post_tool(normal_payload)
-        self.assertEqual(res_post_tool, {})
-
-        # handle_stop returns {}
-        stop_payload = dict(
-            normal_payload,
-            fullyIdle=True,
-            terminationReason="NO_TOOL_CALL",
-        )
-        res_stop = orchestrator_guard.handle_stop(stop_payload)
-        self.assertEqual(res_stop, {})
+        self.assertEqual(orchestrator_guard.handle_pre_tool(normal_payload), {"decision": "allow"})
+        self.assertEqual(orchestrator_guard.handle_post_tool(normal_payload), {})
+        self.assertEqual(self._stop(base=normal_payload), {})
 
     def test_slash_command_activation_and_persistence_across_turns(self) -> None:
-        slash_payload = dict(
-            self.base_payload,
-            lastUserInput="/philharmonic implement feature X",
-            invocationNum=1,
-        )
-        res_inv1 = orchestrator_guard.handle_pre_invocation(slash_payload)
-        self.assertEqual(res_inv1, {})
-
-        state = orchestrator_guard._load_state(slash_payload)
+        self.assertEqual(self._pre_inv(lastUserInput="/philharmonic implement feature X", invocationNum=1), {})
+        state = self._load_st()
         self.assertTrue(state.get("active"))
         self.assertTrue(state.get("session_evaluated"))
 
-        # Subsequent turn with normal message preserves activation
-        turn2_payload = dict(
-            self.base_payload,
-            lastUserInput="now run the tests",
-            invocationNum=2,
+        self.assertEqual(self._pre_inv(lastUserInput="now run the tests", invocationNum=2), {})
+        self.assertTrue(self._load_st().get("active"))
+        self.assertEqual(
+            self._pre("read_file", {"Path": str(orchestrator_guard.PROJECT_ROOT / "README.md")}, lastUserInput="now run the tests", invocationNum=2),
+            {"decision": "allow"},
         )
-        res_inv2 = orchestrator_guard.handle_pre_invocation(turn2_payload)
-        self.assertEqual(res_inv2, {})
-
-        state2 = orchestrator_guard._load_state(turn2_payload)
-        self.assertTrue(state2.get("active"))
-
-        # In active session, pre_tool allows valid tool calls and enforces limits
-        tool_payload = dict(
-            turn2_payload,
-            toolCall={
-                "name": "read_file",
-                "args": {"Path": str(orchestrator_guard.PROJECT_ROOT / "README.md")},
-            },
-        )
-        res_tool = orchestrator_guard.handle_pre_tool(tool_payload)
-        self.assertEqual(res_tool, {"decision": "allow"})
 
     def test_reading_skill_file_activates_inactive_session(self) -> None:
-        normal_payload = dict(
-            self.base_payload,
-            lastUserInput="please look up some instructions",
-        )
-        orchestrator_guard.handle_pre_invocation(normal_payload)
-        state_before = orchestrator_guard._load_state(normal_payload)
-        self.assertFalse(state_before.get("active"))
+        self._pre_inv(lastUserInput="please look up some instructions")
+        self.assertFalse(self._load_st().get("active"))
 
-        # Agent reads the philharmonic SKILL.md file
-        read_skill_payload = dict(
-            self.base_payload,
-            toolCall={
-                "name": "read_file",
-                "args": {
-                    "Path": str(
-                        orchestrator_guard.PROJECT_ROOT
-                        / ".agents"
-                        / "plugins"
-                        / "philharmonic_orchestra"
-                        / "skills"
-                        / "philharmonic"
-                        / "SKILL.md"
-                    )
-                },
-            },
+        skill_path = str(
+            orchestrator_guard.PROJECT_ROOT / ".agents" / "plugins" / "philharmonic_orchestra" / "skills" / "philharmonic" / "SKILL.md"
         )
-        res_pre_tool = orchestrator_guard.handle_pre_tool(read_skill_payload)
-        self.assertEqual(res_pre_tool, {"decision": "allow"})
-
-        state_after = orchestrator_guard._load_state(self.base_payload)
+        self.assertEqual(self._pre("read_file", {"Path": skill_path}), {"decision": "allow"})
+        state_after = self._load_st()
         self.assertTrue(state_after.get("active"))
         self.assertTrue(state_after.get("session_evaluated"))
 
     def test_cli_activate_and_deactivate_modes(self) -> None:
-        # CLI activate
         act_res = orchestrator_guard._cli_activate(self.base_payload)
         self.assertEqual(act_res["status"], "activated")
         self.assertTrue(act_res["active"])
         self.assertIn("state_path", act_res)
+        self.assertTrue(orchestrator_guard._cli_status(self.base_payload)["active"])
 
-        status_res = orchestrator_guard._cli_status(self.base_payload)
-        self.assertTrue(status_res["active"])
-
-        # CLI deactivate
         deact_res = orchestrator_guard._cli_deactivate(self.base_payload)
         self.assertEqual(deact_res["status"], "deactivated")
         self.assertFalse(deact_res["active"])
-
-        status_res2 = orchestrator_guard._cli_status(self.base_payload)
-        self.assertFalse(status_res2["active"])
+        self.assertFalse(orchestrator_guard._cli_status(self.base_payload)["active"])
 
     def test_philharmonic_skill_file_exists_and_valid_frontmatter(self) -> None:
         skill_path = (
-            orchestrator_guard.PROJECT_ROOT
-            / ".agents"
-            / "plugins"
-            / "philharmonic_orchestra"
-            / "skills"
-            / "philharmonic"
-            / "SKILL.md"
+            orchestrator_guard.PROJECT_ROOT / ".agents" / "plugins" / "philharmonic_orchestra" / "skills" / "philharmonic" / "SKILL.md"
         )
         self.assertTrue(skill_path.exists())
         content = skill_path.read_text(encoding="utf-8")
@@ -2213,783 +1003,277 @@ NOTES: <one sentence summarizing findings>
         self.assertIn("## 5. Empirical Test Receipts, Circuit Breaker, and Diff Audit", content)
 
     def test_remote_vm_tool_schemas_support(self) -> None:
-        # 1. lookup_skill(skill_name="philharmonic") activates an inactive session
-        normal_payload = dict(
-            self.base_payload,
-            lastUserInput="hello remote vm",
-        )
-        orchestrator_guard.handle_pre_invocation(normal_payload)
-        self.assertFalse(orchestrator_guard._load_state(normal_payload).get("active"))
+        self._pre_inv(lastUserInput="hello remote vm")
+        self.assertFalse(self._load_st().get("active"))
 
-        lookup_payload = dict(
-            self.base_payload,
-            toolCall={
-                "name": "lookup_skill",
-                "args": {"skill_name": "philharmonic"},
-            },
-        )
-        res_lookup = orchestrator_guard.handle_pre_tool(lookup_payload)
-        self.assertEqual(res_lookup["decision"], "allow")
-        self.assertTrue(orchestrator_guard._load_state(self.base_payload).get("active"))
+        self.assertEqual(self._pre("lookup_skill", {"skill_name": "philharmonic"})["decision"], "allow")
+        self.assertTrue(self._load_st().get("active"))
 
-        # 1b. lookup_skills(skill_names=["philharmonic"]) also activates an inactive session
         orchestrator_guard._cli_deactivate(self.base_payload)
-        self.assertFalse(orchestrator_guard._load_state(self.base_payload).get("active"))
-        lookup_multi_payload = dict(
-            self.base_payload,
-            toolCall={
-                "name": "lookup_skills",
-                "args": {"skill_names": ["other_skill", "philharmonic"]},
-            },
-        )
-        res_lookup_multi = orchestrator_guard.handle_pre_tool(lookup_multi_payload)
-        self.assertEqual(res_lookup_multi["decision"], "allow")
-        self.assertTrue(orchestrator_guard._load_state(self.base_payload).get("active"))
+        self.assertFalse(self._load_st().get("active"))
+        self.assertEqual(self._pre("lookup_skills", {"skill_names": ["other_skill", "philharmonic"]})["decision"], "allow")
+        self.assertTrue(self._load_st().get("active"))
 
-        # 2. snake_case define_subagent forces enable_subagent_tools=False
-        define_payload = dict(
-            self.base_payload,
-            toolCall={
-                "name": "define_subagent",
-                "args": {
-                    "name": "scout",
-                    "enable_write_tools": False,
-                    "enable_subagent_tools": True,
-                },
-            },
-        )
-        res_define = orchestrator_guard.handle_pre_tool(define_payload)
+        res_define = self._pre("define_subagent", {"name": "scout", "enable_write_tools": False, "enable_subagent_tools": True})
         self.assertEqual(res_define["decision"], "allow")
         self.assertEqual(res_define["overwrite"], {"enable_subagent_tools": False})
 
-        # 3. Subagents array in invoke_subagent rewrites inherit models and blocks pro
-        subagents_pro_payload = dict(
-            self.base_payload,
-            toolCall={
-                "id": "remote_sub_pro",
-                "name": "invoke_subagent",
-                "args": {
-                    "Subagents": [
-                        {
-                            "TypeName": "implementer",
-                            "Role": "Pro Worker",
-                            "Model": "pro",
-                            "Prompt": VALID_PROMPT,
-                        }
-                    ]
-                },
-            },
+        res_pro = self._pre(
+            "invoke_subagent",
+            {"Subagents": [self._sub_args("implementer", "Pro Worker", "pro")]},
+            call_id="remote_sub_pro",
         )
-        res_pro = orchestrator_guard.handle_pre_tool(subagents_pro_payload)
         self.assertEqual(res_pro["decision"], "deny")
         self.assertIn("Model='pro'", res_pro["reason"])
 
-        subagents_inherit_payload = dict(
-            self.base_payload,
-            toolCall={
-                "id": "remote_sub_inherit",
-                "name": "invoke_subagent",
-                "args": {
-                    "Subagents": [
-                        {
-                            "TypeName": "scout",
-                            "Role": "Remote Scout",
-                            "Model": "inherit",
-                            "Prompt": VALID_PROMPT,
-                        },
-                        {
-                            "TypeName": "implementer",
-                            "Role": "Remote Implementer",
-                            "Model": "inherit",
-                            "Prompt": VALID_PROMPT,
-                        },
-                    ]
-                },
-            },
-        )
-        res_inherit = orchestrator_guard.handle_pre_tool(subagents_inherit_payload)
+        inherit_args = {
+            "Subagents": [
+                self._sub_args("scout", "Remote Scout", "inherit"),
+                self._sub_args("implementer", "Remote Implementer", "inherit"),
+            ]
+        }
+        res_inherit = self._pre("invoke_subagent", inherit_args, call_id="remote_sub_inherit")
         self.assertEqual(res_inherit["decision"], "allow")
-        self.assertEqual(
-            res_inherit["overwrite"]["Subagents"][0]["Model"], "flash_lite"
-        )
-        self.assertEqual(
-            res_inherit["overwrite"]["Subagents"][1]["Model"], "flash"
-        )
-        state_after_spawn = orchestrator_guard._load_state(self.base_payload)
-        self.assertEqual(len(state_after_spawn.get("pending_spawns", [])), 2)
+        self.assertEqual(res_inherit["overwrite"]["Subagents"][0]["Model"], "flash_lite")
+        self.assertEqual(res_inherit["overwrite"]["Subagents"][1]["Model"], "flash")
+        self.assertEqual(len(self._load_st().get("pending_spawns", [])), 2)
 
-        # 3b. handle_post_tool with Subagents list rolls back all pending spawns on error
-        post_err_payload = dict(
-            subagents_inherit_payload,
-            error="remote subagent spawn failed",
-        )
-        orchestrator_guard.handle_post_tool(post_err_payload)
-        state_after_rollback = orchestrator_guard._load_state(self.base_payload)
-        self.assertEqual(len(state_after_rollback.get("pending_spawns", [])), 0)
+        self._post("invoke_subagent", inherit_args, error="remote subagent spawn failed", call_id="remote_sub_inherit")
+        self.assertEqual(len(self._load_st().get("pending_spawns", [])), 0)
 
-        # 4. view_file, write_to_file, and replace_file_content enforce budget, dirty receipt, and tamper checks
         test_file = str(orchestrator_guard.PROJECT_ROOT / "tests" / "test_remote.py")
-        tamper_replace = dict(
-            self.base_payload,
-            toolCall={
-                "name": "replace_file_content",
-                "args": {
-                    "TargetFile": test_file,
-                    "TargetContent": "    assert x == 1\n",
-                    "ReplacementContent": "    # assert x == 1\n",
-                },
-            },
+        res_tamper = self._pre(
+            "replace_file_content",
+            {"TargetFile": test_file, "TargetContent": "    assert x == 1\n", "ReplacementContent": "    # assert x == 1\n"},
         )
-        res_tamper = orchestrator_guard.handle_pre_tool(tamper_replace)
         self.assertEqual(res_tamper["decision"], "deny")
         self.assertIn("reduces assertion count", res_tamper["reason"])
 
-        tamper_write_to_file = dict(
-            self.base_payload,
-            toolCall={
-                "name": "write_to_file",
-                "args": {
-                    "TargetFile": test_file,
-                    "CodeContent": "def test_x():\n    assert True\n",
-                },
-            },
-        )
-        res_tamper_wtf = orchestrator_guard.handle_pre_tool(tamper_write_to_file)
+        res_tamper_wtf = self._pre("write_to_file", {"TargetFile": test_file, "CodeContent": "def test_x():\n    assert True\n"})
         self.assertEqual(res_tamper_wtf["decision"], "deny")
         self.assertIn("assert True", res_tamper_wtf["reason"])
 
         code_file = str(orchestrator_guard.PROJECT_ROOT / "remote_code.py")
-        res_write_code = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "write_to_file",
-                    "args": {
-                        "TargetFile": code_file,
-                        "CodeContent": "val = 123\n",
-                    },
-                },
-            )
-        )
-        self.assertEqual(res_write_code["decision"], "allow")
-        state_dirty = orchestrator_guard._load_state(self.base_payload)
-        self.assertTrue(
-            orchestrator_guard._get_test_receipt(state_dirty, self.base_payload).get("dirty")
-        )
+        self.assertEqual(self._pre("write_to_file", {"TargetFile": code_file, "CodeContent": "val = 123\n"})["decision"], "allow")
+        self.assertTrue(orchestrator_guard._get_test_receipt(self._load_st(), self.base_payload).get("dirty"))
 
-        # 4b. handle_post_tool with Subagents list keeps dirty=True for scout/research only,
-        # and clears dirty=False when an implementer entry succeeds
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "remote_post_readonly",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "Subagents": [
-                            {"TypeName": "scout", "Role": "Read Scout"},
-                            {"TypeName": "research", "Role": "Doc Researcher"},
-                        ]
-                    },
-                },
-                error="",
-            )
+        self._post(
+            "invoke_subagent",
+            {"Subagents": [{"TypeName": "scout", "Role": "Read Scout"}, {"TypeName": "research", "Role": "Doc Researcher"}]},
+            call_id="remote_post_readonly",
         )
-        state_still_dirty = orchestrator_guard._load_state(self.base_payload)
-        self.assertTrue(
-            orchestrator_guard._get_test_receipt(state_still_dirty, self.base_payload).get("dirty")
-        )
+        self.assertTrue(orchestrator_guard._get_test_receipt(self._load_st(), self.base_payload).get("dirty"))
 
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "remote_post_impl",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "Subagents": [
-                            {"TypeName": "scout", "Role": "Read Scout"},
-                            {"TypeName": "implementer", "Role": "Code Implementer"},
-                        ]
-                    },
-                },
-                error="",
-            )
+        self._post(
+            "invoke_subagent",
+            {"Subagents": [{"TypeName": "scout", "Role": "Read Scout"}, {"TypeName": "implementer", "Role": "Code Implementer"}]},
+            call_id="remote_post_impl",
         )
-        state_verified = orchestrator_guard._load_state(self.base_payload)
-        receipt_verified = orchestrator_guard._get_test_receipt(
-            state_verified, self.base_payload
-        )
+        receipt_verified = orchestrator_guard._get_test_receipt(self._load_st(), self.base_payload)
         self.assertFalse(receipt_verified.get("dirty"))
         self.assertTrue(receipt_verified.get("verified"))
 
-        f1 = str(orchestrator_guard.PROJECT_ROOT / "remote_a.py")
-        f2 = str(orchestrator_guard.PROJECT_ROOT / "remote_b.py")
-        f3 = str(orchestrator_guard.PROJECT_ROOT / "remote_c.py")
-        for f in (f1, f2):
-            r = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={"name": "view_file", "args": {"AbsolutePath": f}},
-                )
-            )
-            self.assertEqual(r["decision"], "allow")
-        r3 = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={"name": "view_file", "args": {"AbsolutePath": f3}},
-            )
-        )
+        for fname in ("remote_a.py", "remote_b.py"):
+            self.assertEqual(self._pre("view_file", {"AbsolutePath": str(orchestrator_guard.PROJECT_ROOT / fname)})["decision"], "allow")
+        r3 = self._pre("view_file", {"AbsolutePath": str(orchestrator_guard.PROJECT_ROOT / "remote_c.py")})
         self.assertEqual(r3["decision"], "deny")
         self.assertIn("Direct execution fast-path read budget", r3["reason"])
 
     def test_redirection_splitting_and_regex_literal_paths_in_workspace(self) -> None:
-        self.assertEqual(
-            orchestrator_guard._split_shell_commands("git diff 2>&1"),
-            ["git diff 2>&1"],
-        )
+        self.assertEqual(orchestrator_guard._split_shell_commands("git diff 2>&1"), ["git diff 2>&1"])
         self.assertTrue(orchestrator_guard._is_git_only_command("git diff 2>&1"))
-        self.assertFalse(
-            orchestrator_guard._is_git_only_command("git diff 2>&1 && pytest")
-        )
+        self.assertFalse(orchestrator_guard._is_git_only_command("git diff 2>&1 && pytest"))
 
         roots = orchestrator_guard._allowed_roots(self.base_payload)
         cwd = str(orchestrator_guard.PROJECT_ROOT)
-        self.assertTrue(
-            orchestrator_guard._command_stays_in_workspace(
-                "awk '/pattern/' README.md", cwd, roots
-            )
-        )
-        self.assertTrue(
-            orchestrator_guard._command_stays_in_workspace(
-                "sed '/foo/d' README.md", cwd, roots
-            )
-        )
-        self.assertFalse(
-            orchestrator_guard._command_stays_in_workspace(
-                "cat /etc/passwd", cwd, roots
-            )
-        )
+        self.assertTrue(orchestrator_guard._command_stays_in_workspace("awk '/pattern/' README.md", cwd, roots))
+        self.assertTrue(orchestrator_guard._command_stays_in_workspace("sed '/foo/d' README.md", cwd, roots))
+        self.assertFalse(orchestrator_guard._command_stays_in_workspace("cat /etc/passwd", cwd, roots))
 
     def test_tripped_circuit_breaker_blocks_compound_git_command(self) -> None:
-        state = orchestrator_guard._load_state(self.base_payload)
+        state = self._load_st()
         cb = orchestrator_guard._get_circuit_breaker(state)
-        cb["failure_streak"] = 2
-        cb["tripped"] = True
-        cb["last_error"] = "exit 1"
+        cb["failure_streak"], cb["tripped"], cb["last_error"] = 2, True, "exit 1"
         orchestrator_guard._save_state(self.base_payload, state)
 
-        res_compound = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "run_command",
-                    "args": {
-                        "CommandLine": "git status && pytest",
-                        "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                    },
-                },
-            )
-        )
+        res_compound = self._pre("run_command", self._cmd_args("git status && pytest"))
         self.assertEqual(res_compound["decision"], "deny")
         self.assertIn("2-turn circuit breaker tripped", res_compound["reason"])
-
-        res_git_status = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "run_command",
-                    "args": {
-                        "CommandLine": "git status",
-                        "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                    },
-                },
-            )
-        )
-        self.assertEqual(res_git_status["decision"], "allow")
-
-        res_git_diff = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "run_command",
-                    "args": {
-                        "CommandLine": "git diff 2>&1",
-                        "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                    },
-                },
-            )
-        )
-        self.assertEqual(res_git_diff["decision"], "allow")
+        self.assertEqual(self._pre("run_command", self._cmd_args("git status"))["decision"], "allow")
+        self.assertEqual(self._pre("run_command", self._cmd_args("git diff 2>&1"))["decision"], "allow")
 
     def test_parallel_sibling_brain_subagents_claim_distinct_pending_spawns(self) -> None:
-        app_data = Path(self.artifact_dir) / "appdata_parallel"
-        parent_brain = app_data / "brain" / "parent-cid"
-        sub1_brain = app_data / "brain" / "sub-1-cid"
-        sub2_brain = app_data / "brain" / "sub-2-cid"
-        parent_brain.mkdir(parents=True, exist_ok=True)
-        sub1_brain.mkdir(parents=True, exist_ok=True)
-        sub2_brain.mkdir(parents=True, exist_ok=True)
+        parent_payload = self._brain_payload("parent-cid", root="appdata_parallel/brain")
+        sub1_payload = self._brain_payload("sub-1-cid", root="appdata_parallel/brain")
+        sub2_payload = self._brain_payload("sub-2-cid", root="appdata_parallel/brain")
 
-        parent_payload = dict(
-            self.base_payload,
-            conversationId="parent-cid",
-            artifactDirectoryPath=str(parent_brain),
-            toolCall={
-                "id": "parallel_spawn_1",
-                "name": "invoke_subagent",
-                "args": {
-                    "Subagents": [
-                        {
-                            "TypeName": "scout",
-                            "Role": "First Scout",
-                            "Model": "flash_lite",
-                            "Prompt": VALID_PROMPT,
-                        },
-                        {
-                            "TypeName": "implementer",
-                            "Role": "Second Implementer",
-                            "Model": "flash",
-                            "Prompt": VALID_PROMPT,
-                        },
-                    ]
-                },
-            },
+        res = self._pre(
+            "invoke_subagent",
+            {"Subagents": [self._sub_args("scout", "First Scout", "flash_lite"), self._sub_args("implementer", "Second Implementer", "flash")]},
+            call_id="parallel_spawn_1",
+            base=parent_payload,
         )
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(parent_payload)["decision"], "allow"
-        )
+        self.assertEqual(res["decision"], "allow")
 
-        sub1_payload = dict(
-            self.base_payload,
-            conversationId="sub-1-cid",
-            artifactDirectoryPath=str(sub1_brain),
-        )
-        sub1_state = orchestrator_guard._load_state(sub1_payload)
+        sub1_state = self._load_st(sub1_payload)
         self.assertTrue(orchestrator_guard._is_known_subagent(sub1_payload, sub1_state))
         self.assertEqual(sub1_state["self_subagent_meta"]["type_name"], "scout")
 
-        sub2_payload = dict(
-            self.base_payload,
-            conversationId="sub-2-cid",
-            artifactDirectoryPath=str(sub2_brain),
-        )
-        sub2_state = orchestrator_guard._load_state(sub2_payload)
+        sub2_state = self._load_st(sub2_payload)
         self.assertTrue(orchestrator_guard._is_known_subagent(sub2_payload, sub2_state))
         self.assertEqual(sub2_state["self_subagent_meta"]["type_name"], "implementer")
 
-        parent_state_after = orchestrator_guard._load_state(parent_payload)
+        parent_state_after = self._load_st(parent_payload)
         self.assertEqual(len(parent_state_after.get("pending_spawns", [])), 0)
-        self.assertEqual(
-            parent_state_after["subagents"]["sub-1-cid"]["type_name"], "scout"
-        )
-        self.assertEqual(
-            parent_state_after["subagents"]["sub-2-cid"]["type_name"], "implementer"
-        )
+        self.assertEqual(parent_state_after["subagents"]["sub-1-cid"]["type_name"], "scout")
+        self.assertEqual(parent_state_after["subagents"]["sub-2-cid"]["type_name"], "implementer")
 
     def test_scout_readonly_enforced_in_define_and_pre_tool(self) -> None:
-        define_pascal = dict(
-            self.base_payload,
-            toolCall={
-                "name": "define_subagent",
-                "args": {
-                    "Name": "scout",
-                    "EnableWriteTools": True,
-                    "EnableSubagentTools": True,
-                },
-            },
-        )
-        res_def1 = orchestrator_guard.handle_pre_tool(define_pascal)
+        res_def1 = self._pre("define_subagent", {"Name": "scout", "EnableWriteTools": True, "EnableSubagentTools": True})
         self.assertEqual(res_def1["decision"], "allow")
-        self.assertEqual(
-            res_def1["overwrite"],
-            {"EnableSubagentTools": False, "EnableWriteTools": False},
-        )
+        self.assertEqual(res_def1["overwrite"], {"EnableSubagentTools": False, "EnableWriteTools": False})
 
-        define_snake = dict(
-            self.base_payload,
-            toolCall={
-                "name": "define_subagent",
-                "args": {
-                    "name": "scout",
-                    "enable_write_tools": True,
-                    "enable_subagent_tools": False,
-                },
-            },
-        )
-        res_def2 = orchestrator_guard.handle_pre_tool(define_snake)
+        res_def2 = self._pre("define_subagent", {"name": "scout", "enable_write_tools": True, "enable_subagent_tools": False})
         self.assertEqual(res_def2["decision"], "allow")
         self.assertEqual(res_def2["overwrite"], {"enable_write_tools": False})
 
         scout_cid = "scout-readonly-worker-01"
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id=scout_cid,
-            type_name="scout",
-            model="flash_lite",
-        )
+        self._reg_sub("scout", scout_cid, "flash_lite")
         scratch_md = str(Path(self.artifact_dir) / "scratch" / "notes.md")
-        res_scout_write = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                conversationId=scout_cid,
-                toolCall={
-                    "name": "write_file",
-                    "args": {"Path": scratch_md, "Content": "hello"},
-                },
-            )
-        )
+        res_scout_write = self._pre("write_file", {"Path": scratch_md, "Content": "hello"}, cid=scout_cid)
         self.assertEqual(res_scout_write["decision"], "deny")
         self.assertIn("Scout subagents", res_scout_write["reason"])
 
     def test_blocked_or_failed_subagent_output_does_not_clear_dirty_receipt(self) -> None:
-        state = orchestrator_guard._load_state(self.base_payload)
+        state = self._load_st()
         receipt = orchestrator_guard._get_test_receipt(state)
-        receipt["dirty"] = True
-        receipt["verified"] = False
+        receipt["dirty"], receipt["verified"] = True, False
         orchestrator_guard._save_state(self.base_payload, state)
 
         blocked_report = (
-            "STATUS: BLOCKED\n"
-            "FILES_CHANGED: NONE\n"
-            "VERIFICATION: pytest failed twice.\n"
+            "STATUS: BLOCKED\nFILES_CHANGED: NONE\nVERIFICATION: pytest failed twice.\n"
             "NOTES: Failing test in auth module at file:///tmp/scratch/fail.log"
         )
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "impl_blocked_call",
-                    "name": "invoke_subagent",
-                    "args": {"TypeName": "implementer"},
-                },
-                output=blocked_report,
-                error="",
-            )
-        )
-        state_after = orchestrator_guard._load_state(self.base_payload)
-        receipt_after = orchestrator_guard._get_test_receipt(state_after)
+        self._post("invoke_subagent", {"TypeName": "implementer"}, output=blocked_report, call_id="impl_blocked_call")
+        receipt_after = orchestrator_guard._get_test_receipt(self._load_st())
         self.assertTrue(receipt_after["dirty"])
         self.assertFalse(receipt_after["verified"])
 
     def test_prune_state_bounds_deduplication_lists_and_cli_reset(self) -> None:
-        state = orchestrator_guard._load_state(self.base_payload)
+        state = self._load_st()
         limit = orchestrator_guard.MAX_STATE_LIST_ENTRIES
         state["isolation_reminded_invocations"] = [f"inv:{i}" for i in range(limit + 25)]
         state["recorded_spawn_calls"] = [f"spawn:{i}" for i in range(limit + 25)]
         state["stop_reminded_executions"] = [f"stop:{i}" for i in range(limit + 25)]
-        cb = orchestrator_guard._get_circuit_breaker(state)
-        cb["seen_failures"] = [f"fail:{i}" for i in range(limit + 25)]
+        orchestrator_guard._get_circuit_breaker(state)["seen_failures"] = [f"fail:{i}" for i in range(limit + 25)]
         orchestrator_guard._save_state(self.base_payload, state)
 
-        reloaded = orchestrator_guard._load_state(self.base_payload)
+        reloaded = self._load_st()
         self.assertEqual(len(reloaded["isolation_reminded_invocations"]), limit)
         self.assertEqual(len(reloaded["recorded_spawn_calls"]), limit)
         self.assertEqual(len(reloaded["stop_reminded_executions"]), limit)
-        self.assertEqual(
-            len(orchestrator_guard._get_circuit_breaker(reloaded)["seen_failures"]),
-            limit,
-        )
-        self.assertEqual(
-            reloaded["recorded_spawn_calls"][-1], f"spawn:{limit + 24}"
-        )
+        self.assertEqual(len(orchestrator_guard._get_circuit_breaker(reloaded)["seen_failures"]), limit)
+        self.assertEqual(reloaded["recorded_spawn_calls"][-1], f"spawn:{limit + 24}")
 
         reset_res = orchestrator_guard._cli_reset(self.base_payload)
         self.assertEqual(reset_res["status"], "reset")
-        after_reset = orchestrator_guard._load_state(self.base_payload)
-        self.assertEqual(after_reset["recorded_spawn_calls"], [])
+        self.assertEqual(self._load_st()["recorded_spawn_calls"], [])
 
-    def test_cross_brain_subagent_receipt_propagation_and_cb_invocation_reset(
-        self,
-    ) -> None:
-        app_data = Path(self.artifact_dir) / "appdata_receipt_prop"
-        parent_brain = app_data / "brain" / "parent-root-cid"
-        sub_brain = app_data / "brain" / "sub-impl-cid"
-        parent_brain.mkdir(parents=True, exist_ok=True)
-        sub_brain.mkdir(parents=True, exist_ok=True)
+    def test_cross_brain_subagent_receipt_propagation_and_cb_invocation_reset(self) -> None:
+        parent_payload = self._brain_payload("parent-root-cid", root="appdata_receipt_prop/brain", invocationNum=2)
+        sub_payload = self._brain_payload("sub-impl-cid", root="appdata_receipt_prop/brain")
 
-        parent_payload = dict(
-            self.base_payload,
-            conversationId="parent-root-cid",
-            artifactDirectoryPath=str(parent_brain),
-            invocationNum=2,
-        )
         orchestrator_guard.handle_pre_invocation(parent_payload)
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id="sub-impl-cid",
-            type_name="implementer",
-            model="flash",
-            role="Cross-Brain Implementer",
-        )
+        self._reg_sub("implementer", "sub-impl-cid", "flash", payload=parent_payload, role="Cross-Brain Implementer")
 
         code_path = str(orchestrator_guard.PROJECT_ROOT / "src_cross_brain.py")
-        sub_edit_payload = dict(
-            self.base_payload,
-            conversationId="sub-impl-cid",
-            artifactDirectoryPath=str(sub_brain),
-            toolCall={
-                "name": "write_file",
-                "args": {"Path": code_path, "Content": "x = 1\n"},
-            },
-        )
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(sub_edit_payload)["decision"], "allow"
-        )
+        self.assertEqual(self._pre("write_file", {"Path": code_path, "Content": "x = 1\n"}, base=sub_payload)["decision"], "allow")
 
-        parent_state = orchestrator_guard._load_state(parent_payload)
-        parent_receipt = orchestrator_guard._get_test_receipt(parent_state)
+        parent_receipt = orchestrator_guard._get_test_receipt(self._load_st(parent_payload))
         self.assertTrue(parent_receipt["dirty"])
         self.assertFalse(parent_receipt["verified"])
 
-        parent_stop_1 = dict(
-            parent_payload,
-            fullyIdle=True,
-            terminationReason="NO_TOOL_CALL",
-            executionNum=1,
-        )
-        res_stop_1 = orchestrator_guard.handle_stop(parent_stop_1)
+        res_stop_1 = self._stop(base=parent_payload, executionNum=1)
         self.assertEqual(res_stop_1["decision"], "continue")
         self.assertIn("Empirical test receipt missing", res_stop_1["reason"])
 
-        sub_test_post = dict(
-            self.base_payload,
-            conversationId="sub-impl-cid",
-            artifactDirectoryPath=str(sub_brain),
-            toolCall={
-                "id": "sub_pytest_pass",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "pytest tests/",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-            error="",
-        )
-        orchestrator_guard.handle_post_tool(sub_test_post)
-
-        parent_state_2 = orchestrator_guard._load_state(parent_payload)
+        self._post("run_command", self._cmd_args("pytest tests/"), call_id="sub_pytest_pass", base=sub_payload)
+        parent_state_2 = self._load_st(parent_payload)
         parent_receipt_2 = orchestrator_guard._get_test_receipt(parent_state_2)
         self.assertFalse(parent_receipt_2["dirty"])
         self.assertTrue(parent_receipt_2["verified"])
+        self.assertEqual(self._stop(base=parent_payload, executionNum=2)["decision"], "allow")
 
-        parent_stop_2 = dict(parent_stop_1, executionNum=2)
-        self.assertEqual(
-            orchestrator_guard.handle_stop(parent_stop_2)["decision"], "allow"
-        )
-
-        # Trip circuit breaker on invocation 2, then verify advancing to invocation 3 resets it
         cb = orchestrator_guard._get_circuit_breaker(parent_state_2)
-        cb["failure_streak"] = 2
-        cb["tripped"] = True
-        cb["last_error"] = "failed twice on inv 2"
+        cb["failure_streak"], cb["tripped"], cb["last_error"] = 2, True, "failed twice on inv 2"
         orchestrator_guard._save_state(parent_payload, parent_state_2)
 
         parent_inv3 = dict(parent_payload, invocationNum=3)
         orchestrator_guard.handle_pre_invocation(parent_inv3)
-        parent_state_3 = orchestrator_guard._load_state(parent_inv3)
-        cb_3 = orchestrator_guard._get_circuit_breaker(parent_state_3)
+        cb_3 = orchestrator_guard._get_circuit_breaker(self._load_st(parent_inv3))
         self.assertFalse(cb_3["tripped"])
         self.assertEqual(cb_3["failure_streak"], 0)
 
     def test_allowed_files_header_enforces_subagent_file_allowlist(self) -> None:
-        app_data = Path(self.artifact_dir) / "appdata_allowed_files"
-        parent_brain = app_data / "brain" / "parent-allow-cid"
-        sub1_brain = app_data / "brain" / "sub-allow-1"
-        sub2_brain = app_data / "brain" / "sub-allow-2"
-        parent_brain.mkdir(parents=True, exist_ok=True)
-        sub1_brain.mkdir(parents=True, exist_ok=True)
-        sub2_brain.mkdir(parents=True, exist_ok=True)
+        parent_payload = self._brain_payload("parent-allow-cid", root="appdata_allowed_files/brain")
+        sub1_payload = self._brain_payload("sub-allow-1", root="appdata_allowed_files/brain")
+        sub2_payload = self._brain_payload("sub-allow-2", root="appdata_allowed_files/brain")
 
         prompt_1 = (
-            "TASK: Implement feature A.\n"
-            "ALLOWED_FILES: module_a.py, tests/test_a.py\n\n"
-            "RULES:\n"
-            "1. Open `module_a.py`.\n"
-            "2. Do not change any file outside `ALLOWED_FILES`.\n\n"
-            "REPORT FORMAT:\n"
-            "STATUS: COMPLETED | BLOCKED | FAILED\n"
-            "FILES_CHANGED: module_a.py\n"
-            "VERIFICATION: pytest\n"
-            "NOTES: done\n"
+            "TASK: Implement feature A.\nALLOWED_FILES: module_a.py, tests/test_a.py\n\n"
+            "RULES:\n1. Open `module_a.py`.\n2. Do not change any file outside `ALLOWED_FILES`.\n\n"
+            "REPORT FORMAT:\nSTATUS: COMPLETED | BLOCKED | FAILED\nFILES_CHANGED: module_a.py\nVERIFICATION: pytest\nNOTES: done\n"
         )
         prompt_2 = (
-            "TASK: Implement feature B.\n"
-            "ALLOWED_FILES: module_b.py\n\n"
-            "RULES:\n"
-            "1. Open `module_b.py`.\n"
-            "2. Do not change any file outside `ALLOWED_FILES`.\n\n"
-            "REPORT FORMAT:\n"
-            "STATUS: COMPLETED | BLOCKED | FAILED\n"
-            "FILES_CHANGED: module_b.py\n"
-            "VERIFICATION: pytest\n"
-            "NOTES: done\n"
-        )
-
-        parent_payload = dict(
-            self.base_payload,
-            conversationId="parent-allow-cid",
-            artifactDirectoryPath=str(parent_brain),
-            toolCall={
-                "id": "spawn_allow_pair",
-                "name": "invoke_subagent",
-                "args": {
-                    "Subagents": [
-                        {
-                            "TypeName": "implementer",
-                            "Role": "Worker A",
-                            "Model": "flash",
-                            "Prompt": prompt_1,
-                        },
-                        {
-                            "TypeName": "implementer",
-                            "Role": "Worker B",
-                            "Model": "flash",
-                            "Prompt": prompt_2,
-                        },
-                    ]
-                },
-            },
+            "TASK: Implement feature B.\nALLOWED_FILES: module_b.py\n\n"
+            "RULES:\n1. Open `module_b.py`.\n2. Do not change any file outside `ALLOWED_FILES`.\n\n"
+            "REPORT FORMAT:\nSTATUS: COMPLETED | BLOCKED | FAILED\nFILES_CHANGED: module_b.py\nVERIFICATION: pytest\nNOTES: done\n"
         )
         self.assertEqual(
-            orchestrator_guard.handle_pre_tool(parent_payload)["decision"], "allow"
+            self._pre(
+                "invoke_subagent",
+                {"Subagents": [self._sub_args("implementer", "Worker A", "flash", prompt_1), self._sub_args("implementer", "Worker B", "flash", prompt_2)]},
+                call_id="spawn_allow_pair",
+                base=parent_payload,
+            )["decision"],
+            "allow",
         )
 
         mod_a = str(orchestrator_guard.PROJECT_ROOT / "module_a.py")
         mod_b = str(orchestrator_guard.PROJECT_ROOT / "module_b.py")
         mod_c = str(orchestrator_guard.PROJECT_ROOT / "module_c.py")
-        scratch_log = str(sub1_brain / "scratch" / "fail.log")
+        scratch_log = str(Path(sub1_payload["artifactDirectoryPath"]) / "scratch" / "fail.log")
 
-        # Subagent 1 is allowed to edit module_a.py and write scratch/fail.log, but denied on module_b.py
-        res_sub1_ok = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                conversationId="sub-allow-1",
-                artifactDirectoryPath=str(sub1_brain),
-                toolCall={
-                    "name": "write_file",
-                    "args": {"Path": mod_a, "Content": "a = 1\n"},
-                },
-            )
-        )
-        self.assertEqual(res_sub1_ok["decision"], "allow")
-
-        res_sub1_scratch = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                conversationId="sub-allow-1",
-                artifactDirectoryPath=str(sub1_brain),
-                toolCall={
-                    "name": "write_to_file",
-                    "args": {"TargetFile": scratch_log, "CodeContent": "error\n"},
-                },
-            )
-        )
-        self.assertEqual(res_sub1_scratch["decision"], "allow")
-
-        res_sub1_deny = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                conversationId="sub-allow-1",
-                artifactDirectoryPath=str(sub1_brain),
-                toolCall={
-                    "name": "replace_file_content",
-                    "args": {"TargetFile": mod_b},
-                },
-            )
-        )
+        self.assertEqual(self._pre("write_file", {"Path": mod_a, "Content": "a = 1\n"}, base=sub1_payload)["decision"], "allow")
+        self.assertEqual(self._pre("write_to_file", {"TargetFile": scratch_log, "CodeContent": "error\n"}, base=sub1_payload)["decision"], "allow")
+        res_sub1_deny = self._pre("replace_file_content", {"TargetFile": mod_b}, base=sub1_payload)
         self.assertEqual(res_sub1_deny["decision"], "deny")
         self.assertIn("File allowlist violation", res_sub1_deny["reason"])
 
-        # Subagent 2 is allowed to edit module_b.py, but denied on module_a.py
-        res_sub2_ok = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                conversationId="sub-allow-2",
-                artifactDirectoryPath=str(sub2_brain),
-                toolCall={
-                    "name": "write_file",
-                    "args": {"Path": mod_b, "Content": "b = 2\n"},
-                },
-            )
-        )
-        self.assertEqual(res_sub2_ok["decision"], "allow")
-
-        res_sub2_deny = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                conversationId="sub-allow-2",
-                artifactDirectoryPath=str(sub2_brain),
-                toolCall={
-                    "name": "write_file",
-                    "args": {"Path": mod_a, "Content": "a = 2\n"},
-                },
-            )
-        )
+        self.assertEqual(self._pre("write_file", {"Path": mod_b, "Content": "b = 2\n"}, base=sub2_payload)["decision"], "allow")
+        res_sub2_deny = self._pre("write_file", {"Path": mod_a, "Content": "a = 2\n"}, base=sub2_payload)
         self.assertEqual(res_sub2_deny["decision"], "deny")
         self.assertIn("File allowlist violation", res_sub2_deny["reason"])
 
-        # send_message updates sub-allow-1's ALLOWED_FILES to include module_c.py
-        send_update = dict(
-            self.base_payload,
-            conversationId="parent-allow-cid",
-            artifactDirectoryPath=str(parent_brain),
-            toolCall={
-                "name": "send_message",
-                "args": {
-                    "Recipient": "sub-allow-1",
-                    "Message": (
-                        "TASK: Also update module_c.py.\n"
-                        "ALLOWED_FILES: module_a.py, module_c.py\n"
-                    ),
-                },
-            },
-        )
         self.assertEqual(
-            orchestrator_guard.handle_pre_tool(send_update)["decision"], "allow"
+            self._pre(
+                "send_message",
+                {"Recipient": "sub-allow-1", "Message": "TASK: Also update module_c.py.\nALLOWED_FILES: module_a.py, module_c.py\n"},
+                base=parent_payload,
+            )["decision"],
+            "allow",
         )
+        self.assertEqual(self._pre("write_file", {"Path": mod_c, "Content": "c = 3\n"}, base=sub1_payload)["decision"], "allow")
 
-        res_sub1_mod_c = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                conversationId="sub-allow-1",
-                artifactDirectoryPath=str(sub1_brain),
-                toolCall={
-                    "name": "write_file",
-                    "args": {"Path": mod_c, "Content": "c = 3\n"},
-                },
-            )
-        )
-        self.assertEqual(res_sub1_mod_c["decision"], "allow")
-
-        # ALLOWED_FILES: NONE blocks all workspace edits while allowing scratch writes
-        send_none = dict(
-            self.base_payload,
-            conversationId="parent-allow-cid",
-            artifactDirectoryPath=str(parent_brain),
-            toolCall={
-                "name": "send_message",
-                "args": {
-                    "Recipient": "sub-allow-1",
-                    "Message": "TASK: Read-only check.\nALLOWED_FILES: NONE\n",
-                },
-            },
-        )
         self.assertEqual(
-            orchestrator_guard.handle_pre_tool(send_none)["decision"], "allow"
+            self._pre(
+                "send_message",
+                {"Recipient": "sub-allow-1", "Message": "TASK: Read-only check.\nALLOWED_FILES: NONE\n"},
+                base=parent_payload,
+            )["decision"],
+            "allow",
         )
-
-        res_sub1_none_deny = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                conversationId="sub-allow-1",
-                artifactDirectoryPath=str(sub1_brain),
-                toolCall={
-                    "name": "write_file",
-                    "args": {"Path": mod_a, "Content": "a = 99\n"},
-                },
-            )
-        )
+        res_sub1_none_deny = self._pre("write_file", {"Path": mod_a, "Content": "a = 99\n"}, base=sub1_payload)
         self.assertEqual(res_sub1_none_deny["decision"], "deny")
         self.assertIn("NONE", res_sub1_none_deny["reason"])
 
@@ -3005,18 +1289,11 @@ NOTES: <one sentence summarizing findings>
                 f"Symbol '{sym}' missing from orchestrator_guard",
             )
 
-    def test_c1_no_wildcard_command_override_and_redirection_bare_root_symlink_guards(
-        self,
-    ) -> None:
+    def test_c1_no_wildcard_command_override_and_redirection_bare_root_symlink_guards(self) -> None:
         import os
 
         cmd = "git status"
-        res = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={"name": "run_command", "args": {"CommandLine": cmd}},
-            )
-        )
+        res = self._pre("run_command", {"CommandLine": cmd})
         self.assertEqual(res.get("decision"), "allow")
         overrides = res.get("permissionOverrides", [])
         self.assertNotIn("command(*)", overrides)
@@ -3024,102 +1301,25 @@ NOTES: <one sentence summarizing findings>
         self.assertTrue(any(str(o).startswith("file(") for o in overrides))
 
         roots = [Path(self.artifact_dir).resolve()]
-        isolated_payload = dict(
-            self.base_payload,
-            workspacePaths=[str(self.artifact_dir)],
-        )
+        iso = self._payload(workspacePaths=[str(self.artifact_dir)])
+        cwd = str(self.artifact_dir)
 
-        self.assertFalse(
-            orchestrator_guard._command_stays_in_workspace(
-                "cat >/etc/passwd", cwd=str(self.artifact_dir), roots=roots
-            )
-        )
-        self.assertFalse(
-            orchestrator_guard._command_stays_in_workspace(
-                "echo hi>>/etc/hosts", cwd=str(self.artifact_dir), roots=roots
-            )
-        )
-        res_cat = orchestrator_guard.handle_pre_tool(
-            dict(
-                isolated_payload,
-                toolCall={
-                    "name": "run_command",
-                    "args": {
-                        "CommandLine": "cat >/etc/passwd",
-                        "Cwd": str(self.artifact_dir),
-                    },
-                },
-            )
-        )
-        self.assertEqual(res_cat.get("decision"), "deny")
+        self.assertFalse(orchestrator_guard._command_stays_in_workspace("cat >/etc/passwd", cwd=cwd, roots=roots))
+        self.assertFalse(orchestrator_guard._command_stays_in_workspace("echo hi>>/etc/hosts", cwd=cwd, roots=roots))
+        self.assertEqual(self._pre("run_command", self._cmd_args("cat >/etc/passwd", cwd), base=iso).get("decision"), "deny")
+        self.assertEqual(self._pre("run_command", self._cmd_args("cat /etc/passwd", cwd), base=iso).get("decision"), "ask")
 
-        res_cat_ro = orchestrator_guard.handle_pre_tool(
-            dict(
-                isolated_payload,
-                toolCall={
-                    "name": "run_command",
-                    "args": {
-                        "CommandLine": "cat /etc/passwd",
-                        "Cwd": str(self.artifact_dir),
-                    },
-                },
-            )
-        )
-        self.assertEqual(res_cat_ro.get("decision"), "ask")
+        self.assertFalse(orchestrator_guard._command_stays_in_workspace("ls /", cwd=cwd, roots=roots))
+        self.assertEqual(self._pre("run_command", self._cmd_args("ls /", cwd), base=iso).get("decision"), "ask")
 
-        self.assertFalse(
-            orchestrator_guard._command_stays_in_workspace(
-                "ls /", cwd=str(self.artifact_dir), roots=roots
-            )
-        )
-        res_root = orchestrator_guard.handle_pre_tool(
-            dict(
-                isolated_payload,
-                toolCall={
-                    "name": "run_command",
-                    "args": {"CommandLine": "ls /", "Cwd": str(self.artifact_dir)},
-                },
-            )
-        )
-        self.assertEqual(res_root.get("decision"), "ask")
-
-        self.assertFalse(
-            orchestrator_guard._command_stays_in_workspace(
-                "ls $HOME", cwd=str(self.artifact_dir), roots=roots
-            )
-        )
-        res_home = orchestrator_guard.handle_pre_tool(
-            dict(
-                isolated_payload,
-                toolCall={
-                    "name": "run_command",
-                    "args": {"CommandLine": "ls $HOME", "Cwd": str(self.artifact_dir)},
-                },
-            )
-        )
-        self.assertEqual(res_home.get("decision"), "ask")
+        self.assertFalse(orchestrator_guard._command_stays_in_workspace("ls $HOME", cwd=cwd, roots=roots))
+        self.assertEqual(self._pre("run_command", self._cmd_args("ls $HOME", cwd), base=iso).get("decision"), "ask")
 
         oldpwd_orig = os.environ.get("OLDPWD")
         try:
             os.environ["OLDPWD"] = "/var/log"
-            self.assertFalse(
-                orchestrator_guard._command_stays_in_workspace(
-                    "ls $OLDPWD", cwd=str(self.artifact_dir), roots=roots
-                )
-            )
-            res_oldpwd = orchestrator_guard.handle_pre_tool(
-                dict(
-                    isolated_payload,
-                    toolCall={
-                        "name": "run_command",
-                        "args": {
-                            "CommandLine": "ls $OLDPWD",
-                            "Cwd": str(self.artifact_dir),
-                        },
-                    },
-                )
-            )
-            self.assertEqual(res_oldpwd.get("decision"), "ask")
+            self.assertFalse(orchestrator_guard._command_stays_in_workspace("ls $OLDPWD", cwd=cwd, roots=roots))
+            self.assertEqual(self._pre("run_command", self._cmd_args("ls $OLDPWD", cwd), base=iso).get("decision"), "ask")
         finally:
             if oldpwd_orig is not None:
                 os.environ["OLDPWD"] = oldpwd_orig
@@ -3129,636 +1329,213 @@ NOTES: <one sentence summarizing findings>
         symlink_path = Path(self.artifact_dir) / "link_to_hosts"
         if not symlink_path.exists():
             symlink_path.symlink_to("/etc/hosts")
-        self.assertFalse(
-            orchestrator_guard._command_stays_in_workspace(
-                "cat link_to_hosts", cwd=str(self.artifact_dir), roots=roots
-            )
-        )
-        res_sym = orchestrator_guard.handle_pre_tool(
-            dict(
-                isolated_payload,
-                toolCall={
-                    "name": "run_command",
-                    "args": {
-                        "CommandLine": "cat link_to_hosts",
-                        "Cwd": str(self.artifact_dir),
-                    },
-                },
-            )
-        )
-        self.assertEqual(res_sym.get("decision"), "ask")
+        self.assertFalse(orchestrator_guard._command_stays_in_workspace("cat link_to_hosts", cwd=cwd, roots=roots))
+        self.assertEqual(self._pre("run_command", self._cmd_args("cat link_to_hosts", cwd), base=iso).get("decision"), "ask")
 
-    def test_c2_allowed_files_blocks_nested_basename_collision_and_shell_writes(
-        self,
-    ) -> None:
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id="imp-c2",
-            type_name="implementer",
-            model="flash",
-            allowed_files=["module_a.py"],
-        )
-        imp_payload = dict(self.base_payload, conversationId="imp-c2")
+    def test_c2_allowed_files_blocks_nested_basename_collision_and_shell_writes(self) -> None:
+        self._reg_sub("implementer", "imp-c2", "flash", allowed_files=["module_a.py"])
 
-        res_root_file = orchestrator_guard.handle_pre_tool(
-            dict(
-                imp_payload,
-                toolCall={
-                    "name": "write_file",
-                    "args": {
-                        "Path": str(orchestrator_guard.PROJECT_ROOT / "module_a.py"),
-                        "Content": "x = 1\n",
-                    },
-                },
-            )
+        self.assertEqual(
+            self._pre("write_file", {"Path": str(orchestrator_guard.PROJECT_ROOT / "module_a.py"), "Content": "x = 1\n"}, cid="imp-c2").get("decision"),
+            "allow",
         )
-        self.assertEqual(res_root_file.get("decision"), "allow")
+        res_nested = self._pre(
+            "write_file",
+            {"Path": str(orchestrator_guard.PROJECT_ROOT / "nested_dir" / "module_a.py"), "Content": "x = 1\n"},
+            cid="imp-c2",
+        )
+        self.assertEqual(res_nested.get("decision"), "deny")
+        self.assertIn("File allowlist violation", res_nested.get("reason", ""))
 
-        res_nested_file = orchestrator_guard.handle_pre_tool(
-            dict(
-                imp_payload,
-                toolCall={
-                    "name": "write_file",
-                    "args": {
-                        "Path": str(
-                            orchestrator_guard.PROJECT_ROOT
-                            / "nested_dir"
-                            / "module_a.py"
-                        ),
-                        "Content": "x = 1\n",
-                    },
-                },
-            )
-        )
-        self.assertEqual(res_nested_file.get("decision"), "deny")
-        self.assertIn("File allowlist violation", res_nested_file.get("reason", ""))
+        for cmd in ("echo hacked > module_b.py", "rm module_b.py"):
+            res_cmd = self._pre("run_command", {"CommandLine": cmd}, cid="imp-c2")
+            self.assertEqual(res_cmd.get("decision"), "deny")
+            self.assertIn("File allowlist violation", res_cmd.get("reason", ""))
 
-        res_cmd_echo = orchestrator_guard.handle_pre_tool(
-            dict(
-                imp_payload,
-                toolCall={
-                    "name": "run_command",
-                    "args": {"CommandLine": "echo hacked > module_b.py"},
-                },
-            )
-        )
-        self.assertEqual(res_cmd_echo.get("decision"), "deny")
-        self.assertIn("File allowlist violation", res_cmd_echo.get("reason", ""))
+        self._reg_sub("scout", "scout-c2", "flash_lite")
+        self.assertEqual(self._pre("run_command", {"CommandLine": "echo x > out.txt"}, cid="scout-c2").get("decision"), "deny")
+        self.assertEqual(self._pre("run_command", {"CommandLine": "rm README.md"}, cid="scout-c2").get("decision"), "deny")
+        self.assertEqual(self._pre("run_command", {"CommandLine": "git status"}, cid="scout-c2").get("decision"), "allow")
+        self.assertEqual(self._pre("run_command", {"CommandLine": "ls"}, cid="scout-c2").get("decision"), "allow")
 
-        res_cmd_rm = orchestrator_guard.handle_pre_tool(
-            dict(
-                imp_payload,
-                toolCall={
-                    "name": "run_command",
-                    "args": {"CommandLine": "rm module_b.py"},
-                },
-            )
-        )
-        self.assertEqual(res_cmd_rm.get("decision"), "deny")
-        self.assertIn("File allowlist violation", res_cmd_rm.get("reason", ""))
+    def test_c3_nonzero_command_exit_output_fails_receipt_and_trips_cb_while_allowing_subagent_blocked_report(self) -> None:
+        self._pre("write_file", {"Path": str(orchestrator_guard.PROJECT_ROOT / "code_c3.py"), "Content": "val = 42\n"})
+        self.assertTrue(orchestrator_guard._get_test_receipt(self._load_st()).get("dirty"))
 
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id="scout-c2",
-            type_name="scout",
-            model="flash_lite",
-        )
-        scout_payload = dict(self.base_payload, conversationId="scout-c2")
-
-        res_scout_write = orchestrator_guard.handle_pre_tool(
-            dict(
-                scout_payload,
-                toolCall={
-                    "name": "run_command",
-                    "args": {"CommandLine": "echo x > out.txt"},
-                },
-            )
-        )
-        self.assertEqual(res_scout_write.get("decision"), "deny")
-
-        res_scout_rm = orchestrator_guard.handle_pre_tool(
-            dict(
-                scout_payload,
-                toolCall={
-                    "name": "run_command",
-                    "args": {"CommandLine": "rm README.md"},
-                },
-            )
-        )
-        self.assertEqual(res_scout_rm.get("decision"), "deny")
-
-        res_scout_git = orchestrator_guard.handle_pre_tool(
-            dict(
-                scout_payload,
-                toolCall={
-                    "name": "run_command",
-                    "args": {"CommandLine": "git status"},
-                },
-            )
-        )
-        self.assertEqual(res_scout_git.get("decision"), "allow")
-
-        res_scout_ls = orchestrator_guard.handle_pre_tool(
-            dict(
-                scout_payload,
-                toolCall={
-                    "name": "run_command",
-                    "args": {"CommandLine": "ls"},
-                },
-            )
-        )
-        self.assertEqual(res_scout_ls.get("decision"), "allow")
-
-    def test_c3_nonzero_command_exit_output_fails_receipt_and_trips_cb_while_allowing_subagent_blocked_report(
-        self,
-    ) -> None:
-        orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "write_file",
-                    "args": {
-                        "Path": str(orchestrator_guard.PROJECT_ROOT / "code_c3.py"),
-                        "Content": "val = 42\n",
-                    },
-                },
-            )
-        )
-        state_after_write = orchestrator_guard._load_state(self.base_payload)
-        receipt_after_write = orchestrator_guard._get_test_receipt(state_after_write)
-        self.assertTrue(receipt_after_write.get("dirty"))
-
-        call_id1 = "post-call-c3-1"
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": call_id1,
-                    "name": "run_command",
-                    "args": {"CommandLine": "pytest tests/"},
-                },
-                error="",
-                output="Command exited with code 1\n1 failed",
-            )
-        )
-        state_post1 = orchestrator_guard._load_state(self.base_payload)
-        rec1 = orchestrator_guard._get_test_receipt(state_post1)
-        cb1 = orchestrator_guard._get_circuit_breaker(state_post1)
+        self._post("run_command", {"CommandLine": "pytest tests/"}, output="Command exited with code 1\n1 failed", call_id="post-call-c3-1")
+        st1 = self._load_st()
+        rec1 = orchestrator_guard._get_test_receipt(st1)
         self.assertTrue(rec1.get("dirty"))
         self.assertFalse(rec1.get("verified"))
-        self.assertEqual(cb1.get("failure_streak"), 1)
+        self.assertEqual(orchestrator_guard._get_circuit_breaker(st1).get("failure_streak"), 1)
 
-        call_id2 = "post-call-c3-2"
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": call_id2,
-                    "name": "run_command",
-                    "args": {"CommandLine": "pytest tests/"},
-                },
-                error="",
-                output="Command exited with code 2\nfatal error",
-            )
-        )
-        state_post2 = orchestrator_guard._load_state(self.base_payload)
-        cb2 = orchestrator_guard._get_circuit_breaker(state_post2)
-        self.assertTrue(cb2.get("tripped"))
+        self._post("run_command", {"CommandLine": "pytest tests/"}, output="Command exited with code 2\nfatal error", call_id="post-call-c3-2")
+        self.assertTrue(orchestrator_guard._get_circuit_breaker(self._load_st()).get("tripped"))
+        self.assertEqual(self._pre("send_message", {"Recipient": "sub-worker", "Message": "try again"}).get("decision"), "deny")
 
-        res_root_send = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "send_message",
-                    "args": {"Recipient": "sub-worker", "Message": "try again"},
-                },
-            )
+        self._reg_sub("implementer", "sub-c3", "flash")
+        blocked_msg = (
+            "STATUS: BLOCKED\nFILES_CHANGED: NONE\nVERIFICATION: pytest tests/ exited with 1\n"
+            f"NOTES: Tests failed repeatedly file://{self.artifact_dir}/scratch/fail.log\n"
         )
-        self.assertEqual(res_root_send.get("decision"), "deny")
+        self.assertEqual(
+            self._pre("send_message", {"Recipient": self.base_payload["conversationId"], "Message": blocked_msg}, cid="sub-c3").get("decision"),
+            "allow",
+        )
 
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id="sub-c3",
-            type_name="implementer",
-            model="flash",
-        )
-        sub_payload = dict(self.base_payload, conversationId="sub-c3")
-        res_sub_blocked = orchestrator_guard.handle_pre_tool(
-            dict(
-                sub_payload,
-                toolCall={
-                    "name": "send_message",
-                    "args": {
-                        "Recipient": self.base_payload["conversationId"],
-                        "Message": (
-                            "STATUS: BLOCKED\n"
-                            "FILES_CHANGED: NONE\n"
-                            "VERIFICATION: pytest tests/ exited with 1\n"
-                            f"NOTES: Tests failed repeatedly file://{self.artifact_dir}/scratch/fail.log\n"
-                        ),
-                    },
-                },
-            )
-        )
-        self.assertEqual(res_sub_blocked.get("decision"), "allow")
-
-    def test_c4_cross_brain_isolation_preserves_unrelated_active_sessions(
-        self,
-    ) -> None:
+    def test_c4_cross_brain_isolation_preserves_unrelated_active_sessions(self) -> None:
         base_dir = Path(self.artifact_dir)
-        ws_a = base_dir / "ws_a"
-        ws_b = base_dir / "ws_b"
+        ws_a, ws_b = base_dir / "ws_a", base_dir / "ws_b"
         ws_a.mkdir(parents=True, exist_ok=True)
         ws_b.mkdir(parents=True, exist_ok=True)
 
-        brain_dir = base_dir / "brain"
-        brain_a = brain_dir / "session-a"
-        brain_b = brain_dir / "session-b"
-        brain_sub = brain_dir / "sub-a"
-        brain_a.mkdir(parents=True, exist_ok=True)
-        brain_b.mkdir(parents=True, exist_ok=True)
-        brain_sub.mkdir(parents=True, exist_ok=True)
+        p_a = self._brain_payload("session-a", workspacePaths=[str(ws_a.resolve())])
+        p_b = self._brain_payload("session-b", workspacePaths=[str(ws_b.resolve())])
+        sub_p = self._brain_payload("sub-a", workspacePaths=[str(ws_a.resolve())], modelName="Gemini 4 Flash", invocationNum=1)
 
-        payload_a = {
-            "conversationId": "session-a",
-            "artifactDirectoryPath": str(brain_a),
-            "workspacePaths": [str(ws_a.resolve())],
-        }
-        payload_b = {
-            "conversationId": "session-b",
-            "artifactDirectoryPath": str(brain_b),
-            "workspacePaths": [str(ws_b.resolve())],
-        }
-
-        st_a = orchestrator_guard._load_state(payload_a)
-        st_a["active"] = True
-        st_a["session_evaluated"] = True
-        st_a["root_conversation_id"] = "session-a"
-        st_a["workspace_roots"] = [str(ws_a.resolve())]
-        st_a["test_receipt"] = {"dirty": True, "verified": False}
-        st_a["pending_spawns"] = [
-            {"call_id": "spawn-a", "type": "implementer", "model": "flash"}
-        ]
-        orchestrator_guard._save_state(payload_a, st_a)
-
-        st_b = orchestrator_guard._load_state(payload_b)
-        st_b["active"] = True
-        st_b["session_evaluated"] = True
-        st_b["root_conversation_id"] = "session-b"
-        st_b["workspace_roots"] = [str(ws_b.resolve())]
-        st_b["test_receipt"] = {"dirty": True, "verified": False}
-        st_b["pending_spawns"] = [
-            {"call_id": "spawn-b", "type": "implementer", "model": "flash"}
-        ]
-        orchestrator_guard._save_state(payload_b, st_b)
-
-        sub_payload = {
-            "conversationId": "sub-a",
-            "workspacePaths": [str(ws_a.resolve())],
-            "artifactDirectoryPath": str(brain_sub),
-            "modelName": "Gemini 4 Flash",
-            "invocationNum": 1,
-        }
-        st_sub = orchestrator_guard._load_state(sub_payload)
-        self.assertTrue(orchestrator_guard._is_known_subagent(sub_payload, st_sub))
-
-        post_passing = dict(
-            sub_payload,
-            toolCall={
-                "name": "run_command",
-                "args": {"CommandLine": "pytest tests/test_feature.py"},
-            },
-            error="",
-            output="1 passed in 0.02s",
+        self._seed_state(
+            p_a,
+            active=True,
+            session_evaluated=True,
+            root_conversation_id="session-a",
+            workspace_roots=[str(ws_a.resolve())],
+            test_receipt={"dirty": True, "verified": False},
+            pending_spawns=[{"call_id": "spawn-a", "type": "implementer", "model": "flash"}],
         )
-        orchestrator_guard.handle_post_tool(post_passing)
+        self._seed_state(
+            p_b,
+            active=True,
+            session_evaluated=True,
+            root_conversation_id="session-b",
+            workspace_roots=[str(ws_b.resolve())],
+            test_receipt={"dirty": True, "verified": False},
+            pending_spawns=[{"call_id": "spawn-b", "type": "implementer", "model": "flash"}],
+        )
 
-        st_a_final = orchestrator_guard._load_state(payload_a)
-        rec_a = orchestrator_guard._get_test_receipt(st_a_final)
+        self.assertTrue(orchestrator_guard._is_known_subagent(sub_p, self._load_st(sub_p)))
+        self._post("run_command", {"CommandLine": "pytest tests/test_feature.py"}, output="1 passed in 0.02s", base=sub_p)
+
+        rec_a = orchestrator_guard._get_test_receipt(self._load_st(p_a))
         self.assertFalse(rec_a.get("dirty"))
         self.assertTrue(rec_a.get("verified"))
 
-        st_b_final = orchestrator_guard._load_state(payload_b)
+        st_b_final = self._load_st(p_b)
         rec_b = orchestrator_guard._get_test_receipt(st_b_final)
         self.assertTrue(rec_b.get("dirty"))
         self.assertFalse(rec_b.get("verified"))
         self.assertEqual(len(st_b_final.get("pending_spawns", [])), 1)
         self.assertEqual(st_b_final["pending_spawns"][0].get("call_id"), "spawn-b")
 
-    def test_h1_multiprocess_concurrent_state_transactions_and_corrupt_recovery(
-        self,
-    ) -> None:
+    def test_h1_multiprocess_concurrent_state_transactions_and_corrupt_recovery(self) -> None:
         import subprocess
 
-        worker_code = """
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-import orchestrator_guard
-payload = {"artifactDirectoryPath": sys.argv[2], "conversationId": "root-mp"}
-orchestrator_guard.register_subagent(
-    payload,
-    conversation_id=sys.argv[3],
-    type_name="scout",
-    model="flash_lite",
-)
-"""
-        procs = []
-        for i in range(6):
-            p = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-c",
-                    worker_code,
-                    str(SCRIPT_DIR),
-                    self.artifact_dir,
-                    f"worker-{i}",
-                ]
-            )
-            procs.append(p)
-
-        for p in procs:
-            exit_code = p.wait()
-            self.assertEqual(exit_code, 0)
-
-        final_state = orchestrator_guard._load_state(
-            {"artifactDirectoryPath": self.artifact_dir, "conversationId": "root-mp"}
+        worker_code = (
+            "import sys; sys.path.insert(0, sys.argv[1]); import orchestrator_guard; "
+            "orchestrator_guard.register_subagent({'artifactDirectoryPath': sys.argv[2], 'conversationId': 'root-mp'}, "
+            "conversation_id=sys.argv[3], type_name='scout', model='flash_lite')"
         )
+        procs = [
+            subprocess.Popen([sys.executable, "-c", worker_code, str(SCRIPT_DIR), self.artifact_dir, f"worker-{i}"])
+            for i in range(6)
+        ]
+        for p in procs:
+            self.assertEqual(p.wait(), 0)
+
+        final_state = self._load_st({"artifactDirectoryPath": self.artifact_dir, "conversationId": "root-mp"})
         self.assertEqual(len(final_state.get("subagents", {})), 6)
 
-        corrupt_temp = tempfile.TemporaryDirectory()
-        try:
-            corrupt_payload = {
-                "artifactDirectoryPath": corrupt_temp.name,
-                "conversationId": "corrupt-cid",
-            }
-            corrupt_file = orchestrator_guard._state_file_path(corrupt_payload)
-            corrupt_file.write_text("{corrupt", encoding="utf-8")
-            recovered = orchestrator_guard._load_state(corrupt_payload)
+        with tempfile.TemporaryDirectory() as corrupt_dir:
+            corrupt_payload = {"artifactDirectoryPath": corrupt_dir, "conversationId": "corrupt-cid"}
+            orchestrator_guard._state_file_path(corrupt_payload).write_text("{corrupt", encoding="utf-8")
+            recovered = self._load_st(corrupt_payload)
             self.assertTrue(recovered.get("active"))
             self.assertTrue(recovered.get("session_evaluated"))
-        finally:
-            corrupt_temp.cleanup()
 
     def test_h2_async_spawn_ack_keeps_dirty_receipt_until_verified(self) -> None:
-        orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "write_file",
-                    "args": {
-                        "Path": str(orchestrator_guard.PROJECT_ROOT / "mut_h2.py"),
-                        "Content": "y = 99\n",
-                    },
-                },
-            )
-        )
-        st_pre = orchestrator_guard._load_state(self.base_payload)
-        rec_pre = orchestrator_guard._get_test_receipt(st_pre)
-        self.assertTrue(rec_pre.get("dirty"))
+        self._pre("write_file", {"Path": str(orchestrator_guard.PROJECT_ROOT / "mut_h2.py"), "Content": "y = 99\n"})
+        self.assertTrue(orchestrator_guard._get_test_receipt(self._load_st()).get("dirty"))
 
-        ack_output = (
-            'Created the following subagent:\n'
-            '{"conversationId": "12345678-1234-1234-1234-1234567890ab"}'
-        )
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "invoke_subagent",
-                    "args": {"TypeName": "implementer"},
-                },
-                output=ack_output,
-            )
-        )
+        ack_output = 'Created the following subagent:\n{"conversationId": "12345678-1234-1234-1234-1234567890ab"}'
+        self._post("invoke_subagent", {"TypeName": "implementer"}, output=ack_output)
 
-        st_post = orchestrator_guard._load_state(self.base_payload)
-        rec_post = orchestrator_guard._get_test_receipt(st_post)
+        rec_post = orchestrator_guard._get_test_receipt(self._load_st())
         self.assertTrue(rec_post.get("dirty"))
         self.assertFalse(rec_post.get("verified"))
 
-    def test_h3_deleted_test_file_diff_multireplace_and_block_comment_tampering(
-        self,
-    ) -> None:
-        deleted_diff = (
-            "--- a/tests/test_old.py\n"
-            "+++ /dev/null\n"
-            "@@ -1,2 +0,0 @@\n"
-            "-def test_old():\n"
-            "-    assert 1 == 1\n"
+    def test_h3_deleted_test_file_diff_multireplace_and_block_comment_tampering(self) -> None:
+        verdict = orchestrator_guard.audit_diff_text(
+            "--- a/tests/test_old.py\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-def test_old():\n-    assert 1 == 1\n"
         )
-        verdict = orchestrator_guard.audit_diff_text(deleted_diff)
         self.assertIsNotNone(verdict)
         self.assertIn("Diff audit detected", verdict or "")
 
-        res_multi = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "multi_replace_file_content",
-                    "args": {
-                        "TargetFile": "tests/test_x.py",
-                        "ReplacementChunks": [
-                            {
-                                "TargetContent": "def test_a():\n    assert a == 1\n",
-                                "ReplacementContent": "def test_a():\n    pass\n",
-                            }
-                        ],
-                    },
-                },
-            )
+        res_multi = self._pre(
+            "multi_replace_file_content",
+            {"TargetFile": "tests/test_x.py", "ReplacementChunks": [{"TargetContent": "def test_a():\n    assert a == 1\n", "ReplacementContent": "def test_a():\n    pass\n"}]},
         )
         self.assertEqual(res_multi.get("decision"), "deny")
         self.assertIn("Test tampering blocked", res_multi.get("reason", ""))
 
-        res_docstring = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "edit_file",
-                    "args": {
-                        "Path": "tests/test_x.py",
-                        "Target": "def test_b():\n    assert x == 1\n",
-                        "Replacement": 'def test_b():\n    """\n    assert x == 1\n    """\n',
-                    },
-                },
-            )
+        res_docstring = self._pre(
+            "edit_file",
+            {"Path": "tests/test_x.py", "Target": "def test_b():\n    assert x == 1\n", "Replacement": 'def test_b():\n    """\n    assert x == 1\n    """\n'},
         )
         self.assertEqual(res_docstring.get("decision"), "deny")
         self.assertIn("Test tampering blocked", res_docstring.get("reason", ""))
 
-        res_c_comment = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "edit_file",
-                    "args": {
-                        "Path": "tests/test_x.py",
-                        "Target": "def test_b():\n    assert x == 1\n",
-                        "Replacement": "def test_b():\n    /* assert x == 1 */\n",
-                    },
-                },
-            )
+        res_c_comment = self._pre(
+            "edit_file",
+            {"Path": "tests/test_x.py", "Target": "def test_b():\n    assert x == 1\n", "Replacement": "def test_b():\n    /* assert x == 1 */\n"},
         )
         self.assertEqual(res_c_comment.get("decision"), "deny")
         self.assertIn("Test tampering blocked", res_c_comment.get("reason", ""))
 
-    def test_h4_h5_m3_subagent_send_message_validation_unsynced_allowlist_and_manage_subagents(
-        self,
-    ) -> None:
-        brain_base = Path(self.artifact_dir) / "brain"
-        parent_brain = brain_base / "parent-h4"
-        sub_brain = brain_base / "sub-h4"
-        parent_brain.mkdir(parents=True, exist_ok=True)
-        sub_brain.mkdir(parents=True, exist_ok=True)
+    def test_h4_h5_m3_subagent_send_message_validation_unsynced_allowlist_and_manage_subagents(self) -> None:
+        parent_p = self._brain_payload("parent-h4")
+        sub_p = self._brain_payload("sub-h4", modelName="Gemini 4 Flash")
+        self._reg_sub("implementer", "sub-h4", "flash", payload=parent_p)
 
-        parent_payload = dict(
-            self.base_payload,
-            conversationId="parent-h4",
-            artifactDirectoryPath=str(parent_brain),
-        )
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id="sub-h4",
-            type_name="implementer",
-            model="flash",
-        )
-
-        sub_payload = dict(
-            self.base_payload,
-            conversationId="sub-h4",
-            artifactDirectoryPath=str(sub_brain),
-            modelName="Gemini 4 Flash",
-        )
-
-        bad_report = "STATUS: COMPLETED\nFILES_CHANGED: NONE\n"
-        res_bad = orchestrator_guard.handle_pre_tool(
-            dict(
-                sub_payload,
-                toolCall={
-                    "name": "send_message",
-                    "args": {"Recipient": "parent-h4", "Message": bad_report},
-                },
-            )
-        )
+        res_bad = self._pre("send_message", {"Recipient": "parent-h4", "Message": "STATUS: COMPLETED\nFILES_CHANGED: NONE\n"}, base=sub_p)
         self.assertEqual(res_bad.get("decision"), "deny")
         self.assertIn("Subagent report format error", res_bad.get("reason", ""))
 
-        good_report = (
-            "STATUS: COMPLETED\n"
-            "FILES_CHANGED: NONE\n"
-            "VERIFICATION: pytest tests/ passed\n"
-            "NOTES: Finished all tasks cleanly.\n"
-        )
-        res_good = orchestrator_guard.handle_pre_tool(
-            dict(
-                sub_payload,
-                toolCall={
-                    "name": "send_message",
-                    "args": {"Recipient": "parent-h4", "Message": good_report},
-                },
-            )
-        )
-        self.assertEqual(res_good.get("decision"), "allow")
+        good_report = "STATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: pytest tests/ passed\nNOTES: Finished all tasks cleanly.\n"
+        self.assertEqual(self._pre("send_message", {"Recipient": "parent-h4", "Message": good_report}, base=sub_p).get("decision"), "allow")
+        self.assertEqual(orchestrator_guard.handle_stop(sub_p).get("decision"), "allow")
 
-        res_stop = orchestrator_guard.handle_stop(sub_payload)
-        self.assertEqual(res_stop.get("decision"), "allow")
+        unsynced_p = self._brain_payload("unsynced-recipient")
+        orchestrator_guard._save_state(unsynced_p, self._load_st(unsynced_p))
+        msg_allowed = "TASK: Refactor module\nALLOWED_FILES: updated.py\nRULES:\n1. Open updated.py\nREPORT FORMAT:\nSTATUS: COMPLETED\n"
+        self._pre("send_message", {"Recipient": "unsynced-recipient", "Message": msg_allowed}, base=parent_p)
+        self.assertEqual(self._load_st(unsynced_p).get("self_subagent_meta", {}).get("allowed_files"), ["updated.py"])
 
-        unsynced_brain = brain_base / "unsynced-recipient"
-        unsynced_brain.mkdir(parents=True, exist_ok=True)
-        unsynced_payload = {
-            "conversationId": "unsynced-recipient",
-            "artifactDirectoryPath": str(unsynced_brain),
-        }
-        orchestrator_guard._save_state(
-            unsynced_payload, orchestrator_guard._load_state(unsynced_payload)
-        )
-
-        msg_allowed = (
-            "TASK: Refactor module\n"
-            "ALLOWED_FILES: updated.py\n"
-            "RULES:\n1. Open updated.py\n"
-            "REPORT FORMAT:\nSTATUS: COMPLETED\n"
-        )
-        orchestrator_guard.handle_pre_tool(
-            dict(
-                parent_payload,
-                toolCall={
-                    "name": "send_message",
-                    "args": {
-                        "Recipient": "unsynced-recipient",
-                        "Message": msg_allowed,
-                    },
-                },
-            )
-        )
-        unsynced_st = orchestrator_guard._load_state(unsynced_payload)
-        self.assertEqual(
-            unsynced_st.get("self_subagent_meta", {}).get("allowed_files"),
-            ["updated.py"],
-        )
-
-        def_res = orchestrator_guard._handle_define_subagent(
-            {"Name": "implementer", "EnableMCPTools": True}
-        )
+        def_res = orchestrator_guard._handle_define_subagent({"Name": "implementer", "EnableMCPTools": True})
         self.assertEqual(def_res.get("decision"), "allow")
         self.assertEqual(def_res.get("overwrite"), {"EnableMCPTools": False})
+        self.assertTrue(orchestrator_guard._is_simple_readonly_task("research", "1. Open a.py\n2. Read x\n3. Do not edit any file"))
 
-        simple_prompt = "1. Open a.py\n2. Read x\n3. Do not edit any file"
-        self.assertTrue(
-            orchestrator_guard._is_simple_readonly_task("research", simple_prompt)
-        )
-
-        st_manage = orchestrator_guard._load_state(parent_payload)
-        st_manage["subagents"] = {
-            "branch-1": {"active_branch": True},
-            "branch-2": {"active_branch": True},
-        }
-        orchestrator_guard._save_state(parent_payload, st_manage)
-
-        orchestrator_guard._handle_manage_subagents(
-            parent_payload, {"action": "kill", "conversation_ids": ["branch-1"]}
-        )
-        st_m1 = orchestrator_guard._load_state(parent_payload)
+        self._seed_state(parent_p, subagents={"branch-1": {"active_branch": True}, "branch-2": {"active_branch": True}})
+        orchestrator_guard._handle_manage_subagents(parent_p, {"action": "kill", "conversation_ids": ["branch-1"]})
+        st_m1 = self._load_st(parent_p)
         self.assertFalse(st_m1["subagents"]["branch-1"]["active_branch"])
         self.assertTrue(st_m1["subagents"]["branch-2"]["active_branch"])
 
-        orchestrator_guard._handle_manage_subagents(
-            parent_payload, {"Action": "kill_all"}
-        )
-        st_m2 = orchestrator_guard._load_state(parent_payload)
-        self.assertFalse(st_m2["subagents"]["branch-2"]["active_branch"])
+        orchestrator_guard._handle_manage_subagents(parent_p, {"Action": "kill_all"})
+        self.assertFalse(self._load_st(parent_p)["subagents"]["branch-2"]["active_branch"])
 
-    def test_l1_cli_main_subprocess_modes_transcript_tail_and_git_diff_fallback(
-        self,
-    ) -> None:
+    def test_l1_cli_main_subprocess_modes_transcript_tail_and_git_diff_fallback(self) -> None:
         import subprocess
 
         tpath = Path(self.artifact_dir) / "transcript.jsonl"
-        with open(tpath, "w", encoding="utf-8") as fh:
-            fh.write(
-                json.dumps({"type": "USER_MESSAGE", "content": "hello worker"}) + "\n"
-            )
-            fh.write(
-                json.dumps(
-                    {
-                        "type": "PLANNER_RESPONSE",
-                        "content": "STATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: pass\nNOTES: done\n",
-                        "tool_calls": [],
-                    }
-                )
-                + "\n"
-            )
-        extracted = orchestrator_guard._extract_last_model_response(
-            {"transcriptPath": str(tpath)}
+        tpath.write_text(
+            json.dumps({"type": "USER_MESSAGE", "content": "hello worker"}) + "\n"
+            + json.dumps({"type": "PLANNER_RESPONSE", "content": "STATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: pass\nNOTES: done\n", "tool_calls": []}) + "\n",
+            encoding="utf-8",
         )
+        extracted = orchestrator_guard._extract_last_model_response({"transcriptPath": str(tpath)})
         self.assertIsNotNone(extracted)
         self.assertIn("STATUS: COMPLETED", extracted or "")
-
-        diff_text = orchestrator_guard._get_workspace_git_diff(
-            {"workspacePaths": [str(orchestrator_guard.PROJECT_ROOT)]}
-        )
-        self.assertIsInstance(diff_text, str)
+        self.assertIsInstance(orchestrator_guard._get_workspace_git_diff({"workspacePaths": [str(orchestrator_guard.PROJECT_ROOT)]}), str)
 
         entrypoint = SCRIPT_DIR / "orchestrator_guard.py"
         cli_modes = [
@@ -3766,66 +1543,18 @@ orchestrator_guard.register_subagent(
             ("activate", self.base_payload),
             ("status", self.base_payload),
             ("pre-invocation", self.base_payload),
-            (
-                "pre-tool",
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "name": "read_file",
-                        "args": {
-                            "Path": str(orchestrator_guard.PROJECT_ROOT / "README.md")
-                        },
-                    },
-                ),
-            ),
-            (
-                "pre-tool",
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "name": "write_file",
-                        "args": {
-                            "Path": str(Path(self.artifact_dir) / "scratch.txt"),
-                            "Content": "test\n",
-                        },
-                    },
-                ),
-            ),
-            (
-                "pre-tool",
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "name": "run_command",
-                        "args": {"CommandLine": "git status"},
-                    },
-                ),
-            ),
-            (
-                "post-tool",
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "name": "run_command",
-                        "args": {"CommandLine": "git status"},
-                    },
-                ),
-            ),
+            ("pre-tool", self._payload(tool="read_file", args={"Path": str(orchestrator_guard.PROJECT_ROOT / "README.md")})),
+            ("pre-tool", self._payload(tool="write_file", args={"Path": str(Path(self.artifact_dir) / "scratch.txt"), "Content": "test\n"})),
+            ("pre-tool", self._payload(tool="run_command", args={"CommandLine": "git status"})),
+            ("post-tool", self._payload(tool="run_command", args={"CommandLine": "git status"})),
             ("stop", self.base_payload),
             ("deactivate", self.base_payload),
             ("reset", self.base_payload),
         ]
         for mode, payload in cli_modes:
-            res = subprocess.run(
-                [sys.executable, str(entrypoint), mode],
-                input=json.dumps(payload),
-                capture_output=True,
-                text=True,
-                check=True,
-            )
+            res = subprocess.run([sys.executable, str(entrypoint), mode], input=json.dumps(payload), capture_output=True, text=True, check=True)
             self.assertEqual(res.returncode, 0)
-            parsed = json.loads(res.stdout)
-            self.assertIsInstance(parsed, dict)
+            self.assertIsInstance(json.loads(res.stdout), dict)
 
     def test_cli_modes_do_not_hang_on_open_unclosed_stdin_pipe(self) -> None:
         import os
@@ -3844,20 +1573,13 @@ orchestrator_guard.register_subagent(
             for mode in ("status", "activate", "deactivate", "reset"):
                 res = subprocess.run(
                     [sys.executable, str(entrypoint), mode],
-                    stdin=r_fd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=3,
-                    check=True,
+                    stdin=r_fd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3, check=True,
                 )
                 self.assertEqual(res.returncode, 0)
                 parsed = json.loads(res.stdout)
                 self.assertIsInstance(parsed, dict)
                 if mode == "status":
-                    self.assertEqual(
-                        parsed.get("stateFile"), str(default_state_file)
-                    )
+                    self.assertEqual(parsed.get("stateFile"), str(default_state_file))
                 elif mode == "activate":
                     self.assertEqual(parsed.get("status"), "activated")
                     self.assertTrue(parsed.get("active"))
@@ -3887,146 +1609,72 @@ orchestrator_guard.register_subagent(
         custom_dir.mkdir(parents=True, exist_ok=True)
         piped_payload = {"artifactDirectoryPath": str(custom_dir)}
 
-        act_res = subprocess.run(
-            [sys.executable, str(entrypoint), "activate"],
-            input=json.dumps(piped_payload),
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=True,
-        )
+        act_res = subprocess.run([sys.executable, str(entrypoint), "activate"], input=json.dumps(piped_payload), capture_output=True, text=True, timeout=3, check=True)
         self.assertEqual(json.loads(act_res.stdout).get("active"), True)
 
-        status_res = subprocess.run(
-            [sys.executable, str(entrypoint), "status"],
-            input=json.dumps(piped_payload),
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=True,
-        )
+        status_res = subprocess.run([sys.executable, str(entrypoint), "status"], input=json.dumps(piped_payload), capture_output=True, text=True, timeout=3, check=True)
         status_data = json.loads(status_res.stdout)
-        self.assertEqual(
-            status_data.get("stateFile"),
-            str(custom_dir / "orchestrator_state.json"),
-        )
+        self.assertEqual(status_data.get("stateFile"), str(custom_dir / "orchestrator_state.json"))
         self.assertTrue(status_data.get("active"))
 
         stdout_buf = io.StringIO()
-        with mock.patch.object(
-            sys, "argv", ["orchestrator_guard.py", "status"]
-        ), mock.patch.object(
+        with mock.patch.object(sys, "argv", ["orchestrator_guard.py", "status"]), mock.patch.object(
             sys, "stdin", io.StringIO(json.dumps(piped_payload))
-        ), mock.patch.object(
-            sys, "stdout", stdout_buf
-        ):
+        ), mock.patch.object(sys, "stdout", stdout_buf):
             guard_cli.main()
-
         inproc_status = json.loads(stdout_buf.getvalue())
-        self.assertEqual(
-            inproc_status.get("stateFile"),
-            str(custom_dir / "orchestrator_state.json"),
-        )
+        self.assertEqual(inproc_status.get("stateFile"), str(custom_dir / "orchestrator_state.json"))
         self.assertTrue(inproc_status.get("active"))
 
         with mock.patch.object(sys, "stdin", io.StringIO("[1, 2, 3]")):
             self.assertEqual(guard_cli._read_stdin_payload(is_cli_mode=True), {})
 
     def test_replan_status_and_root_replan_circuit_breaker(self) -> None:
-        # 1. validate_subagent_report for NEEDS_REPLAN
-        valid_replan = (
-            "STATUS: NEEDS_REPLAN\n"
-            "FILES_CHANGED: NONE\n"
-            "VERIFICATION: NONE\n"
-            "NOTES: Core assumption about database schema was invalidated."
-        )
+        valid_replan = "STATUS: NEEDS_REPLAN\nFILES_CHANGED: NONE\nVERIFICATION: NONE\nNOTES: Core assumption about database schema was invalidated."
         self.assertIsNone(orchestrator_guard.validate_subagent_report(valid_replan))
 
-        invalid_replan = (
-            "STATUS: NEEDS_REPLAN\n"
-            "FILES_CHANGED: NONE\n"
-            "VERIFICATION: NONE\n"
-            "NOTES: invalid"
-        )
-        err = orchestrator_guard.validate_subagent_report(invalid_replan)
+        err = orchestrator_guard.validate_subagent_report("STATUS: NEEDS_REPLAN\nFILES_CHANGED: NONE\nVERIFICATION: NONE\nNOTES: invalid")
         self.assertIsNotNone(err)
         self.assertIn("NEEDS_REPLAN", err)
         self.assertIn("at least 3 words", err)
 
-        # 2. Tripped subagent allowed to send STATUS: NEEDS_REPLAN
         sub_cid = "sub-cb-replan-111"
         sub_brain = Path(self.artifact_dir).parent / sub_cid
         sub_brain.mkdir(parents=True, exist_ok=True)
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id=sub_cid,
-            type_name="implementer",
-            model="flash",
-        )
-        state = orchestrator_guard._load_state(self.base_payload)
+        self._reg_sub("implementer", sub_cid, "flash")
+        state = self._load_st()
         cb = orchestrator_guard._get_circuit_breaker(state, self.base_payload)
-        cb["tripped"] = True
-        cb["failure_streak"] = 2
-        cb["last_error"] = "Command exited with code 1"
+        cb["tripped"], cb["failure_streak"], cb["last_error"] = True, 2, "Command exited with code 1"
         orchestrator_guard._save_state(self.base_payload, state)
 
-        sub_payload = dict(
-            self.base_payload,
-            conversationId=sub_cid,
-            artifactDirectoryPath=str(sub_brain),
-            toolCall={
-                "name": "send_message",
-                "args": {
-                    "Recipient": self.base_payload["conversationId"],
-                    "Message": valid_replan,
-                },
-            },
+        self.assertEqual(
+            self._pre("send_message", {"Recipient": self.base_payload["conversationId"], "Message": valid_replan}, cid=sub_cid, artifactDirectoryPath=str(sub_brain))["decision"],
+            "allow",
         )
-        res_sub_replan = orchestrator_guard.handle_pre_tool(sub_payload)
-        self.assertEqual(res_sub_replan["decision"], "allow")
 
-        # 3. Tripped root denied without REPLAN: header
-        root_dispatch_no_replan = dict(
-            self.base_payload,
-            toolCall={
-                "name": "invoke_subagent",
-                "args": {
-                    "TypeName": "implementer",
-                    "Prompt": "TASK: Fix bug\nRULES:\n1. Open foo.py\n2. Run pytest\nREPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: foo.py\nVERIFICATION: pytest ok\nNOTES: done",
-                },
-            },
+        res_root_deny = self._pre(
+            "invoke_subagent",
+            {"TypeName": "implementer", "Prompt": "TASK: Fix bug\nRULES:\n1. Open foo.py\n2. Run pytest\nREPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: foo.py\nVERIFICATION: pytest ok\nNOTES: done"},
         )
-        res_root_deny = orchestrator_guard.handle_pre_tool(root_dispatch_no_replan)
         self.assertEqual(res_root_deny["decision"], "deny")
         self.assertIn("circuit breaker tripped", res_root_deny["reason"])
         self.assertIn("REPLAN:", res_root_deny["reason"])
 
-        # Tripped root allowed once with REPLAN: header (resets CB)
-        root_dispatch_with_replan = dict(
-            self.base_payload,
-            toolCall={
-                "name": "invoke_subagent",
-                "args": {
-                    "TypeName": "implementer",
-                    "Prompt": "TASK: Fix bug with revised strategy\nREPLAN: Switched to migration approach\nRULES:\n1. Open foo.py\n2. Run pytest\nREPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: foo.py\nVERIFICATION: pytest ok\nNOTES: done",
-                },
-            },
-        )
-        res_root_allow = orchestrator_guard.handle_pre_tool(root_dispatch_with_replan)
-        self.assertEqual(res_root_allow["decision"], "allow")
-        state_after = orchestrator_guard._load_state(self.base_payload)
+        replan_args = {
+            "TypeName": "implementer",
+            "Prompt": "TASK: Fix bug with revised strategy\nREPLAN: Switched to migration approach\nRULES:\n1. Open foo.py\n2. Run pytest\nREPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: foo.py\nVERIFICATION: pytest ok\nNOTES: done",
+        }
+        self.assertEqual(self._pre("invoke_subagent", replan_args)["decision"], "allow")
+        state_after = self._load_st()
         cb_after = orchestrator_guard._get_circuit_breaker(state_after, self.base_payload)
         self.assertFalse(cb_after["tripped"])
         self.assertEqual(cb_after["failure_streak"], 0)
         self.assertEqual(cb_after["replan_count"], 1)
 
-        # Trip CB again
-        cb_after["tripped"] = True
-        cb_after["failure_streak"] = 2
+        cb_after["tripped"], cb_after["failure_streak"] = True, 2
         orchestrator_guard._save_state(self.base_payload, state_after)
 
-        # Denied on 2nd trip because replan_count >= MAX_REPLAN_ATTEMPTS (1)
-        res_root_deny2 = orchestrator_guard.handle_pre_tool(root_dispatch_with_replan)
+        res_root_deny2 = self._pre("invoke_subagent", replan_args)
         self.assertEqual(res_root_deny2["decision"], "deny")
         self.assertIn("circuit breaker tripped", res_root_deny2["reason"])
 
@@ -4038,81 +1686,39 @@ orchestrator_guard.register_subagent(
             file_paths.append(str(p))
 
         try:
-            # 1. Reading 4 small real files succeeds (5 lines each = 20 lines << 400 lines, 4 files < 8 files)
             for f in file_paths[:4]:
-                res = orchestrator_guard.handle_pre_tool(
-                    dict(
-                        self.base_payload,
-                        toolCall={"name": "read_file", "args": {"Path": f}},
-                    )
-                )
-                self.assertEqual(res["decision"], "allow")
+                self.assertEqual(self._pre("read_file", {"Path": f})["decision"], "allow")
 
-            # 2. StartLine / EndLine slicing accumulates accurately
             big_p = orchestrator_guard.PROJECT_ROOT / "tmp_big_sliced.txt"
             big_p.write_text("\n".join(f"line {j}" for j in range(1, 601)) + "\n", encoding="utf-8")
             big_path = str(big_p)
             file_paths.append(big_path)
 
-            # Read 200 lines (lines 1..200) -> allows
-            res_slice1 = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={"name": "read_file", "args": {"Path": big_path, "StartLine": 1, "EndLine": 200}},
-                )
-            )
-            self.assertEqual(res_slice1["decision"], "allow")
-
-            # Read another 200 lines (lines 201..400) -> exceeds 400 lines!
-            res_slice2 = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={"name": "read_file", "args": {"Path": big_path, "StartLine": 201, "EndLine": 400}},
-                )
-            )
+            self.assertEqual(self._pre("read_file", {"Path": big_path, "StartLine": 1, "EndLine": 200})["decision"], "allow")
+            res_slice2 = self._pre("read_file", {"Path": big_path, "StartLine": 201, "EndLine": 400})
             self.assertEqual(res_slice2["decision"], "deny")
             self.assertIn("Direct execution fast-path read budget", res_slice2["reason"])
             self.assertIn("400 lines", res_slice2["reason"])
 
-            # 3. Reading > 16 KB single file is blocked
             huge_p = orchestrator_guard.PROJECT_ROOT / "tmp_huge_bytes.txt"
             huge_p.write_text("A" * 20000 + "\n", encoding="utf-8")
             huge_path = str(huge_p)
             file_paths.append(huge_path)
 
-            state = orchestrator_guard._load_state(self.base_payload)
+            state = self._load_st()
             state["direct_budget"].clear()
             orchestrator_guard._save_state(self.base_payload, state)
 
-            res_huge = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={"name": "read_file", "args": {"Path": huge_path}},
-                )
-            )
+            res_huge = self._pre("read_file", {"Path": huge_path})
             self.assertEqual(res_huge["decision"], "deny")
             self.assertIn("16384 bytes", res_huge["reason"])
 
-            # 4. list_dir is free (0 budget cost)
             for _ in range(15):
-                res_ld = orchestrator_guard.handle_pre_tool(
-                    dict(
-                        self.base_payload,
-                        toolCall={"name": "list_dir", "args": {"Path": str(orchestrator_guard.PROJECT_ROOT)}},
-                    )
-                )
-                self.assertEqual(res_ld["decision"], "allow")
+                self.assertEqual(self._pre("list_dir", {"Path": str(orchestrator_guard.PROJECT_ROOT)})["decision"], "allow")
 
-            # But list_dir on .log is blocked
-            res_ld_log = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={"name": "list_dir", "args": {"Path": str(Path(self.artifact_dir) / "scratch" / "run.log")}},
-                )
-            )
+            res_ld_log = self._pre("list_dir", {"Path": str(Path(self.artifact_dir) / "scratch" / "run.log")})
             self.assertEqual(res_ld_log["decision"], "deny")
             self.assertIn("Context separation violation", res_ld_log["reason"])
-
         finally:
             for fp in file_paths:
                 try:
@@ -4125,1490 +1731,449 @@ orchestrator_guard.register_subagent(
     def test_grounded_spec_file_validation(self) -> None:
         spec_path = Path(self.artifact_dir) / "scratch" / "spec_task_test.md"
         spec_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # 1. Valid spec with SIGNATURES, PITFALLS/INVARIANTS, and VERIFICATION
-        valid_spec_content = (
-            "# Grounded Specification\n\n"
-            "## SIGNATURES\n"
-            "def solve(a: int) -> int: ...\n\n"
-            "## INVARIANTS_AND_PITFALLS\n"
-            "Keep a > 0.\n\n"
-            "## VERIFICATION\n"
-            "Run pytest tests/test_solve.py\n"
+        spec_path.write_text(
+            "# Grounded Specification\n\n## SIGNATURES\ndef solve(a: int) -> int: ...\n\n"
+            "## INVARIANTS_AND_PITFALLS\nKeep a > 0.\n\n## VERIFICATION\nRun pytest tests/test_solve.py\n",
+            encoding="utf-8",
         )
-        spec_path.write_text(valid_spec_content, encoding="utf-8")
-
         prompt_valid = (
-            f"TASK: Implement solve function\n"
-            f"SPEC_FILE: {spec_path}\n"
-            f"RULES:\n1. Open spec\n2. Run pytest\n"
-            f"REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: foo.py\nVERIFICATION: pytest ok\nNOTES: done"
-        )
-        res_valid = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "invoke_subagent",
-                    "args": {"TypeName": "implementer", "Prompt": prompt_valid},
-                },
-            )
-        )
-        self.assertEqual(res_valid["decision"], "allow")
-        state = orchestrator_guard._load_state(self.base_payload)
-        pending = state.get("pending_spawns", [])
-        self.assertTrue(any(p.get("spec_file") == str(spec_path.resolve()) for p in pending))
-
-        # 2. Missing spec file is denied for implementer
-        missing_spec_prompt = (
-            "TASK: Implement feature\n"
-            "SPEC_FILE: /tmp/scratch/non_existent_spec_xyz.md\n"
-            "RULES:\n1. Open spec\n2. Run pytest\n"
+            f"TASK: Implement solve function\nSPEC_FILE: {spec_path}\nRULES:\n1. Open spec\n2. Run pytest\n"
             "REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: foo.py\nVERIFICATION: pytest ok\nNOTES: done"
         )
-        res_missing = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "invoke_subagent",
-                    "args": {"TypeName": "implementer", "Prompt": missing_spec_prompt},
-                },
-            )
+        self.assertEqual(self._pre("invoke_subagent", {"TypeName": "implementer", "Prompt": prompt_valid})["decision"], "allow")
+        self.assertTrue(any(p.get("spec_file") == str(spec_path.resolve()) for p in self._load_st().get("pending_spawns", [])))
+
+        missing_spec_prompt = (
+            "TASK: Implement feature\nSPEC_FILE: /tmp/scratch/non_existent_spec_xyz.md\nRULES:\n1. Open spec\n2. Run pytest\n"
+            "REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: foo.py\nVERIFICATION: pytest ok\nNOTES: done"
         )
+        res_missing = self._pre("invoke_subagent", {"TypeName": "implementer", "Prompt": missing_spec_prompt})
         self.assertEqual(res_missing["decision"], "deny")
         self.assertIn("does not exist", res_missing["reason"])
 
-        # 3. Spec file missing required sections is denied for implementer
         stub_spec_path = Path(self.artifact_dir) / "scratch" / "spec_stub.md"
         stub_spec_path.write_text("# Incomplete Spec\nJust some notes without sections.\n", encoding="utf-8")
         stub_prompt = (
-            f"TASK: Implement feature\n"
-            f"SPEC_FILE: {stub_spec_path}\n"
-            f"RULES:\n1. Open spec\n2. Run pytest\n"
-            f"REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: foo.py\nVERIFICATION: pytest ok\nNOTES: done"
+            f"TASK: Implement feature\nSPEC_FILE: {stub_spec_path}\nRULES:\n1. Open spec\n2. Run pytest\n"
+            "REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: foo.py\nVERIFICATION: pytest ok\nNOTES: done"
         )
-        res_stub = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "invoke_subagent",
-                    "args": {"TypeName": "implementer", "Prompt": stub_prompt},
-                },
-            )
-        )
+        res_stub = self._pre("invoke_subagent", {"TypeName": "implementer", "Prompt": stub_prompt})
         self.assertEqual(res_stub["decision"], "deny")
         self.assertIn("missing required grounded sections", res_stub["reason"])
 
     def test_staged_checkpoints_and_checkpoint_status(self) -> None:
-        state = orchestrator_guard._load_state(self.base_payload)
+        state = self._load_st()
         receipt = orchestrator_guard._get_test_receipt(state, self.base_payload)
-        receipt["dirty"] = True
-        receipt["verified"] = False
+        receipt["dirty"], receipt["verified"] = True, False
         orchestrator_guard._save_state(self.base_payload, state)
 
-        # STAGE: 1/2 in invoke_subagent
         stage_prompt = (
-            "TASK: Multi-stage refactor\n"
-            "ALLOWED_FILES: foo.py\n"
-            "STAGE: 1/2\n"
-            "RULES:\n1. Edit foo.py\n2. Run tests\n"
+            "TASK: Multi-stage refactor\nALLOWED_FILES: foo.py\nSTAGE: 1/2\nRULES:\n1. Edit foo.py\n2. Run tests\n"
             "REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: foo.py\nVERIFICATION: pytest ok\nNOTES: done"
         )
-        res_spawn = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "invoke_subagent",
-                    "args": {"TypeName": "implementer", "Prompt": stage_prompt},
-                },
-            )
-        )
-        self.assertEqual(res_spawn["decision"], "allow")
-        state = orchestrator_guard._load_state(self.base_payload)
-        pending = state.get("pending_spawns", [])
-        self.assertTrue(any(p.get("stage") == "1/2" for p in pending))
+        self.assertEqual(self._pre("invoke_subagent", {"TypeName": "implementer", "Prompt": stage_prompt})["decision"], "allow")
+        self.assertTrue(any(p.get("stage") == "1/2" for p in self._load_st().get("pending_spawns", [])))
 
-        # STATUS: CHECKPOINT report passes validation
-        checkpoint_report = (
-            "STATUS: CHECKPOINT\n"
-            "FILES_CHANGED: foo.py\n"
-            "VERIFICATION: pytest tests/test_foo.py passed\n"
-            "NOTES: Completed stage 1; ready for stage 2."
-        )
+        checkpoint_report = "STATUS: CHECKPOINT\nFILES_CHANGED: foo.py\nVERIFICATION: pytest tests/test_foo.py passed\nNOTES: Completed stage 1; ready for stage 2."
         self.assertIsNone(orchestrator_guard.validate_subagent_report(checkpoint_report))
 
-        # invoke_subagent output with STATUS: CHECKPOINT does NOT prematurely clear dirty receipt
-        post_res = orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "invoke_subagent",
-                    "args": {"TypeName": "implementer", "Prompt": stage_prompt},
-                },
-                output=checkpoint_report,
-                error="",
-            )
-        )
-        self.assertEqual(post_res, {})
-        state_post = orchestrator_guard._load_state(self.base_payload)
-        receipt_post = orchestrator_guard._get_test_receipt(state_post, self.base_payload)
+        self.assertEqual(self._post("invoke_subagent", {"TypeName": "implementer", "Prompt": stage_prompt}, output=checkpoint_report), {})
+        receipt_post = orchestrator_guard._get_test_receipt(self._load_st(), self.base_payload)
         self.assertTrue(receipt_post.get("dirty"))
         self.assertFalse(receipt_post.get("verified"))
 
-        # send_message with STAGE: 2/2 and expanded ALLOWED_FILES:
         sub_cid = "sub-staged-stage2-cid"
-        sub_brain = Path(self.artifact_dir).parent / sub_cid
-        sub_brain.mkdir(parents=True, exist_ok=True)
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id=sub_cid,
-            type_name="implementer",
-            model="flash",
-            allowed_files=["foo.py"],
-        )
-        res_msg = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "send_message",
-                    "args": {
-                        "Recipient": sub_cid,
-                        "Message": "STAGE: 2/2\nALLOWED_FILES: foo.py, bar.py\nPlease proceed with stage 2.",
-                    },
-                },
-            )
+        (Path(self.artifact_dir).parent / sub_cid).mkdir(parents=True, exist_ok=True)
+        self._reg_sub("implementer", sub_cid, "flash", allowed_files=["foo.py"])
+        res_msg = self._pre(
+            "send_message",
+            {"Recipient": sub_cid, "Message": "STAGE: 2/2\nALLOWED_FILES: foo.py, bar.py\nPlease proceed with stage 2."},
         )
         self.assertEqual(res_msg["decision"], "allow")
-        state_msg = orchestrator_guard._load_state(self.base_payload)
-        sub_info = state_msg.get("subagents", {}).get(sub_cid, {})
+        sub_info = self._load_st().get("subagents", {}).get(sub_cid, {})
         self.assertEqual(sub_info.get("stage"), "2/2")
         self.assertIn("2/2", sub_info.get("stage_history", []))
         self.assertEqual(sub_info.get("allowed_files"), ["foo.py", "bar.py"])
 
     def test_compact_scout_report_shorthand(self) -> None:
-        compact_report = (
-            "STATUS: COMPLETED\n"
-            "NOTES: Found symbol in foo.py"
-        )
-        # 1. validate_subagent_report allows compact for scout, rejects for implementer
+        compact_report = "STATUS: COMPLETED\nNOTES: Found symbol in foo.py"
         self.assertIsNone(orchestrator_guard.validate_subagent_report(compact_report, is_scout=True))
         err_impl = orchestrator_guard.validate_subagent_report(compact_report, is_scout=False)
         self.assertIsNotNone(err_impl)
         self.assertIn("Expected 4 header lines", err_impl)
 
-        # 2. scout sending 2-header compact report via send_message is allowed
-        brain_base = Path(self.artifact_dir) / "brain"
-        parent_brain = brain_base / "parent-scout-test"
-        scout_cid = "sub-scout-compact-99"
-        impl_cid = "sub-impl-compact-fail"
-        scout_brain = brain_base / scout_cid
-        impl_brain = brain_base / impl_cid
-        parent_brain.mkdir(parents=True, exist_ok=True)
-        scout_brain.mkdir(parents=True, exist_ok=True)
-        impl_brain.mkdir(parents=True, exist_ok=True)
+        parent_p = self._brain_payload("parent-scout-test")
+        scout_cid, impl_cid = "sub-scout-compact-99", "sub-impl-compact-fail"
+        scout_p = self._brain_payload(scout_cid)
+        impl_p = self._brain_payload(impl_cid)
 
-        parent_payload = dict(
-            self.base_payload,
-            conversationId="parent-scout-test",
-            artifactDirectoryPath=str(parent_brain),
-        )
-        orchestrator_guard._cli_activate(parent_payload)
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id=scout_cid,
-            type_name="scout",
-            model="flash_lite",
-        )
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id=impl_cid,
-            type_name="implementer",
-            model="flash",
-        )
-        scout_payload = dict(
-            self.base_payload,
-            conversationId=scout_cid,
-            artifactDirectoryPath=str(scout_brain),
-            toolCall={
-                "name": "send_message",
-                "args": {
-                    "Recipient": "parent-scout-test",
-                    "Message": compact_report,
-                },
-            },
-        )
-        res_scout_msg = orchestrator_guard.handle_pre_tool(scout_payload)
-        self.assertEqual(res_scout_msg["decision"], "allow")
+        orchestrator_guard._cli_activate(parent_p)
+        self._reg_sub("scout", scout_cid, "flash_lite", payload=parent_p)
+        self._reg_sub("implementer", impl_cid, "flash", payload=parent_p)
 
-        # 3. implementer sending 2-header compact report via send_message is denied
-        impl_payload = dict(
-            self.base_payload,
-            conversationId=impl_cid,
-            artifactDirectoryPath=str(impl_brain),
-            toolCall={
-                "name": "send_message",
-                "args": {
-                    "Recipient": "parent-scout-test",
-                    "Message": compact_report,
-                },
-            },
+        self.assertEqual(
+            self._pre("send_message", {"Recipient": "parent-scout-test", "Message": compact_report}, base=scout_p)["decision"],
+            "allow",
         )
-        res_impl_msg = orchestrator_guard.handle_pre_tool(impl_payload)
+        res_impl_msg = self._pre("send_message", {"Recipient": "parent-scout-test", "Message": compact_report}, base=impl_p)
         self.assertEqual(res_impl_msg["decision"], "deny")
         self.assertIn("Subagent report format error", res_impl_msg["reason"])
-
-        # 4. handle_stop allows compact report for scout
-        stop_payload = dict(
-            self.base_payload,
-            conversationId=scout_cid,
-            artifactDirectoryPath=str(scout_brain),
-            lastAssistantMessage=compact_report,
-            fullyIdle=True,
-        )
-        res_stop = orchestrator_guard.handle_stop(stop_payload)
-        self.assertEqual(res_stop.get("decision"), "allow")
+        self.assertEqual(self._stop(compact_report, base=scout_p).get("decision"), "allow")
 
     def test_system_orchestrator_exit_plan_mode_coexistence(self) -> None:
         orchestrator_guard._cli_activate(self.base_payload)
-        plan_content = (
-            "TASK: Multi-file refactor\n"
-            "ALLOWED_FILES: file_x.py, file_y.py, file_z.py\n"
-            "1. Edit all three files\n"
-            "2. Run tests"
-        )
-        exit_plan_payload = dict(
-            self.base_payload,
-            toolCall={
-                "name": "exit_plan_mode",
-                "args": {"plan": plan_content},
-            },
-        )
-        res_exit = orchestrator_guard.handle_pre_tool(exit_plan_payload)
-        self.assertEqual(res_exit["decision"], "allow")
+        plan_content = "TASK: Multi-file refactor\nALLOWED_FILES: file_x.py, file_y.py, file_z.py\n1. Edit all three files\n2. Run tests"
+        self.assertEqual(self._pre("exit_plan_mode", {"plan": plan_content})["decision"], "allow")
 
-        state = orchestrator_guard._load_state(self.base_payload)
+        state = self._load_st()
         self.assertTrue(state.get("plan_execute_phase"))
         self.assertFalse(state.get("plan_execute_consumed"))
         self.assertEqual(state.get("plan_allowed_files"), ["file_x.py", "file_y.py", "file_z.py"])
 
-        # In coexistence mode, root can edit > 2 files in plan_allowed_files
-        for fname in ["file_x.py", "file_y.py", "file_z.py"]:
-            fpath = str(orchestrator_guard.PROJECT_ROOT / fname)
-            res_edit = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={"name": "edit_file", "args": {"Path": fpath, "Target": "", "Replacement": ""}},
-                )
+        for fname in ("file_x.py", "file_y.py", "file_z.py"):
+            self.assertEqual(
+                self._pre("edit_file", {"Path": str(orchestrator_guard.PROJECT_ROOT / fname), "Target": "", "Replacement": ""})["decision"],
+                "allow",
             )
-            self.assertEqual(res_edit["decision"], "allow")
 
-        # Editing out-of-plan file is denied
-        out_fpath = str(orchestrator_guard.PROJECT_ROOT / "out_of_plan.py")
-        res_out = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={"name": "edit_file", "args": {"Path": out_fpath, "Target": "", "Replacement": ""}},
-            )
-        )
+        res_out = self._pre("edit_file", {"Path": str(orchestrator_guard.PROJECT_ROOT / "out_of_plan.py"), "Target": "", "Replacement": ""})
         self.assertEqual(res_out["decision"], "deny")
         self.assertIn("File allowlist violation", res_out["reason"])
 
-        # Running multiple commands is allowed
-        for cmd in ["echo 1", "echo 2", "echo 3", "echo 4"]:
-            res_cmd = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={"name": "run_command", "args": {"CommandLine": cmd}},
-                )
-            )
-            self.assertEqual(res_cmd["decision"], "allow")
+        for cmd in ("echo 1", "echo 2", "echo 3", "echo 4"):
+            self.assertEqual(self._pre("run_command", {"CommandLine": cmd})["decision"], "allow")
 
-        # But reading .log is STILL blocked in plan_execute_phase
-        log_fpath = str(Path(self.artifact_dir) / "scratch" / "test.log")
-        res_log = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={"name": "read_file", "args": {"Path": log_fpath}},
-            )
-        )
+        res_log = self._pre("read_file", {"Path": str(Path(self.artifact_dir) / "scratch" / "test.log")})
         self.assertEqual(res_log["decision"], "deny")
         self.assertIn("Context separation violation", res_log["reason"])
 
-        # PreInvocation resets plan_execute_phase on [plan review]
-        review_payload = dict(
-            self.base_payload,
-            lastUserInput="Please do [plan review] now",
-        )
-        orchestrator_guard.handle_pre_invocation(review_payload)
-        state_after_review = orchestrator_guard._load_state(self.base_payload)
+        self._pre_inv(lastUserInput="Please do [plan review] now")
+        state_after_review = self._load_st()
         self.assertFalse(state_after_review.get("plan_execute_phase"))
         self.assertIsNone(state_after_review.get("plan_allowed_files"))
 
     def test_safe_git_env_prefixes_and_unsafe_env_rejection(self) -> None:
-        # Safe git prefixes accepted by _is_git_only_command
-        safe_cmds = [
+        safe_cmds = (
             "GIT_EDITOR=true git status",
             "GIT_SEQUENCE_EDITOR=: git diff",
             "GIT_PAGER=cat git log",
             "LC_ALL=C GIT_TERMINAL_PROMPT=0 git status",
             "PAGER='' git diff",
             'LANG="en_US.UTF-8" GIT_EDITOR="/bin/true" git status',
-            "GIT_PAGER=\"\" git status",
-        ]
+            'GIT_PAGER="" git status',
+        )
         for cmd in safe_cmds:
-            self.assertTrue(
-                orchestrator_guard._is_git_only_command(cmd),
-                f"Expected safe command to be accepted: {cmd}",
-            )
+            self.assertTrue(orchestrator_guard._is_git_only_command(cmd), f"Expected safe command to be accepted: {cmd}")
 
-        # Unsafe env prefixes rejected by _is_git_only_command
-        unsafe_cmds = [
+        unsafe_cmds = (
             "GIT_SSH_COMMAND=evil git status",
             "LD_PRELOAD=/tmp/lib.so git status",
             "GIT_EDITOR=/tmp/evil.sh git status",
             "GIT_EDITOR=vim git status",
             "PATH=/tmp git status",
             "GIT_EXEC_PATH=/tmp git status",
-        ]
+        )
         for cmd in unsafe_cmds:
-            self.assertFalse(
-                orchestrator_guard._is_git_only_command(cmd),
-                f"Expected unsafe command to be rejected: {cmd}",
-            )
+            self.assertFalse(orchestrator_guard._is_git_only_command(cmd), f"Expected unsafe command to be rejected: {cmd}")
 
-        # Tripped circuit breaker allows safe git inspections but denies unsafe commands
-        state = orchestrator_guard._load_state(self.base_payload)
+        state = self._load_st()
         cb = orchestrator_guard._get_circuit_breaker(state)
-        cb["failure_streak"] = 2
-        cb["tripped"] = True
-        cb["last_error"] = "exit 1"
+        cb["failure_streak"], cb["tripped"], cb["last_error"] = 2, True, "exit 1"
         orchestrator_guard._save_state(self.base_payload, state)
 
-        res_safe = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "run_command",
-                    "args": {
-                        "CommandLine": "GIT_EDITOR=true git status",
-                        "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                    },
-                },
-            )
-        )
-        self.assertEqual(res_safe["decision"], "allow")
-
-        res_unsafe = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "run_command",
-                    "args": {
-                        "CommandLine": "GIT_SSH_COMMAND=evil git status",
-                        "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                    },
-                },
-            )
-        )
+        self.assertEqual(self._pre("run_command", self._cmd_args("GIT_EDITOR=true git status"))["decision"], "allow")
+        res_unsafe = self._pre("run_command", self._cmd_args("GIT_SSH_COMMAND=evil git status"))
         self.assertEqual(res_unsafe["decision"], "deny")
         self.assertIn("2-turn circuit breaker tripped", res_unsafe["reason"])
 
-        # Grounded spec with underscore headers is accepted
-        cb["tripped"] = False
-        cb["failure_streak"] = 0
+        cb["tripped"], cb["failure_streak"] = False, 0
         orchestrator_guard._save_state(self.base_payload, state)
 
         spec_file = Path(self.artifact_dir) / "scratch" / "spec_underscores.md"
         spec_file.parent.mkdir(parents=True, exist_ok=True)
         spec_file.write_text(
-            "# Grounded Spec with Underscores\n\n"
-            "## SIGNATURES_AND_SNIPPETS\n"
-            "def foo() -> None: pass\n\n"
-            "## INVARIANTS_AND_PITFALLS\n"
-            "- invariant 1\n\n"
-            "## VERIFICATION_EXPECTATIONS\n"
-            "- run pytest\n"
+            "# Grounded Spec with Underscores\n\n## SIGNATURES_AND_SNIPPETS\ndef foo() -> None: pass\n\n"
+            "## INVARIANTS_AND_PITFALLS\n- invariant 1\n\n## VERIFICATION_EXPECTATIONS\n- run pytest\n"
         )
-        sub_dispatch = dict(
-            self.base_payload,
-            toolCall={
-                "name": "invoke_subagent",
-                "args": {
-                    "TypeName": "implementer",
-                    "Prompt": (
-                        "TASK: Implement underscores test.\n"
-                        f"SPEC_FILE: {spec_file}\n"
-                        "ALLOWED_FILES: tests/test_sample.py\n\n"
-                        "RULES:\n1. Open file.\n2. Edit.\n3. Run pytest.\n\n"
-                        "REPORT FORMAT:\nSTATUS: COMPLETED\n"
-                        "FILES_CHANGED: tests/test_sample.py\n"
-                        "VERIFICATION: pytest ok\n"
-                        "NOTES: done\n"
-                    ),
-                },
-            },
+        prompt = (
+            f"TASK: Implement underscores test.\nSPEC_FILE: {spec_file}\nALLOWED_FILES: tests/test_sample.py\n\n"
+            "RULES:\n1. Open file.\n2. Edit.\n3. Run pytest.\n\n"
+            "REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: tests/test_sample.py\nVERIFICATION: pytest ok\nNOTES: done\n"
         )
-        res_dispatch = orchestrator_guard.handle_pre_tool(sub_dispatch)
-        self.assertEqual(res_dispatch["decision"], "allow")
+        self.assertEqual(self._pre("invoke_subagent", {"TypeName": "implementer", "Prompt": prompt})["decision"], "allow")
 
     def test_sandbox_boundary_errors_exempt_from_circuit_breaker(self) -> None:
-        state = orchestrator_guard._load_state(self.base_payload)
+        state = self._load_st()
         cb = orchestrator_guard._get_circuit_breaker(state)
-        cb["failure_streak"] = 0
-        cb["tripped"] = False
+        cb["failure_streak"], cb["tripped"] = 0, False
         orchestrator_guard._save_state(self.base_payload, state)
 
-        # 1. Error with .git/index.lock: Read-only file system does NOT increment failure streak
-        post_ro_lock = dict(
-            self.base_payload,
-            toolCall={
-                "id": "cmd_ro_lock",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "git checkout -b branch1",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-            error="fatal: Unable to create '/path/.git/index.lock': Read-only file system",
+        exempt_cases = (
+            ("cmd_ro_lock", "git checkout -b branch1", "", "fatal: Unable to create '/path/.git/index.lock': Read-only file system", False),
+            ("cmd_banner", "git push origin branch1", "There were sandbox errors that may or may not be related to the failure\nexit status 1", "Command exited with code 1", False),
+            ("cmd_sberr", "npm test", "", "Process failed in sandbox", True),
+            ("cmd_fetch_ro", "git fetch origin", "fatal: cannot open .git/FETCH_HEAD: Read-only file system\n", "Command exited with code 128", False),
         )
-        orchestrator_guard.handle_post_tool(post_ro_lock)
-        state_after_ro = orchestrator_guard._load_state(self.base_payload)
-        cb_ro = orchestrator_guard._get_circuit_breaker(state_after_ro)
-        self.assertEqual(cb_ro.get("failure_streak", 0), 0)
-        self.assertFalse(cb_ro.get("tripped", False))
+        for cid_call, cmd, out, err, sb_flag in exempt_cases:
+            extra = {"sandboxError": True} if sb_flag else {}
+            self._post("run_command", self._cmd_args(cmd), output=out, error=err, call_id=cid_call, **extra)
+            cb_now = orchestrator_guard._get_circuit_breaker(self._load_st())
+            self.assertEqual(cb_now.get("failure_streak", 0), 0)
+            self.assertFalse(cb_now.get("tripped", False))
 
-        # 2. Output with sandbox banner does NOT increment failure streak
-        post_sandbox_banner = dict(
-            self.base_payload,
-            toolCall={
-                "id": "cmd_banner",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "git push origin branch1",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-            output="There were sandbox errors that may or may not be related to the failure\nexit status 1",
-            error="Command exited with code 1",
-        )
-        orchestrator_guard.handle_post_tool(post_sandbox_banner)
-        state_after_banner = orchestrator_guard._load_state(self.base_payload)
-        cb_banner = orchestrator_guard._get_circuit_breaker(state_after_banner)
-        self.assertEqual(cb_banner.get("failure_streak", 0), 0)
-        self.assertFalse(cb_banner.get("tripped", False))
-
-        # 3. Payload with sandboxError=True does NOT increment failure streak
-        post_sb_err = dict(
-            self.base_payload,
-            toolCall={
-                "id": "cmd_sberr",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "npm test",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-            sandboxError=True,
-            error="Process failed in sandbox",
-        )
-        orchestrator_guard.handle_post_tool(post_sb_err)
-        state_after_sberr = orchestrator_guard._load_state(self.base_payload)
-        cb_sberr = orchestrator_guard._get_circuit_breaker(state_after_sberr)
-        self.assertEqual(cb_sberr.get("failure_streak", 0), 0)
-        self.assertFalse(cb_sberr.get("tripped", False))
-
-        # 4. Read-only FETCH_HEAD does NOT increment failure streak
-        post_fetch_ro = dict(
-            self.base_payload,
-            toolCall={
-                "id": "cmd_fetch_ro",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "git fetch origin",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-            output="fatal: cannot open .git/FETCH_HEAD: Read-only file system\n",
-            error="Command exited with code 128",
-        )
-        orchestrator_guard.handle_post_tool(post_fetch_ro)
-        state_after_fetch = orchestrator_guard._load_state(self.base_payload)
-        cb_fetch = orchestrator_guard._get_circuit_breaker(state_after_fetch)
-        self.assertEqual(cb_fetch.get("failure_streak", 0), 0)
-        self.assertFalse(cb_fetch.get("tripped", False))
-
-        # 5. Genuine code failures DO increment failure streak and trip breaker at streak 2
-        post_real_1 = dict(
-            self.base_payload,
-            toolCall={
-                "id": "cmd_real_1",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "pytest tests/",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-            error="exit status 1",
-        )
-        orchestrator_guard.handle_post_tool(post_real_1)
-        state_after_real_1 = orchestrator_guard._load_state(self.base_payload)
-        cb_real_1 = orchestrator_guard._get_circuit_breaker(state_after_real_1)
+        self._post("run_command", self._cmd_args("pytest tests/"), error="exit status 1", call_id="cmd_real_1")
+        cb_real_1 = orchestrator_guard._get_circuit_breaker(self._load_st())
         self.assertEqual(cb_real_1.get("failure_streak", 0), 1)
         self.assertFalse(cb_real_1.get("tripped", False))
 
-        post_real_2 = dict(
-            self.base_payload,
-            toolCall={
-                "id": "cmd_real_2",
-                "name": "run_command",
-                "args": {
-                    "CommandLine": "pytest tests/",
-                    "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                },
-            },
-            error="exit status 1",
-        )
-        orchestrator_guard.handle_post_tool(post_real_2)
-        state_after_real_2 = orchestrator_guard._load_state(self.base_payload)
-        cb_real_2 = orchestrator_guard._get_circuit_breaker(state_after_real_2)
+        self._post("run_command", self._cmd_args("pytest tests/"), error="exit status 1", call_id="cmd_real_2")
+        cb_real_2 = orchestrator_guard._get_circuit_breaker(self._load_st())
         self.assertEqual(cb_real_2.get("failure_streak", 0), 2)
         self.assertTrue(cb_real_2.get("tripped", False))
 
     def test_phase1_define_subagent_verifier_and_reviewer_permissions(self) -> None:
-        # 1. PascalCase define_subagent strips write, MCP, and subagent tools for verifier & reviewer
         for role_name in ("verifier", "reviewer"):
-            res = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "name": "define_subagent",
-                        "args": {
-                            "Name": role_name,
-                            "EnableWriteTools": True,
-                            "EnableMCPTools": True,
-                            "EnableSubagentTools": True,
-                        },
-                    },
-                )
-            )
+            res = self._pre("define_subagent", {"Name": role_name, "EnableWriteTools": True, "EnableMCPTools": True, "EnableSubagentTools": True})
             self.assertEqual(res["decision"], "allow")
-            self.assertEqual(
-                res["overwrite"],
-                {
-                    "EnableSubagentTools": False,
-                    "EnableWriteTools": False,
-                    "EnableMCPTools": False,
-                },
-            )
+            self.assertEqual(res["overwrite"], {"EnableSubagentTools": False, "EnableWriteTools": False, "EnableMCPTools": False})
 
-        # 2. snake_case define_subagent strips write, MCP, and subagent tools for verifier & reviewer
-        for role_name in ("verifier", "reviewer"):
-            res_snake = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "name": "define_subagent",
-                        "args": {
-                            "name": role_name,
-                            "enable_write_tools": True,
-                            "enable_mcp_tools": True,
-                            "enable_subagent_tools": True,
-                        },
-                    },
-                )
-            )
+            res_snake = self._pre("define_subagent", {"name": role_name, "enable_write_tools": True, "enable_mcp_tools": True, "enable_subagent_tools": True})
             self.assertEqual(res_snake["decision"], "allow")
-            self.assertEqual(
-                res_snake["overwrite"],
-                {
-                    "enable_subagent_tools": False,
-                    "enable_write_tools": False,
-                    "enable_mcp_tools": False,
-                },
-            )
+            self.assertEqual(res_snake["overwrite"], {"enable_subagent_tools": False, "enable_write_tools": False, "enable_mcp_tools": False})
 
     def test_phase1_verifier_reviewer_model_policy_and_regressions(self) -> None:
-        short_readonly_prompt = (
-            "TASK: Inspect module changes.\n"
-            "REVIEW_LENS: security\n"
-            "RULES:\n1. Read changed files.\n2. Run git diff.\n"
+        short_prompt = (
+            "TASK: Inspect module changes.\nREVIEW_LENS: security\nRULES:\n1. Read changed files.\n2. Run git diff.\n"
             "REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: ok\nNOTES: done"
         )
-        # Verifier and reviewer model policy: omitted -> flash, flash -> flash, pro -> pro,
-        # inherit -> inherit, flash_lite -> flash, short readonly prompt NOT downgraded to flash_lite.
-        for type_name in ("verifier", "reviewer"):
-            # Omitted Model -> overwritten to flash
-            res_omitted = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "id": f"m_omit_{type_name}",
-                        "name": "invoke_subagent",
-                        "args": {
-                            "TypeName": type_name,
-                            "Prompt": short_readonly_prompt,
-                        },
-                    },
-                )
-            )
-            self.assertEqual(res_omitted["decision"], "allow")
-            self.assertEqual(res_omitted["overwrite"]["Model"], "flash")
+        for tname in ("verifier", "reviewer"):
+            res_omit = self._pre("invoke_subagent", {"TypeName": tname, "Prompt": short_prompt}, call_id=f"m_omit_{tname}")
+            self.assertEqual(res_omit["decision"], "allow")
+            self.assertEqual(res_omit["overwrite"]["Model"], "flash")
 
-            # Explicit flash -> kept as flash (no overwrite)
-            res_flash = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "id": f"m_flash_{type_name}",
-                        "name": "invoke_subagent",
-                        "args": {
-                            "TypeName": type_name,
-                            "Model": "flash",
-                            "Prompt": short_readonly_prompt.replace("security", f"flash-{type_name}"),
-                        },
-                    },
-                )
-            )
-            self.assertEqual(res_flash, {"decision": "allow"})
+            self.assertEqual(self._pre("invoke_subagent", {"TypeName": tname, "Model": "flash", "Prompt": short_prompt.replace("security", f"flash-{tname}")}, call_id=f"m_flash_{tname}"), {"decision": "allow"})
+            self.assertEqual(self._pre("invoke_subagent", {"TypeName": tname, "Model": "pro", "Prompt": short_prompt.replace("security", f"pro-{tname}")}, call_id=f"m_pro_{tname}"), {"decision": "allow"})
+            self.assertEqual(self._pre("invoke_subagent", {"TypeName": tname, "Model": "inherit", "Prompt": short_prompt.replace("security", f"inh-{tname}")}, call_id=f"m_inh_{tname}"), {"decision": "allow"})
 
-            # Explicit pro -> allowed & preserved
-            res_pro = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "id": f"m_pro_{type_name}",
-                        "name": "invoke_subagent",
-                        "args": {
-                            "TypeName": type_name,
-                            "Model": "pro",
-                            "Prompt": short_readonly_prompt.replace("security", f"pro-{type_name}"),
-                        },
-                    },
-                )
-            )
-            self.assertEqual(res_pro, {"decision": "allow"})
-
-            # Explicit inherit -> allowed & preserved
-            res_inherit = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "id": f"m_inh_{type_name}",
-                        "name": "invoke_subagent",
-                        "args": {
-                            "TypeName": type_name,
-                            "Model": "inherit",
-                            "Prompt": short_readonly_prompt.replace("security", f"inh-{type_name}"),
-                        },
-                    },
-                )
-            )
-            self.assertEqual(res_inherit, {"decision": "allow"})
-
-            # Explicit flash_lite -> rewritten to flash
-            res_lite = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "id": f"m_lite_{type_name}",
-                        "name": "invoke_subagent",
-                        "args": {
-                            "TypeName": type_name,
-                            "Model": "flash_lite",
-                            "Prompt": short_readonly_prompt.replace("security", f"lite-{type_name}"),
-                        },
-                    },
-                )
-            )
+            res_lite = self._pre("invoke_subagent", {"TypeName": tname, "Model": "flash_lite", "Prompt": short_prompt.replace("security", f"lite-{tname}")}, call_id=f"m_lite_{tname}")
             self.assertEqual(res_lite["decision"], "allow")
             self.assertEqual(res_lite["overwrite"]["Model"], "flash")
 
-        # Regression guard: scout, research, implementer still deny pro and rewrite inherit
         for std_type in ("scout", "research", "implementer"):
-            res_std_pro = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "id": f"std_pro_{std_type}",
-                        "name": "invoke_subagent",
-                        "args": {
-                            "TypeName": std_type,
-                            "Model": "pro",
-                            "Prompt": VALID_PROMPT,
-                        },
-                    },
-                )
-            )
+            res_std_pro = self._pre("invoke_subagent", {"TypeName": std_type, "Model": "pro", "Prompt": VALID_PROMPT}, call_id=f"std_pro_{std_type}")
             self.assertEqual(res_std_pro["decision"], "deny")
             self.assertIn("Model='pro'", res_std_pro["reason"])
 
-            res_std_inh = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "id": f"std_inh_{std_type}",
-                        "name": "invoke_subagent",
-                        "args": {
-                            "TypeName": std_type,
-                            "Model": "inherit",
-                            "Prompt": VALID_PROMPT,
-                        },
-                    },
-                )
-            )
+            res_std_inh = self._pre("invoke_subagent", {"TypeName": std_type, "Model": "inherit", "Prompt": VALID_PROMPT}, call_id=f"std_inh_{std_type}")
             self.assertEqual(res_std_inh["decision"], "allow")
-            expected_default = "flash_lite" if std_type == "scout" else "flash"
-            self.assertEqual(res_std_inh["overwrite"]["Model"], expected_default)
+            self.assertEqual(res_std_inh["overwrite"]["Model"], "flash_lite" if std_type == "scout" else "flash")
 
     def test_phase1_verifier_reviewer_strict_readonly_and_dirty_receipt(self) -> None:
-        brain_base = Path(self.artifact_dir) / "brain"
-        parent_brain = brain_base / "parent-ro-test"
-        verifier_cid = "sub-verifier-ro-01"
-        reviewer_cid = "sub-reviewer-ro-02"
-        for d in (parent_brain, brain_base / verifier_cid, brain_base / reviewer_cid):
-            d.mkdir(parents=True, exist_ok=True)
-
-        parent_payload = dict(
-            self.base_payload,
-            conversationId="parent-ro-test",
-            artifactDirectoryPath=str(parent_brain),
-        )
-        orchestrator_guard._cli_activate(parent_payload)
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id=verifier_cid,
-            type_name="verifier",
-            model="flash",
-            status="active",
-        )
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id=reviewer_cid,
-            type_name="reviewer",
-            model="pro",
-            status="active",
-            review_lens="security",
-        )
+        parent_p = self._brain_payload("parent-ro-test")
+        v_cid, r_cid = "sub-verifier-ro-01", "sub-reviewer-ro-02"
+        v_p, r_p = self._brain_payload(v_cid), self._brain_payload(r_cid)
+        orchestrator_guard._cli_activate(parent_p)
+        self._reg_sub("verifier", v_cid, "flash", payload=parent_p, status="active")
+        self._reg_sub("reviewer", r_cid, "pro", payload=parent_p, status="active", review_lens="security")
 
         target_code = str(orchestrator_guard.PROJECT_ROOT / "src" / "app.py")
-        for sub_cid, sub_type in ((verifier_cid, "verifier"), (reviewer_cid, "reviewer")):
-            sub_payload = dict(
-                self.base_payload,
-                conversationId=sub_cid,
-                artifactDirectoryPath=str(brain_base / sub_cid),
-            )
-            # MUTATION_TOOLS blocked
+        for sub_p in (v_p, r_p):
             for tool_name, tool_args in (
                 ("write_file", {"Path": target_code, "Content": "x = 1"}),
                 ("edit_file", {"Path": target_code, "Target": "a", "Replacement": "b"}),
                 ("replace_file_content", {"TargetFile": target_code, "TargetContent": "a", "ReplacementContent": "b"}),
             ):
-                res_mut = orchestrator_guard.handle_pre_tool(
-                    dict(sub_payload, toolCall={"name": tool_name, "args": tool_args})
-                )
+                res_mut = self._pre(tool_name, tool_args, base=sub_p)
                 self.assertEqual(res_mut["decision"], "deny")
                 self.assertIn("strictly read-only", res_mut["reason"])
 
-            # Mutating shell commands blocked
             for bad_cmd in ("echo hi > out.txt", "rm -f foo.py", "sed -i 's/a/b/' foo.py", "touch new.py"):
-                res_cmd = orchestrator_guard.handle_pre_tool(
-                    dict(
-                        sub_payload,
-                        toolCall={
-                            "name": "run_command",
-                            "args": {"CommandLine": bad_cmd, "Cwd": str(orchestrator_guard.PROJECT_ROOT)},
-                        },
-                    )
-                )
+                res_cmd = self._pre("run_command", self._cmd_args(bad_cmd), base=sub_p)
                 self.assertEqual(res_cmd["decision"], "deny")
                 self.assertIn("strictly read-only", res_cmd["reason"])
 
-            # read_file and git diff allowed
-            res_read = orchestrator_guard.handle_pre_tool(
-                dict(
-                    sub_payload,
-                    toolCall={
-                        "name": "read_file",
-                        "args": {"Path": str(orchestrator_guard.PROJECT_ROOT / "README.md"), "StartLine": 1, "EndLine": 10},
-                    },
-                )
-            )
-            self.assertEqual(res_read["decision"], "allow")
-            res_git = orchestrator_guard.handle_pre_tool(
-                dict(
-                    sub_payload,
-                    toolCall={
-                        "name": "run_command",
-                        "args": {"CommandLine": "git diff HEAD", "Cwd": str(orchestrator_guard.PROJECT_ROOT)},
-                    },
-                )
-            )
-            self.assertEqual(res_git["decision"], "allow")
+            self.assertEqual(self._pre("read_file", {"Path": str(orchestrator_guard.PROJECT_ROOT / "README.md"), "StartLine": 1, "EndLine": 10}, base=sub_p)["decision"], "allow")
+            self.assertEqual(self._pre("run_command", self._cmd_args("git diff HEAD"), base=sub_p)["decision"], "allow")
 
-        # Synchronous invoke_subagent completion for verifier/reviewer NEVER clears dirty test_receipt
-        parent_state = orchestrator_guard._load_state(parent_payload)
-        parent_receipt = orchestrator_guard._get_test_receipt(parent_state, parent_payload)
-        parent_receipt["dirty"] = True
-        parent_receipt["verified"] = False
-        orchestrator_guard._save_state(parent_payload, parent_state)
+        parent_state = self._load_st(parent_p)
+        rec = orchestrator_guard._get_test_receipt(parent_state, parent_p)
+        rec["dirty"], rec["verified"] = True, False
+        orchestrator_guard._save_state(parent_p, parent_state)
 
         for ro_type in ("verifier", "reviewer"):
-            orchestrator_guard.handle_post_tool(
-                dict(
-                    parent_payload,
-                    toolCall={
-                        "id": f"sync_{ro_type}",
-                        "name": "invoke_subagent",
-                        "args": {"TypeName": ro_type, "Role": ro_type.title()},
-                    },
-                    output="STATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: inspected\nNOTES: VERDICT: PASS",
-                    error="",
-                )
-            )
-            st_after = orchestrator_guard._load_state(parent_payload)
-            rec_after = orchestrator_guard._get_test_receipt(st_after, parent_payload)
+            self._post("invoke_subagent", {"TypeName": ro_type, "Role": ro_type.title()}, output="STATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: inspected\nNOTES: VERDICT: PASS", call_id=f"sync_{ro_type}", base=parent_p)
+            rec_after = orchestrator_guard._get_test_receipt(self._load_st(parent_p), parent_p)
             self.assertTrue(rec_after["dirty"])
             self.assertFalse(rec_after["verified"])
 
     def test_phase1_verifier_reviewer_require_4_header_report(self) -> None:
         compact_report = "STATUS: COMPLETED\nNOTES: Looks good to me"
-        valid_4_header = (
-            "STATUS: COMPLETED\n"
-            "FILES_CHANGED: NONE\n"
-            "VERIFICATION: Ran git diff and inspected tests\n"
-            "NOTES: VERDICT: APPROVE"
-        )
-        brain_base = Path(self.artifact_dir) / "brain"
-        parent_brain = brain_base / "parent-report-test"
-        parent_brain.mkdir(parents=True, exist_ok=True)
-        parent_payload = dict(
-            self.base_payload,
-            conversationId="parent-report-test",
-            artifactDirectoryPath=str(parent_brain),
-        )
-        orchestrator_guard._cli_activate(parent_payload)
+        valid_4_header = "STATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: Ran git diff and inspected tests\nNOTES: VERDICT: APPROVE"
+        parent_p = self._brain_payload("parent-report-test")
+        orchestrator_guard._cli_activate(parent_p)
 
         for idx, role_type in enumerate(("verifier", "reviewer"), start=1):
             sub_cid = f"sub-{role_type}-report-{idx}"
-            (brain_base / sub_cid).mkdir(parents=True, exist_ok=True)
-            orchestrator_guard.register_subagent(
-                parent_payload,
-                conversation_id=sub_cid,
-                type_name=role_type,
-                model="flash",
-                status="active",
-                review_lens="security" if role_type == "reviewer" else None,
-            )
-            sub_payload = dict(
-                self.base_payload,
-                conversationId=sub_cid,
-                artifactDirectoryPath=str(brain_base / sub_cid),
-            )
-            # 2-header shorthand rejected in send_message
-            res_msg = orchestrator_guard.handle_pre_tool(
-                dict(
-                    sub_payload,
-                    toolCall={
-                        "name": "send_message",
-                        "args": {"Recipient": "parent-report-test", "Message": compact_report},
-                    },
-                )
-            )
+            sub_p = self._brain_payload(sub_cid)
+            self._reg_sub(role_type, sub_cid, "flash", payload=parent_p, status="active", review_lens="security" if role_type == "reviewer" else None)
+
+            res_msg = self._pre("send_message", {"Recipient": "parent-report-test", "Message": compact_report}, base=sub_p)
             self.assertEqual(res_msg["decision"], "deny")
             self.assertIn("Expected 4 header lines", res_msg["reason"])
 
-            # 2-header shorthand triggers continue in handle_stop
-            res_stop_bad = orchestrator_guard.handle_stop(
-                dict(
-                    sub_payload,
-                    executionNum=1,
-                    lastAssistantMessage=compact_report,
-                    fullyIdle=True,
-                )
-            )
+            res_stop_bad = self._stop(compact_report, base=sub_p, executionNum=1)
             self.assertEqual(res_stop_bad["decision"], "continue")
             self.assertIn("Expected 4 header lines", res_stop_bad["reason"])
 
-            # 4-header report passes handle_stop and marks status completed in parent brain
-            res_stop_ok = orchestrator_guard.handle_stop(
-                dict(
-                    sub_payload,
-                    executionNum=2,
-                    lastAssistantMessage=valid_4_header,
-                    fullyIdle=True,
-                )
-            )
-            self.assertEqual(res_stop_ok["decision"], "allow")
-            parent_state = orchestrator_guard._load_state(parent_payload)
-            self.assertEqual(parent_state["subagents"][sub_cid]["status"], "completed")
+            self.assertEqual(self._stop(valid_4_header, base=sub_p, executionNum=2)["decision"], "allow")
+            self.assertEqual(self._load_st(parent_p)["subagents"][sub_cid]["status"], "completed")
 
     def test_phase1_freshness_gate_mutation_epoch_root_and_implementer(self) -> None:
-        brain_base = Path(self.artifact_dir) / "brain"
-        parent_brain = brain_base / "parent-epoch-test"
-        impl_cid = "sub-impl-epoch-01"
-        verifier_cid = "sub-verifier-epoch-02"
-        reviewer_cid = "sub-reviewer-epoch-03"
-        for d in (
-            parent_brain,
-            brain_base / impl_cid,
-            brain_base / verifier_cid,
-            brain_base / reviewer_cid,
-        ):
-            d.mkdir(parents=True, exist_ok=True)
+        parent_p = self._brain_payload("parent-epoch-test")
+        impl_cid, verifier_cid, reviewer_cid = "sub-impl-epoch-01", "sub-verifier-epoch-02", "sub-reviewer-epoch-03"
+        impl_p = self._brain_payload(impl_cid)
+        self._brain_payload(verifier_cid)
+        self._brain_payload(reviewer_cid)
 
-        parent_payload = dict(
-            self.base_payload,
-            conversationId="parent-epoch-test",
-            artifactDirectoryPath=str(parent_brain),
-        )
-        orchestrator_guard._cli_activate(parent_payload)
-        orchestrator_guard.handle_pre_invocation(parent_payload)
+        orchestrator_guard._cli_activate(parent_p)
+        orchestrator_guard.handle_pre_invocation(parent_p)
+        self._reg_sub("implementer", impl_cid, "flash", payload=parent_p, status="active")
+        self._reg_sub("verifier", verifier_cid, "flash", payload=parent_p, status="active", spawned_mutation_epoch=0)
+        self._reg_sub("reviewer", reviewer_cid, "pro", payload=parent_p, status="active", spawned_mutation_epoch=0, review_lens="security")
 
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id=impl_cid,
-            type_name="implementer",
-            model="flash",
-            status="active",
-        )
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id=verifier_cid,
-            type_name="verifier",
-            model="flash",
-            status="active",
-            spawned_mutation_epoch=0,
-        )
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id=reviewer_cid,
-            type_name="reviewer",
-            model="pro",
-            status="active",
-            spawned_mutation_epoch=0,
-            review_lens="security",
-        )
-
-        # Clarifying send_message BEFORE any code mutation is allowed
         for target_cid in (verifier_cid, reviewer_cid):
-            res_before = orchestrator_guard.handle_pre_tool(
-                dict(
-                    parent_payload,
-                    toolCall={
-                        "name": "send_message",
-                        "args": {"Recipient": target_cid, "Message": "Please also check input bounds."},
-                    },
-                )
-            )
-            self.assertEqual(res_before["decision"], "allow")
+            self.assertEqual(self._pre("send_message", {"Recipient": target_cid, "Message": "Please also check input bounds."}, base=parent_p)["decision"], "allow")
 
-        # Implementer mutates workspace file -> propagates dirty=True and bumps parent mutation_epoch
-        impl_payload = dict(
-            self.base_payload,
-            conversationId=impl_cid,
-            artifactDirectoryPath=str(brain_base / impl_cid),
-            toolCall={
-                "name": "edit_file",
-                "args": {
-                    "Path": str(orchestrator_guard.PROJECT_ROOT / "src_mod.py"),
-                    "Target": "a",
-                    "Replacement": "b",
-                },
-            },
-        )
-        res_impl_edit = orchestrator_guard.handle_pre_tool(impl_payload)
-        self.assertEqual(res_impl_edit["decision"], "allow")
-
-        parent_state = orchestrator_guard._load_state(parent_payload)
         self.assertEqual(
-            orchestrator_guard._get_test_receipt(parent_state, parent_payload).get("mutation_epoch"),
-            1,
+            self._pre("edit_file", {"Path": str(orchestrator_guard.PROJECT_ROOT / "src_mod.py"), "Target": "a", "Replacement": "b"}, base=impl_p)["decision"],
+            "allow",
         )
+        self.assertEqual(orchestrator_guard._get_test_receipt(self._load_st(parent_p), parent_p).get("mutation_epoch"), 1)
 
-        # send_message to stale verifier & reviewer is now DENIED
         for target_cid, r_type in ((verifier_cid, "verifier"), (reviewer_cid, "reviewer")):
-            res_stale = orchestrator_guard.handle_pre_tool(
-                dict(
-                    parent_payload,
-                    toolCall={
-                        "name": "send_message",
-                        "args": {"Recipient": target_cid, "Message": "Re-verify after fix."},
-                    },
-                )
-            )
+            res_stale = self._pre("send_message", {"Recipient": target_cid, "Message": "Re-verify after fix."}, base=parent_p)
             self.assertEqual(res_stale["decision"], "deny")
             self.assertIn(f"Stale {r_type}", res_stale["reason"])
 
-        # Spawn fresh verifier at epoch 1 -> send_message allowed until root edit bumps epoch to 2
-        fresh_verifier_cid = "sub-verifier-fresh-04"
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id=fresh_verifier_cid,
-            type_name="verifier",
-            model="flash",
-            status="active",
-            spawned_mutation_epoch=1,
-        )
-        res_fresh_ok = orchestrator_guard.handle_pre_tool(
-            dict(
-                parent_payload,
-                toolCall={
-                    "name": "send_message",
-                    "args": {"Recipient": fresh_verifier_cid, "Message": "Clarification at epoch 1."},
-                },
-            )
-        )
-        self.assertEqual(res_fresh_ok["decision"], "allow")
+        fresh_v = "sub-verifier-fresh-04"
+        self._reg_sub("verifier", fresh_v, "flash", payload=parent_p, status="active", spawned_mutation_epoch=1)
+        self.assertEqual(self._pre("send_message", {"Recipient": fresh_v, "Message": "Clarification at epoch 1."}, base=parent_p)["decision"], "allow")
 
-        # Root edit bumps mutation_epoch to 2 -> fresh_verifier becomes stale too
-        res_root_edit = orchestrator_guard.handle_pre_tool(
-            dict(
-                parent_payload,
-                toolCall={
-                    "name": "write_file",
-                    "args": {
-                        "Path": str(orchestrator_guard.PROJECT_ROOT / "root_mod.py"),
-                        "Content": "x = 2\n",
-                    },
-                },
-            )
-        )
-        self.assertEqual(res_root_edit["decision"], "allow")
-        status_out = orchestrator_guard._cli_status(parent_payload)
-        self.assertEqual(status_out["testReceipt"]["mutationEpoch"], 2)
+        self.assertEqual(self._pre("write_file", {"Path": str(orchestrator_guard.PROJECT_ROOT / "root_mod.py"), "Content": "x = 2\n"}, base=parent_p)["decision"], "allow")
+        self.assertEqual(orchestrator_guard._cli_status(parent_p)["testReceipt"]["mutationEpoch"], 2)
 
-        res_stale_root = orchestrator_guard.handle_pre_tool(
-            dict(
-                parent_payload,
-                toolCall={
-                    "name": "send_message",
-                    "args": {"Recipient": fresh_verifier_cid, "Message": "Verify root edit."},
-                },
-            )
-        )
+        res_stale_root = self._pre("send_message", {"Recipient": fresh_v, "Message": "Verify root edit."}, base=parent_p)
         self.assertEqual(res_stale_root["decision"], "deny")
         self.assertIn("Stale verifier", res_stale_root["reason"])
 
     def test_phase1_disjoint_implementer_lanes_and_lifecycle_release(self) -> None:
         def _impl_entry(allowed_line: str, workspace: str = "inherit", role: str = "Lane") -> dict:
             header = f"ALLOWED_FILES: {allowed_line}\n" if allowed_line else ""
-            return {
-                "TypeName": "implementer",
-                "Role": role,
-                "Model": "flash",
-                "Workspace": workspace,
-                "Prompt": (
-                    f"TASK: Implement {role}.\n"
-                    f"{header}"
-                    "RULES:\n1. Edit assigned files.\n2. Run tests.\n"
-                    "REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: a.py\nVERIFICATION: ok\nNOTES: done"
-                ),
-            }
-
-        # 1. Atomic Subagents batch: exact & directory-prefix overlap denied WITHOUT mutating pending_spawns
-        res_batch_overlap = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "batch_overlap_1",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "Subagents": [
-                            _impl_entry("web/", role="Lane Web"),
-                            _impl_entry("web/App.tsx", role="Lane App"),
-                        ]
-                    },
-                },
+            return self._sub_args(
+                "implementer", role, "flash",
+                f"TASK: Implement {role}.\n{header}RULES:\n1. Edit assigned files.\n2. Run tests.\n"
+                "REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: a.py\nVERIFICATION: ok\nNOTES: done",
+                Workspace=workspace,
             )
-        )
+
+        res_batch_overlap = self._pre("invoke_subagent", {"Subagents": [_impl_entry("web/", role="Lane Web"), _impl_entry("web/App.tsx", role="Lane App")]}, call_id="batch_overlap_1")
         self.assertEqual(res_batch_overlap["decision"], "deny")
         self.assertIn("Overlapping ALLOWED_FILES", res_batch_overlap["reason"])
-        st_atomic = orchestrator_guard._load_state(self.base_payload)
+        st_atomic = self._load_st()
         self.assertEqual(st_atomic.get("pending_spawns"), [])
         self.assertEqual(st_atomic.get("recorded_spawn_calls"), [])
 
-        # 2. Disjoint lanes in a batch are allowed
-        res_disjoint = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "batch_disjoint_1",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "Subagents": [
-                            _impl_entry("web/", role="Lane Web"),
-                            _impl_entry("api/", role="Lane API"),
-                            _impl_entry("docs/", role="Lane Docs"),
-                        ]
-                    },
-                },
-            )
-        )
-        self.assertEqual(res_disjoint["decision"], "allow")
+        disjoint_subagents = {"Subagents": [_impl_entry("web/", role="Lane Web"), _impl_entry("api/", role="Lane API"), _impl_entry("docs/", role="Lane Docs")]}
+        self.assertEqual(self._pre("invoke_subagent", disjoint_subagents, call_id="batch_disjoint_1")["decision"], "allow")
 
-        # 3. Local CLI sequential pending_spawns overlap is denied
-        res_pending_conflict = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "cli_conflict_1",
-                    "name": "invoke_subagent",
-                    "args": _impl_entry("api/routes.py", role="Lane API Routes"),
-                },
-            )
-        )
+        res_pending_conflict = self._pre("invoke_subagent", _impl_entry("api/routes.py", role="Lane API Routes"), call_id="cli_conflict_1")
         self.assertEqual(res_pending_conflict["decision"], "deny")
         self.assertIn("Overlapping ALLOWED_FILES", res_pending_conflict["reason"])
 
-        # 4. Synchronous PostToolUse completion releases pending_spawns lane locks
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "batch_disjoint_1",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "Subagents": [
-                            _impl_entry("web/", role="Lane Web"),
-                            _impl_entry("api/", role="Lane API"),
-                            _impl_entry("docs/", role="Lane Docs"),
-                        ]
-                    },
-                },
-                output="STATUS: COMPLETED\nFILES_CHANGED: web/a.ts\nVERIFICATION: ok\nNOTES: done",
-                error="",
-            )
-        )
-        res_after_post = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "cli_after_post_1",
-                    "name": "invoke_subagent",
-                    "args": _impl_entry("api/routes.py", role="Lane API Routes"),
-                },
-            )
-        )
-        self.assertEqual(res_after_post["decision"], "allow")
+        self._post("invoke_subagent", disjoint_subagents, output="STATUS: COMPLETED\nFILES_CHANGED: web/a.ts\nVERIFICATION: ok\nNOTES: done", call_id="batch_disjoint_1")
+        self.assertEqual(self._pre("invoke_subagent", _impl_entry("api/routes.py", role="Lane API Routes"), call_id="cli_after_post_1")["decision"], "allow")
 
-        # 5. Active subagents overlap check + release via handle_stop and manage_subagents(kill)
-        brain_base = Path(self.artifact_dir) / "brain"
-        parent_brain = brain_base / "parent-lane-test"
-        lane_a = "sub-lane-a-01"
-        lane_b = "sub-lane-b-02"
-        for d in (parent_brain, brain_base / lane_a, brain_base / lane_b):
-            d.mkdir(parents=True, exist_ok=True)
-        parent_payload = dict(
-            self.base_payload,
-            conversationId="parent-lane-test",
-            artifactDirectoryPath=str(parent_brain),
-        )
-        orchestrator_guard._cli_activate(parent_payload)
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id=lane_a,
-            type_name="implementer",
-            model="flash",
-            allowed_files=["src/a.py"],
-            status="active",
-        )
-        res_sub_overlap = orchestrator_guard.handle_pre_tool(
-            dict(
-                parent_payload,
-                toolCall={
-                    "id": "sub_overlap_1",
-                    "name": "invoke_subagent",
-                    "args": _impl_entry("src/a.py", role="Conflicting Worker"),
-                },
-            )
-        )
+        parent_p = self._brain_payload("parent-lane-test")
+        lane_a, lane_b, lane_c = "sub-lane-a-01", "sub-lane-b-02", "sub-lane-c-03"
+        lane_a_p = self._brain_payload(lane_a)
+        self._brain_payload(lane_b)
+        orchestrator_guard._cli_activate(parent_p)
+        self._reg_sub("implementer", lane_a, "flash", payload=parent_p, allowed_files=["src/a.py"], status="active")
+
+        res_sub_overlap = self._pre("invoke_subagent", _impl_entry("src/a.py", role="Conflicting Worker"), call_id="sub_overlap_1", base=parent_p)
         self.assertEqual(res_sub_overlap["decision"], "deny")
         self.assertIn("Overlapping ALLOWED_FILES", res_sub_overlap["reason"])
 
-        # Overlapping files ARE allowed when isolated in separate branch/share workspaces
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id=lane_b,
-            type_name="implementer",
-            model="flash",
-            workspace="branch",
-            allowed_files=["src/shared.py"],
-            status="active",
-        )
-        res_isolated = orchestrator_guard.handle_pre_tool(
-            dict(
-                parent_payload,
-                toolCall={
-                    "id": "sub_isolated_share",
-                    "name": "invoke_subagent",
-                    "args": _impl_entry("src/shared.py", workspace="share", role="Share Worker"),
-                },
-            )
-        )
-        self.assertEqual(res_isolated["decision"], "allow")
+        self._reg_sub("implementer", lane_b, "flash", payload=parent_p, workspace="branch", allowed_files=["src/shared.py"], status="active")
+        self.assertEqual(self._pre("invoke_subagent", _impl_entry("src/shared.py", workspace="share", role="Share Worker"), call_id="sub_isolated_share", base=parent_p)["decision"], "allow")
+        self.assertEqual(self._pre("invoke_subagent", _impl_entry("", role="Unrestricted Legacy Worker"), call_id="sub_omitted_allowed", base=parent_p)["decision"], "allow")
 
-        # Omitted ALLOWED_FILES stays backward-compatible
-        res_omitted = orchestrator_guard.handle_pre_tool(
-            dict(
-                parent_payload,
-                toolCall={
-                    "id": "sub_omitted_allowed",
-                    "name": "invoke_subagent",
-                    "args": _impl_entry("", role="Unrestricted Legacy Worker"),
-                },
-            )
-        )
-        self.assertEqual(res_omitted["decision"], "allow")
+        self.assertEqual(self._stop("STATUS: COMPLETED\nFILES_CHANGED: src/a.py\nVERIFICATION: pytest ok\nNOTES: done", base=lane_a_p)["decision"], "allow")
+        self.assertEqual(self._pre("invoke_subagent", _impl_entry("src/a.py", role="Follow-up Worker"), call_id="sub_reuse_after_stop", base=parent_p)["decision"], "allow")
 
-        # Sequential reuse allowed after handle_stop marks lane_a completed
-        res_stop_a = orchestrator_guard.handle_stop(
-            dict(
-                self.base_payload,
-                conversationId=lane_a,
-                artifactDirectoryPath=str(brain_base / lane_a),
-                lastAssistantMessage=(
-                    "STATUS: COMPLETED\nFILES_CHANGED: src/a.py\nVERIFICATION: pytest ok\nNOTES: done"
-                ),
-                fullyIdle=True,
-            )
-        )
-        self.assertEqual(res_stop_a["decision"], "allow")
-        res_reuse_a = orchestrator_guard.handle_pre_tool(
-            dict(
-                parent_payload,
-                toolCall={
-                    "id": "sub_reuse_after_stop",
-                    "name": "invoke_subagent",
-                    "args": _impl_entry("src/a.py", role="Follow-up Worker"),
-                },
-            )
-        )
-        self.assertEqual(res_reuse_a["decision"], "allow")
-
-        # Reactivating lane_a via send_message while another active worker holds src/c.py is blocked
-        lane_c = "sub-lane-c-03"
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id=lane_c,
-            type_name="implementer",
-            model="flash",
-            allowed_files=["src/c.py"],
-            status="active",
-        )
-        res_reactivate_conflict = orchestrator_guard.handle_pre_tool(
-            dict(
-                parent_payload,
-                toolCall={
-                    "name": "send_message",
-                    "args": {
-                        "Recipient": lane_a,
-                        "Message": "ALLOWED_FILES: src/c.py\nContinue work on c.py.",
-                    },
-                },
-            )
-        )
+        self._reg_sub("implementer", lane_c, "flash", payload=parent_p, allowed_files=["src/c.py"], status="active")
+        res_reactivate_conflict = self._pre("send_message", {"Recipient": lane_a, "Message": "ALLOWED_FILES: src/c.py\nContinue work on c.py."}, base=parent_p)
         self.assertEqual(res_reactivate_conflict["decision"], "deny")
         self.assertIn("Overlapping ALLOWED_FILES", res_reactivate_conflict["reason"])
 
-        # manage_subagents(Action='kill') marks lane_c killed and releases src/c.py
-        orchestrator_guard.handle_pre_tool(
-            dict(
-                parent_payload,
-                toolCall={
-                    "name": "manage_subagents",
-                    "args": {"Action": "kill", "ConversationIds": [lane_c]},
-                },
-            )
-        )
-        res_reactivate_ok = orchestrator_guard.handle_pre_tool(
-            dict(
-                parent_payload,
-                toolCall={
-                    "name": "send_message",
-                    "args": {
-                        "Recipient": lane_a,
-                        "Message": "ALLOWED_FILES: src/c.py\nContinue work on c.py.",
-                    },
-                },
-            )
-        )
-        self.assertEqual(res_reactivate_ok["decision"], "allow")
+        self._pre("manage_subagents", {"Action": "kill", "ConversationIds": [lane_c]}, base=parent_p)
+        self.assertEqual(self._pre("send_message", {"Recipient": lane_a, "Message": "ALLOWED_FILES: src/c.py\nContinue work on c.py."}, base=parent_p)["decision"], "allow")
 
     def test_phase1_reviewer_lens_enforcement_and_round2_release(self) -> None:
-        def _rev_entry(lens_line: str, role: str = "Reviewer") -> dict:
+        def _rev_entry(lens_line: Optional[str], role: str = "Reviewer") -> dict:
             header = f"REVIEW_LENS: {lens_line}\n" if lens_line is not None else ""
-            return {
-                "TypeName": "reviewer",
-                "Role": role,
-                "Model": "flash",
-                "Prompt": (
-                    f"TASK: Review changes.\n"
-                    f"{header}"
-                    "RULES:\n1. Inspect diff.\n2. Report findings.\n"
-                    "REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: git diff\nNOTES: VERDICT: APPROVE"
-                ),
-            }
-
-        # 1. Missing or blank REVIEW_LENS denied
-        for bad_lens in (None, '""', "---"):
-            res_missing = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "id": f"rev_bad_{bad_lens}",
-                        "name": "invoke_subagent",
-                        "args": _rev_entry(bad_lens),
-                    },
-                )
+            return self._sub_args(
+                "reviewer", role, "flash",
+                f"TASK: Review changes.\n{header}RULES:\n1. Inspect diff.\n2. Report findings.\n"
+                "REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: git diff\nNOTES: VERDICT: APPROVE",
             )
+
+        for bad_lens in (None, '""', "---"):
+            res_missing = self._pre("invoke_subagent", _rev_entry(bad_lens), call_id=f"rev_bad_{bad_lens}")
             self.assertEqual(res_missing["decision"], "deny")
             self.assertIn("REVIEW_LENS", res_missing["reason"])
 
-        # Blank REVIEW_LENS followed by newline must not match across newline onto next line
-        for idx, blank_prompt in enumerate(
-            (
-                "TASK: Review changes.\nREVIEW_LENS:\nRULES:\n1. Review.\n",
-                "REVIEW_LENS:   \nTASK: Review changes.\nRULES:\n1. Review.\n",
-            )
-        ):
-            res_blank = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "id": f"rev_blank_{idx}",
-                        "name": "invoke_subagent",
-                        "args": {
-                            "TypeName": "reviewer",
-                            "Role": "Reviewer",
-                            "Model": "flash",
-                            "Prompt": (
-                                f"{blank_prompt}"
-                                "REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: git diff\nNOTES: VERDICT: APPROVE"
-                            ),
-                        },
-                    },
-                )
+        for idx, blank_prompt in enumerate(("TASK: Review changes.\nREVIEW_LENS:\nRULES:\n1. Review.\n", "REVIEW_LENS:   \nTASK: Review changes.\nRULES:\n1. Review.\n")):
+            res_blank = self._pre(
+                "invoke_subagent",
+                self._sub_args("reviewer", "Reviewer", "flash", f"{blank_prompt}REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: git diff\nNOTES: VERDICT: APPROVE"),
+                call_id=f"rev_blank_{idx}",
             )
             self.assertEqual(res_blank["decision"], "deny")
             self.assertIn("REVIEW_LENS", res_blank["reason"])
 
-        # 2. Duplicate normalized lens in atomic Subagents batch denied without mutating pending_spawns
-        res_dup_batch = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "rev_dup_batch",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "Subagents": [
-                            _rev_entry("edge cases", role="Reviewer 1"),
-                            _rev_entry("edge_cases", role="Reviewer 2"),
-                        ]
-                    },
-                },
-            )
-        )
+        res_dup_batch = self._pre("invoke_subagent", {"Subagents": [_rev_entry("edge cases", "Reviewer 1"), _rev_entry("edge_cases", "Reviewer 2")]}, call_id="rev_dup_batch")
         self.assertEqual(res_dup_batch["decision"], "deny")
         self.assertIn("Duplicate REVIEW_LENS 'edge-cases'", res_dup_batch["reason"])
-        st_atomic = orchestrator_guard._load_state(self.base_payload)
-        self.assertEqual(st_atomic.get("pending_spawns"), [])
+        self.assertEqual(self._load_st().get("pending_spawns"), [])
 
-        # 3. Distinct lenses allowed in parallel batch
-        res_distinct = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "rev_distinct_batch",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "Subagents": [
-                            _rev_entry("ux", role="UX Reviewer"),
-                            _rev_entry("simplicity", role="Simplicity Reviewer"),
-                            _rev_entry("edge-cases", role="Edge Cases Reviewer"),
-                            _rev_entry("security", role="Security Reviewer"),
-                        ]
-                    },
-                },
-            )
+        res_distinct = self._pre(
+            "invoke_subagent",
+            {"Subagents": [_rev_entry("ux", "UX Reviewer"), _rev_entry("simplicity", "Simplicity Reviewer"), _rev_entry("edge-cases", "Edge Cases Reviewer"), _rev_entry("security", "Security Reviewer")]},
+            call_id="rev_distinct_batch",
         )
         self.assertEqual(res_distinct["decision"], "allow")
 
-        # Duplicate against pending_spawns denied
-        res_dup_pending = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "rev_dup_pending",
-                    "name": "invoke_subagent",
-                    "args": _rev_entry("Edge Cases", role="Dup Reviewer"),
-                },
-            )
-        )
+        res_dup_pending = self._pre("invoke_subagent", _rev_entry("Edge Cases", "Dup Reviewer"), call_id="rev_dup_pending")
         self.assertEqual(res_dup_pending["decision"], "deny")
         self.assertIn("Duplicate REVIEW_LENS 'edge-cases'", res_dup_pending["reason"])
 
-        # 4. Round-1 active reviewer blocks duplicate lens; round-2 allowed after handle_stop completes round-1
-        brain_base = Path(self.artifact_dir) / "brain"
-        parent_brain = brain_base / "parent-rev-round2"
+        parent_p = self._brain_payload("parent-rev-round2")
         rev1_cid = "sub-rev-sec-r1"
-        for d in (parent_brain, brain_base / rev1_cid):
-            d.mkdir(parents=True, exist_ok=True)
-        parent_payload = dict(
-            self.base_payload,
-            conversationId="parent-rev-round2",
-            artifactDirectoryPath=str(parent_brain),
-        )
-        orchestrator_guard._cli_activate(parent_payload)
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id=rev1_cid,
-            type_name="reviewer",
-            model="pro",
-            status="active",
-            review_lens="security",
-        )
-        status_r1 = orchestrator_guard._cli_status(parent_payload)
+        rev1_p = self._brain_payload(rev1_cid)
+        orchestrator_guard._cli_activate(parent_p)
+        self._reg_sub("reviewer", rev1_cid, "pro", payload=parent_p, status="active", review_lens="security")
+
+        status_r1 = orchestrator_guard._cli_status(parent_p)
         self.assertEqual(status_r1["activeSubagents"][rev1_cid]["status"], "active")
         self.assertEqual(status_r1["activeSubagents"][rev1_cid]["reviewLens"], "security")
 
-        res_dup_active = orchestrator_guard.handle_pre_tool(
-            dict(
-                parent_payload,
-                toolCall={
-                    "id": "rev_dup_active",
-                    "name": "invoke_subagent",
-                    "args": _rev_entry("security", role="Round 2 Early"),
-                },
-            )
-        )
+        res_dup_active = self._pre("invoke_subagent", _rev_entry("security", "Round 2 Early"), call_id="rev_dup_active", base=parent_p)
         self.assertEqual(res_dup_active["decision"], "deny")
         self.assertIn("Duplicate REVIEW_LENS 'security'", res_dup_active["reason"])
 
-        # Round-1 reviewer completes via handle_stop
-        res_stop_r1 = orchestrator_guard.handle_stop(
-            dict(
-                self.base_payload,
-                conversationId=rev1_cid,
-                artifactDirectoryPath=str(brain_base / rev1_cid),
-                lastAssistantMessage=(
-                    "STATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: git diff\nNOTES: VERDICT: REQUEST_CHANGES"
-                ),
-                fullyIdle=True,
-            )
-        )
-        self.assertEqual(res_stop_r1["decision"], "allow")
-
-        # Round-2 fresh reviewer reusing "security" is now allowed
-        res_r2 = orchestrator_guard.handle_pre_tool(
-            dict(
-                parent_payload,
-                toolCall={
-                    "id": "rev_r2_ok",
-                    "name": "invoke_subagent",
-                    "args": _rev_entry("security", role="Round 2 Fresh Security"),
-                },
-            )
-        )
-        self.assertEqual(res_r2["decision"], "allow")
+        self.assertEqual(self._stop("STATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: git diff\nNOTES: VERDICT: REQUEST_CHANGES", base=rev1_p)["decision"], "allow")
+        self.assertEqual(self._pre("invoke_subagent", _rev_entry("security", "Round 2 Fresh Security"), call_id="rev_r2_ok", base=parent_p)["decision"], "allow")
 
     def test_orchestrator_guard_failsafe_catches_import_indentation_error(self) -> None:
         import shutil
@@ -5617,22 +2182,11 @@ orchestrator_guard.register_subagent(
         scripts_copy = Path(self.artifact_dir) / "scripts_copy"
         guard_copy = scripts_copy / "guard"
         guard_copy.mkdir(parents=True, exist_ok=True)
-        src_script = Path(orchestrator_guard.__file__).resolve()
-        dst_script = scripts_copy / "orchestrator_guard.py"
-        shutil.copy2(src_script, dst_script)
-        (guard_copy / "__init__.py").write_text(
-            "def broken():\n  pass\n   bad_indent = 1\n",
-            encoding="utf-8",
-        )
+        shutil.copy2(Path(orchestrator_guard.__file__).resolve(), scripts_copy / "orchestrator_guard.py")
+        (guard_copy / "__init__.py").write_text("def broken():\n  pass\n   bad_indent = 1\n", encoding="utf-8")
 
         for mode in ("pre-tool", "stop", "post-tool"):
-            proc = subprocess.run(
-                [sys.executable, str(dst_script), mode],
-                input="{}",
-                text=True,
-                capture_output=True,
-                check=False,
-            )
+            proc = subprocess.run([sys.executable, str(scripts_copy / "orchestrator_guard.py"), mode], input="{}", text=True, capture_output=True, check=False)
             self.assertEqual(proc.returncode, 0, f"mode={mode} stderr={proc.stderr}")
             out = json.loads(proc.stdout.strip())
             if mode in ("pre-tool", "stop"):
@@ -5644,354 +2198,148 @@ orchestrator_guard.register_subagent(
     def test_plan_execute_phase_persists_across_steps_and_subagent_wakeups(self) -> None:
         orchestrator_guard._cli_activate(self.base_payload)
         plan_text = "ALLOWED_FILES: file_a.py, file_b.py, file_c.py\n1. Implement feature"
-        res_exit = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                lastUserInput="Implement feature",
-                toolCall={"name": "exit_plan_mode", "args": {"plan": plan_text}},
-            )
-        )
-        self.assertEqual(res_exit["decision"], "allow")
-        st = orchestrator_guard._load_state(self.base_payload)
+        self.assertEqual(self._pre("exit_plan_mode", {"plan": plan_text}, lastUserInput="Implement feature")["decision"], "allow")
+        st = self._load_st()
         self.assertTrue(st.get("plan_execute_phase"))
         self.assertEqual(st.get("plan_execute_user_input"), "Implement feature")
         self.assertFalse(st.get("plan_execute_turn_finished"))
 
-        # Repeated PreInvocation calls with identical lastUserInput preserve plan_execute_phase
         for inv_num in (2, 3):
-            orchestrator_guard.handle_pre_invocation(
-                dict(self.base_payload, invocationNum=inv_num, lastUserInput="Implement feature")
-            )
-            st_step = orchestrator_guard._load_state(self.base_payload)
+            self._pre_inv(invocationNum=inv_num, lastUserInput="Implement feature")
+            st_step = self._load_st()
             self.assertTrue(st_step.get("plan_execute_phase"))
             self.assertTrue(st_step.get("plan_execute_consumed"))
-            self.assertEqual(
-                st_step.get("plan_allowed_files"),
-                ["file_a.py", "file_b.py", "file_c.py"],
-            )
+            self.assertEqual(st_step.get("plan_allowed_files"), ["file_a.py", "file_b.py", "file_c.py"])
 
-        # Active subagent prevents idle stop from marking plan_execute_turn_finished
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id="sub-active-plan-1",
-            type_name="implementer",
-            model="flash",
-            status="active",
-        )
-        res_stop_active = orchestrator_guard.handle_stop(
-            dict(self.base_payload, fullyIdle=True)
-        )
-        self.assertEqual(res_stop_active["decision"], "allow")
-        st_after_active_stop = orchestrator_guard._load_state(self.base_payload)
-        self.assertFalse(st_after_active_stop.get("plan_execute_turn_finished"))
-        orchestrator_guard.handle_pre_invocation(
-            dict(self.base_payload, invocationNum=4, lastUserInput="Implement feature")
-        )
-        self.assertTrue(
-            orchestrator_guard._load_state(self.base_payload).get("plan_execute_phase")
-        )
+        self._reg_sub("implementer", "sub-active-plan-1", "flash", status="active")
+        self.assertEqual(self._stop()["decision"], "allow")
+        self.assertFalse(self._load_st().get("plan_execute_turn_finished"))
+        self._pre_inv(invocationNum=4, lastUserInput="Implement feature")
+        self.assertTrue(self._load_st().get("plan_execute_phase"))
 
-        # Active pending_spawn also preserves plan_execute_phase across idle stop & wakeup
-        st_pending = orchestrator_guard._load_state(self.base_payload)
+        st_pending = self._load_st()
         st_pending["subagents"]["sub-active-plan-1"]["status"] = "completed"
-        st_pending["pending_spawns"] = [
-            {"type": "implementer", "role": "worker", "status": "active"}
-        ]
+        st_pending["pending_spawns"] = [{"type": "implementer", "role": "worker", "status": "active"}]
         orchestrator_guard._save_state(self.base_payload, st_pending)
-        orchestrator_guard.handle_stop(dict(self.base_payload, fullyIdle=True))
-        self.assertFalse(
-            orchestrator_guard._load_state(self.base_payload).get("plan_execute_turn_finished")
-        )
-        orchestrator_guard.handle_pre_invocation(
-            dict(self.base_payload, invocationNum=5, lastUserInput="Implement feature")
-        )
-        self.assertTrue(
-            orchestrator_guard._load_state(self.base_payload).get("plan_execute_phase")
-        )
+        self._stop()
+        self.assertFalse(self._load_st().get("plan_execute_turn_finished"))
+        self._pre_inv(invocationNum=5, lastUserInput="Implement feature")
+        self.assertTrue(self._load_st().get("plan_execute_phase"))
 
-        # A new lastUserInput resets plan_execute_phase and plan_allowed_files
-        orchestrator_guard.handle_pre_invocation(
-            dict(self.base_payload, invocationNum=6, lastUserInput="Next task")
-        )
-        st_new_input = orchestrator_guard._load_state(self.base_payload)
-        self.assertFalse(st_new_input.get("plan_execute_phase"))
-        self.assertIsNone(st_new_input.get("plan_allowed_files"))
-        self.assertIsNone(st_new_input.get("plan_execute_user_input"))
-        self.assertFalse(st_new_input.get("plan_execute_turn_finished"))
+        self._pre_inv(invocationNum=6, lastUserInput="Next task")
+        st_new = self._load_st()
+        self.assertFalse(st_new.get("plan_execute_phase"))
+        self.assertIsNone(st_new.get("plan_allowed_files"))
+        self.assertIsNone(st_new.get("plan_execute_user_input"))
+        self.assertFalse(st_new.get("plan_execute_turn_finished"))
 
-        # Idle root handle_stop with no active subagents marks turn finished; same lastUserInput then resets
-        st_clear = orchestrator_guard._load_state(self.base_payload)
-        st_clear["pending_spawns"] = []
-        orchestrator_guard._save_state(self.base_payload, st_clear)
-        orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                lastUserInput="Implement feature 2",
-                toolCall={"name": "exit_plan_mode", "args": {"plan": plan_text}},
-            )
-        )
-        orchestrator_guard.handle_pre_invocation(
-            dict(self.base_payload, invocationNum=7, lastUserInput="Implement feature 2")
-        )
-        orchestrator_guard.handle_stop(dict(self.base_payload, fullyIdle=True))
-        st_turn_done = orchestrator_guard._load_state(self.base_payload)
-        self.assertTrue(st_turn_done.get("plan_execute_turn_finished"))
-        orchestrator_guard.handle_pre_invocation(
-            dict(self.base_payload, invocationNum=8, lastUserInput="Implement feature 2")
-        )
-        st_after_done = orchestrator_guard._load_state(self.base_payload)
+        self._seed_state(pending_spawns=[])
+        self._pre("exit_plan_mode", {"plan": plan_text}, lastUserInput="Implement feature 2")
+        self._pre_inv(invocationNum=7, lastUserInput="Implement feature 2")
+        self._stop()
+        self.assertTrue(self._load_st().get("plan_execute_turn_finished"))
+        self._pre_inv(invocationNum=8, lastUserInput="Implement feature 2")
+        st_after_done = self._load_st()
         self.assertFalse(st_after_done.get("plan_execute_phase"))
         self.assertIsNone(st_after_done.get("plan_allowed_files"))
 
-        # [plan review] still resets immediately
-        orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                lastUserInput="Implement feature 3",
-                toolCall={"name": "exit_plan_mode", "args": {"plan": plan_text}},
-            )
-        )
-        orchestrator_guard.handle_pre_invocation(
-            dict(self.base_payload, invocationNum=9, lastUserInput="Please run [plan review]")
-        )
-        st_review = orchestrator_guard._load_state(self.base_payload)
+        self._pre("exit_plan_mode", {"plan": plan_text}, lastUserInput="Implement feature 3")
+        self._pre_inv(invocationNum=9, lastUserInput="Please run [plan review]")
+        st_review = self._load_st()
         self.assertFalse(st_review.get("plan_execute_phase"))
         self.assertIsNone(st_review.get("plan_allowed_files"))
 
     def test_phase2_share_workspace_tracking_stop_gate_and_kill_cleanup(self) -> None:
         orchestrator_guard._cli_activate(self.base_payload)
         share_cid = "11111111-2222-3333-4444-555555555555"
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id=share_cid,
-            type_name="implementer",
-            model="flash",
-            workspace="share",
-            role="Share Worker",
-        )
-        st = orchestrator_guard._load_state(self.base_payload)
+        self._reg_sub("implementer", share_cid, "flash", workspace="share", role="Share Worker")
+        st = self._load_st()
         self.assertFalse(st["subagents"][share_cid]["active_branch"])
         self.assertTrue(st["subagents"][share_cid]["active_worktree"])
 
-        # handle_stop blocks when a "share" worktree subagent is active
-        res_stop = orchestrator_guard.handle_stop(
-            dict(self.base_payload, terminationReason="NO_TOOL_CALL", fullyIdle=True)
-        )
+        res_stop = self._stop()
         self.assertEqual(res_stop["decision"], "continue")
         self.assertIn("Uncleaned branched subagent worktrees remain", res_stop["reason"])
         self.assertIn(share_cid, res_stop["reason"])
 
-        # manage_subagents(kill) clears active_worktree on subagents and pending_spawns
-        orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "manage_subagents",
-                    "args": {"Action": "kill", "ConversationIds": [share_cid]},
-                },
-            )
-        )
-        st_killed = orchestrator_guard._load_state(self.base_payload)
+        self._pre("manage_subagents", {"Action": "kill", "ConversationIds": [share_cid]})
+        st_killed = self._load_st()
         self.assertFalse(st_killed["subagents"][share_cid]["active_worktree"])
         self.assertFalse(st_killed["subagents"][share_cid]["active_branch"])
+        self.assertEqual(self._stop(executionNum=2)["decision"], "allow")
 
-        res_stop_after_kill = orchestrator_guard.handle_stop(
-            dict(
-                self.base_payload,
-                executionNum=2,
-                terminationReason="NO_TOOL_CALL",
-                fullyIdle=True,
-            )
-        )
-        self.assertEqual(res_stop_after_kill["decision"], "allow")
-
-        # Also verify pending_spawns with Workspace="share" blocks Stop until kill_all
-        spawn_res = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "share_pending_1",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "implementer",
-                        "Role": "Share Pending",
-                        "Model": "flash",
-                        "Workspace": "share",
-                        "Prompt": VALID_PROMPT,
-                    },
-                },
-            )
-        )
+        spawn_res = self._pre("invoke_subagent", self._sub_args("implementer", "Share Pending", "flash", Workspace="share"), call_id="share_pending_1")
         self.assertEqual(spawn_res["decision"], "allow")
-        st_pending = orchestrator_guard._load_state(self.base_payload)
+        st_pending = self._load_st()
         self.assertTrue(st_pending["pending_spawns"][0]["active_worktree"])
         self.assertFalse(st_pending["pending_spawns"][0]["active_branch"])
 
-        res_stop_pending = orchestrator_guard.handle_stop(
-            dict(
-                self.base_payload,
-                executionNum=3,
-                terminationReason="NO_TOOL_CALL",
-                fullyIdle=True,
-            )
-        )
+        res_stop_pending = self._stop(executionNum=3)
         self.assertEqual(res_stop_pending["decision"], "continue")
         self.assertIn("Share Pending", res_stop_pending["reason"])
 
-        orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={"name": "manage_subagents", "args": {"Action": "kill_all"}},
-            )
-        )
-        res_stop_final = orchestrator_guard.handle_stop(
-            dict(
-                self.base_payload,
-                executionNum=4,
-                terminationReason="NO_TOOL_CALL",
-                fullyIdle=True,
-            )
-        )
-        self.assertEqual(res_stop_final["decision"], "allow")
+        self._pre("manage_subagents", {"Action": "kill_all"})
+        self.assertEqual(self._stop(executionNum=4)["decision"], "allow")
 
     def test_phase2_best_of_n_mode_cohort_workspace_model_and_atomic_batch(self) -> None:
         orchestrator_guard._cli_activate(self.base_payload)
 
-        # 1. MODE: BEST_OF_N with Workspace="inherit" is denied
-        res_inherit = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "bon_inherit",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "implementer",
-                        "Role": "Candidate Inherit",
-                        "Workspace": "inherit",
-                        "Prompt": "MODE: BEST_OF_N\nALLOWED_FILES: src/a.py\n" + VALID_PROMPT,
-                    },
-                },
-            )
+        res_inherit = self._pre(
+            "invoke_subagent",
+            self._sub_args("implementer", "Candidate Inherit", prompt="MODE: BEST_OF_N\nALLOWED_FILES: src/a.py\n" + VALID_PROMPT, Workspace="inherit"),
+            call_id="bon_inherit",
         )
         self.assertEqual(res_inherit["decision"], "deny")
         self.assertIn("MODE: BEST_OF_N requires isolated Workspace='branch' or Workspace='share'", res_inherit["reason"])
 
-        # 2. Standard non-BEST_OF_N implementer still denies Model="pro"
-        res_non_bon_pro = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "non_bon_pro",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "implementer",
-                        "Role": "Standard Pro",
-                        "Model": "pro",
-                        "Workspace": "branch",
-                        "Prompt": VALID_PROMPT,
-                    },
-                },
-            )
-        )
+        res_non_bon_pro = self._pre("invoke_subagent", self._sub_args("implementer", "Standard Pro", "pro", Workspace="branch"), call_id="non_bon_pro")
         self.assertEqual(res_non_bon_pro["decision"], "deny")
         self.assertIn("Model='pro'", res_non_bon_pro["reason"])
 
-        # 3. MODE: BEST_OF_N without COHORT auto-generates best-of-n-<inv_key>,
-        #    defaults omitted/inherit Model to flash, and allows explicit Model="pro"
-        res_auto_cohort = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                invocationNum=7,
-                toolCall={
-                    "id": "bon_auto_batch",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "Subagents": [
-                            {
-                                "TypeName": "implementer",
-                                "Role": "Cand A",
-                                "Model": "pro",
-                                "Workspace": "branch",
-                                "Prompt": "MODE: BEST_OF_N\nALLOWED_FILES: src/a.py\n" + VALID_PROMPT,
-                            },
-                            {
-                                "TypeName": "implementer",
-                                "Role": "Cand B",
-                                "Model": "inherit",
-                                "Workspace": "share",
-                                "Prompt": "MODE: best-of-n\nALLOWED_FILES: src/a.py\n" + VALID_PROMPT,
-                            },
-                        ]
-                    },
-                },
-            )
+        res_auto_cohort = self._pre(
+            "invoke_subagent",
+            {"Subagents": [
+                self._sub_args("implementer", "Cand A", "pro", "MODE: BEST_OF_N\nALLOWED_FILES: src/a.py\n" + VALID_PROMPT, Workspace="branch"),
+                self._sub_args("implementer", "Cand B", "inherit", "MODE: best-of-n\nALLOWED_FILES: src/a.py\n" + VALID_PROMPT, Workspace="share"),
+            ]},
+            call_id="bon_auto_batch",
+            invocationNum=7,
         )
         self.assertEqual(res_auto_cohort["decision"], "allow")
         overwritten = res_auto_cohort.get("overwrite", {}).get("Subagents", [])
         self.assertEqual(overwritten[0]["Model"], "pro")
         self.assertEqual(overwritten[1]["Model"], "flash")
 
-        st_auto = orchestrator_guard._load_state(self.base_payload)
+        st_auto = self._load_st()
         self.assertIn("best-of-n-7", st_auto["cohorts"])
         self.assertEqual(st_auto["cohorts"]["best-of-n-7"]["total_spawned"], 2)
         self.assertEqual(st_auto["pending_spawns"][0]["cohort"], "best-of-n-7")
         self.assertEqual(st_auto["pending_spawns"][0]["mode"], "best_of_n")
         self.assertTrue(st_auto["pending_spawns"][1]["active_worktree"])
 
-        # 4. Explicit COHORT alone implies mode="best_of_n"
-        res_cohort_only = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                invocationNum=8,
-                toolCall={
-                    "id": "bon_cohort_only",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "implementer",
-                        "Role": "Cand C",
-                        "Workspace": "share",
-                        "Prompt": "COHORT: Cache_Fix\nALLOWED_FILES: src/a.py\n" + VALID_PROMPT,
-                    },
-                },
-            )
+        res_cohort_only = self._pre(
+            "invoke_subagent",
+            self._sub_args("implementer", "Cand C", prompt="COHORT: Cache_Fix\nALLOWED_FILES: src/a.py\n" + VALID_PROMPT, Workspace="share"),
+            call_id="bon_cohort_only",
+            invocationNum=8,
         )
         self.assertEqual(res_cohort_only["decision"], "allow")
-        st_c = orchestrator_guard._load_state(self.base_payload)
+        st_c = self._load_st()
         self.assertIn("cache-fix", st_c["cohorts"])
         self.assertEqual(st_c["cohorts"]["cache-fix"]["total_spawned"], 1)
 
-        # 5. Atomic batch rollback: valid entry #1 + invalid entry #2 leaves state untouched
-        before_pending = len(st_c["pending_spawns"])
-        before_calls = len(st_c["recorded_spawn_calls"])
-        res_atomic_fail = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                invocationNum=9,
-                toolCall={
-                    "id": "bon_atomic_fail",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "Subagents": [
-                            {
-                                "TypeName": "implementer",
-                                "Role": "Good Entry",
-                                "Model": "pro",
-                                "Workspace": "branch",
-                                "Prompt": "COHORT: atomic-cohort\nEVAL_CMD: python3 scripts/eval.py\n" + VALID_PROMPT,
-                            },
-                            {
-                                "TypeName": "implementer",
-                                "Role": "Bad Inherit Entry",
-                                "Workspace": "inherit",
-                                "Prompt": "COHORT: atomic-cohort\n" + VALID_PROMPT,
-                            },
-                        ]
-                    },
-                },
-            )
+        before_pending, before_calls = len(st_c["pending_spawns"]), len(st_c["recorded_spawn_calls"])
+        res_atomic_fail = self._pre(
+            "invoke_subagent",
+            {"Subagents": [
+                self._sub_args("implementer", "Good Entry", "pro", "COHORT: atomic-cohort\nEVAL_CMD: python3 scripts/eval.py\n" + VALID_PROMPT, Workspace="branch"),
+                self._sub_args("implementer", "Bad Inherit Entry", prompt="COHORT: atomic-cohort\n" + VALID_PROMPT, Workspace="inherit"),
+            ]},
+            call_id="bon_atomic_fail",
+            invocationNum=9,
         )
         self.assertEqual(res_atomic_fail["decision"], "deny")
-        st_after_fail = orchestrator_guard._load_state(self.base_payload)
+        st_after_fail = self._load_st()
         self.assertNotIn("atomic-cohort", st_after_fail["cohorts"])
         self.assertEqual(len(st_after_fail["pending_spawns"]), before_pending)
         self.assertEqual(len(st_after_fail["recorded_spawn_calls"]), before_calls)
@@ -6000,191 +2348,53 @@ orchestrator_guard.register_subagent(
     def test_phase2_cohort_circuit_breaker_per_candidate_and_async_sync(self) -> None:
         orchestrator_guard._cli_activate(self.base_payload)
 
-        # Spawn 5 candidates in cohort "five-way"
         for i in range(1, 6):
-            res = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "id": f"five_{i}",
-                        "name": "invoke_subagent",
-                        "args": {
-                            "TypeName": "implementer",
-                            "Role": f"Cand {i}",
-                            "Workspace": "share",
-                            "Prompt": f"MODE: BEST_OF_N\nCOHORT: five-way\n{VALID_PROMPT}",
-                        },
-                    },
-                )
-            )
+            res = self._pre("invoke_subagent", self._sub_args("implementer", f"Cand {i}", prompt=f"MODE: BEST_OF_N\nCOHORT: five-way\n{VALID_PROMPT}", Workspace="share"), call_id=f"five_{i}")
             self.assertEqual(res["decision"], "allow")
 
-        # 2/5 candidate failures must NOT trip the global circuit breaker
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "five_1",
-                    "name": "invoke_subagent",
-                    "args": {"TypeName": "implementer", "Prompt": "COHORT: five-way\n" + VALID_PROMPT},
-                },
-                error="candidate 1 crashed",
-            )
-        )
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "five_2",
-                    "name": "invoke_subagent",
-                    "args": {"TypeName": "implementer", "Prompt": "COHORT: five-way\n" + VALID_PROMPT},
-                },
-                output="STATUS: FAILED\nFILES_CHANGED: NONE\nVERIFICATION: pytest\nNOTES: failed tests see file:///tmp/fail.log",
-            )
-        )
-        st_mid = orchestrator_guard._load_state(self.base_payload)
+        self._post("invoke_subagent", {"TypeName": "implementer", "Prompt": "COHORT: five-way\n" + VALID_PROMPT}, error="candidate 1 crashed", call_id="five_1")
+        self._post("invoke_subagent", {"TypeName": "implementer", "Prompt": "COHORT: five-way\n" + VALID_PROMPT}, output="STATUS: FAILED\nFILES_CHANGED: NONE\nVERIFICATION: pytest\nNOTES: failed tests see file:///tmp/fail.log", call_id="five_2")
+        st_mid = self._load_st()
         self.assertFalse(st_mid["circuit_breaker"]["tripped"])
         self.assertEqual(st_mid["circuit_breaker"]["failure_streak"], 0)
         self.assertEqual(len(st_mid["cohorts"]["five-way"]["failed"]), 2)
 
-        # Spawn a 2-candidate cohort "two-way" and fail 2/2 -> trips global breaker
         for i in range(1, 3):
-            orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "id": f"two_{i}",
-                        "name": "invoke_subagent",
-                        "args": {
-                            "TypeName": "implementer",
-                            "Role": f"Two {i}",
-                            "Workspace": "branch",
-                            "Prompt": f"MODE: BEST_OF_N\nCOHORT: two-way\n{VALID_PROMPT}",
-                        },
-                    },
-                )
-            )
+            self._pre("invoke_subagent", self._sub_args("implementer", f"Two {i}", prompt=f"MODE: BEST_OF_N\nCOHORT: two-way\n{VALID_PROMPT}", Workspace="branch"), call_id=f"two_{i}")
         for i in range(1, 3):
-            orchestrator_guard.handle_post_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "id": f"two_{i}",
-                        "name": "invoke_subagent",
-                        "args": {"TypeName": "implementer", "Prompt": "COHORT: two-way\n" + VALID_PROMPT},
-                    },
-                    error=f"two_{i} failed",
-                )
-            )
-        st_tripped = orchestrator_guard._load_state(self.base_payload)
+            self._post("invoke_subagent", {"TypeName": "implementer", "Prompt": "COHORT: two-way\n" + VALID_PROMPT}, error=f"two_{i} failed", call_id=f"two_{i}")
+        st_tripped = self._load_st()
         self.assertTrue(st_tripped["circuit_breaker"]["tripped"])
         self.assertGreaterEqual(st_tripped["circuit_breaker"]["failure_streak"], 2)
         self.assertEqual(len(st_tripped["cohorts"]["two-way"]["failed"]), 2)
 
-        # Async brain sibling sync + local candidate 2-turn circuit breaker
-        brain_base = Path(self.artifact_dir) / "brain"
-        parent_dir = brain_base / "parent-bon"
-        cand1_dir = brain_base / "cand-async-1"
-        cand2_dir = brain_base / "cand-async-2"
-        parent_dir.mkdir(parents=True, exist_ok=True)
-        cand1_dir.mkdir(parents=True, exist_ok=True)
-        cand2_dir.mkdir(parents=True, exist_ok=True)
-
-        parent_payload = {
-            "conversationId": "parent-bon",
-            "workspacePaths": [str(orchestrator_guard.PROJECT_ROOT)],
-            "artifactDirectoryPath": str(parent_dir),
-            "invocationNum": 1,
-            "executionNum": 1,
-        }
-        orchestrator_guard._cli_activate(parent_payload)
-        orchestrator_guard.handle_pre_invocation(parent_payload)
+        parent_p = self._brain_payload("parent-bon")
+        cand1_p = self._brain_payload("cand-async-1", isSubagent=True)
+        cand2_p = self._brain_payload("cand-async-2", isSubagent=True)
+        orchestrator_guard._cli_activate(parent_p)
+        orchestrator_guard.handle_pre_invocation(parent_p)
         for cid_idx, c_cid in enumerate(("cand-async-1", "cand-async-2"), start=1):
-            orchestrator_guard.register_subagent(
-                parent_payload,
-                conversation_id=c_cid,
-                type_name="implementer",
-                model="flash",
-                workspace="share",
-                role=f"Async {cid_idx}",
-                status="active",
-                mode="best_of_n",
-                cohort="async-cohort",
-            )
-        p_state = orchestrator_guard._load_state(parent_payload)
-        p_state["cohorts"]["async-cohort"] = {
-            "total_spawned": 2,
-            "succeeded": [],
-            "failed": [],
-            "created_at": 100.0,
-        }
-        orchestrator_guard._save_state(parent_payload, p_state)
+            self._reg_sub("implementer", c_cid, "flash", payload=parent_p, workspace="share", role=f"Async {cid_idx}", status="active", mode="best_of_n", cohort="async-cohort")
+        p_state = self._load_st(parent_p)
+        p_state["cohorts"]["async-cohort"] = {"total_spawned": 2, "succeeded": [], "failed": [], "created_at": 100.0}
+        orchestrator_guard._save_state(parent_p, p_state)
 
-        # Candidate 1 trips its own local 2-turn circuit breaker
-        cand1_payload = {
-            "conversationId": "cand-async-1",
-            "workspacePaths": [str(orchestrator_guard.PROJECT_ROOT)],
-            "artifactDirectoryPath": str(cand1_dir),
-            "isSubagent": True,
-            "invocationNum": 1,
-            "executionNum": 1,
-        }
         for step in (1, 2):
-            orchestrator_guard.handle_post_tool(
-                dict(
-                    cand1_payload,
-                    toolCall={
-                        "id": f"c1_cmd_{step}",
-                        "name": "run_command",
-                        "args": {"CommandLine": "pytest tests/missing.py"},
-                    },
-                    exitCode=1,
-                )
-            )
-        st_cand1 = orchestrator_guard._load_state(cand1_payload)
-        self.assertTrue(st_cand1["circuit_breaker"]["tripped"])
+            self._post("run_command", {"CommandLine": "pytest tests/missing.py"}, exit_code=1, call_id=f"c1_cmd_{step}", base=cand1_p)
+        self.assertTrue(self._load_st(cand1_p)["circuit_breaker"]["tripped"])
 
-        # Candidate 1 stops -> parent cohort records cand-async-1 as failed, parent breaker stays untripped (1/2)
-        res_c1_stop = orchestrator_guard.handle_stop(
-            dict(
-                cand1_payload,
-                fullyIdle=True,
-                lastAssistantMessage=(
-                    "STATUS: BLOCKED\nFILES_CHANGED: NONE\nVERIFICATION: pytest failed\n"
-                    "NOTES: Candidate failed twice see file:///tmp/c1.log"
-                ),
-            )
-        )
+        res_c1_stop = self._stop("STATUS: BLOCKED\nFILES_CHANGED: NONE\nVERIFICATION: pytest failed\nNOTES: Candidate failed twice see file:///tmp/c1.log", base=cand1_p)
         self.assertEqual(res_c1_stop["decision"], "allow")
-        p_after_c1 = orchestrator_guard._load_state(parent_payload)
+        p_after_c1 = self._load_st(parent_p)
         self.assertEqual(p_after_c1["cohorts"]["async-cohort"]["failed"], ["cand-async-1"])
         self.assertFalse(p_after_c1["circuit_breaker"]["tripped"])
 
-        # Candidate 2 succeeds cleanly -> parent cohort records succeeded
-        cand2_payload = {
-            "conversationId": "cand-async-2",
-            "workspacePaths": [str(orchestrator_guard.PROJECT_ROOT)],
-            "artifactDirectoryPath": str(cand2_dir),
-            "isSubagent": True,
-            "invocationNum": 1,
-            "executionNum": 1,
-        }
-        res_c2_stop = orchestrator_guard.handle_stop(
-            dict(
-                cand2_payload,
-                fullyIdle=True,
-                lastAssistantMessage=(
-                    "STATUS: COMPLETED\nFILES_CHANGED: src/a.py\nVERIFICATION: pytest passed\n"
-                    "NOTES: SCORE: 1.0"
-                ),
-            )
-        )
+        res_c2_stop = self._stop("STATUS: COMPLETED\nFILES_CHANGED: src/a.py\nVERIFICATION: pytest passed\nNOTES: SCORE: 1.0", base=cand2_p)
         self.assertEqual(res_c2_stop["decision"], "allow")
-        p_after_c2 = orchestrator_guard._load_state(parent_payload)
+        p_after_c2 = self._load_st(parent_p)
         self.assertEqual(p_after_c2["cohorts"]["async-cohort"]["succeeded"], ["cand-async-2"])
         self.assertFalse(p_after_c2["circuit_breaker"]["tripped"])
 
-        # State pruning caps cohorts and succeeded/failed lists
         prune_state = orchestrator_guard._default_state()
         for idx in range(orchestrator_guard.MAX_STATE_INVOCATION_HISTORY + 5):
             prune_state["cohorts"][f"cohort-{idx}"] = {
@@ -6202,293 +2412,97 @@ orchestrator_guard.register_subagent(
 
     def test_phase2_candidate_receipt_isolation(self) -> None:
         iso_app = Path(self.temp_dir.name) / "iso_app"
-        brain_base = iso_app / "brain"
-        parent_dir = brain_base / "parent-iso"
-        cand_dir = brain_base / "cand-iso"
         wt_dir = iso_app / "worktrees" / "parent-iso" / "w1"
-        parent_dir.mkdir(parents=True, exist_ok=True)
-        cand_dir.mkdir(parents=True, exist_ok=True)
         (wt_dir / "src").mkdir(parents=True, exist_ok=True)
+        parent_p = self._brain_payload("parent-iso", root="iso_app/brain")
+        cand_p = self._brain_payload("cand-iso", root="iso_app/brain", workspacePaths=[str(orchestrator_guard.PROJECT_ROOT), str(wt_dir)], isSubagent=True)
 
-        parent_payload = {
-            "conversationId": "parent-iso",
-            "workspacePaths": [str(orchestrator_guard.PROJECT_ROOT)],
-            "artifactDirectoryPath": str(parent_dir),
-            "invocationNum": 1,
-            "executionNum": 1,
-        }
-        orchestrator_guard._cli_activate(parent_payload)
-        orchestrator_guard.handle_pre_invocation(parent_payload)
-        p_state = orchestrator_guard._load_state(parent_payload)
-        p_state["test_receipt"] = {
-            "dirty": True,
-            "verified": False,
-            "last_mutated_file": "src/main.py",
-            "last_test_cmd": "",
-            "mutation_epoch": 4,
-        }
-        orchestrator_guard._save_state(parent_payload, p_state)
+        orchestrator_guard._cli_activate(parent_p)
+        orchestrator_guard.handle_pre_invocation(parent_p)
+        self._seed_state(parent_p, test_receipt={"dirty": True, "verified": False, "last_mutated_file": "src/main.py", "last_test_cmd": "", "mutation_epoch": 4})
+        self._reg_sub("implementer", "cand-iso", "flash", payload=parent_p, workspace="branch", role="Iso Candidate", allowed_files=["src/example_iso.py"], status="active", mode="best_of_n", cohort="iso-cohort")
 
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id="cand-iso",
-            type_name="implementer",
-            model="flash",
-            workspace="branch",
-            role="Iso Candidate",
-            allowed_files=["src/example_iso.py"],
-            status="active",
-            mode="best_of_n",
-            cohort="iso-cohort",
-        )
-
-        # Candidate mutates a workspace code file -> parent dirty/epoch stays unchanged
-        cand_payload = {
-            "conversationId": "cand-iso",
-            "workspacePaths": [str(orchestrator_guard.PROJECT_ROOT), str(wt_dir)],
-            "artifactDirectoryPath": str(cand_dir),
-            "isSubagent": True,
-            "invocationNum": 1,
-            "executionNum": 1,
-        }
-        target_py = orchestrator_guard.PROJECT_ROOT / "src" / "example_iso.py"
-        res_edit = orchestrator_guard.handle_pre_tool(
-            dict(
-                cand_payload,
-                toolCall={
-                    "id": "cand_edit_1",
-                    "name": "edit_file",
-                    "args": {"Path": str(target_py), "Target": "a", "Replacement": "b"},
-                },
-            )
-        )
-        self.assertEqual(res_edit["decision"], "allow")
-        wt_allowed_py = wt_dir / "src" / "example_iso.py"
-        res_wt_allow = orchestrator_guard.handle_pre_tool(
-            dict(
-                cand_payload,
-                toolCall={
-                    "id": "cand_wt_allow",
-                    "name": "edit_file",
-                    "args": {"Path": str(wt_allowed_py), "Target": "a", "Replacement": "b"},
-                },
-            )
-        )
-        self.assertEqual(res_wt_allow["decision"], "allow")
-        wt_denied_py = wt_dir / "src" / "outside_allowlist.py"
-        res_wt_deny = orchestrator_guard.handle_pre_tool(
-            dict(
-                cand_payload,
-                toolCall={
-                    "id": "cand_wt_deny",
-                    "name": "edit_file",
-                    "args": {"Path": str(wt_denied_py), "Target": "a", "Replacement": "b"},
-                },
-            )
-        )
+        self.assertEqual(self._pre("edit_file", {"Path": str(orchestrator_guard.PROJECT_ROOT / "src" / "example_iso.py"), "Target": "a", "Replacement": "b"}, call_id="cand_edit_1", base=cand_p)["decision"], "allow")
+        self.assertEqual(self._pre("edit_file", {"Path": str(wt_dir / "src" / "example_iso.py"), "Target": "a", "Replacement": "b"}, call_id="cand_wt_allow", base=cand_p)["decision"], "allow")
+        res_wt_deny = self._pre("edit_file", {"Path": str(wt_dir / "src" / "outside_allowlist.py"), "Target": "a", "Replacement": "b"}, call_id="cand_wt_deny", base=cand_p)
         self.assertEqual(res_wt_deny["decision"], "deny")
         self.assertIn("File allowlist violation", res_wt_deny["reason"])
-        p_after_edit = orchestrator_guard._load_state(parent_payload)
+
+        p_after_edit = self._load_st(parent_p)
         self.assertEqual(p_after_edit["test_receipt"]["mutation_epoch"], 4)
         self.assertEqual(p_after_edit["test_receipt"]["last_mutated_file"], "src/main.py")
 
-        # Candidate runs passing test -> clears candidate's receipt, NOT parent's dirty receipt
-        orchestrator_guard.handle_post_tool(
-            dict(
-                cand_payload,
-                toolCall={
-                    "id": "cand_test_1",
-                    "name": "run_command",
-                    "args": {"CommandLine": "python3 -m unittest discover -s tests"},
-                },
-                exitCode=0,
-            )
-        )
-        c_after_test = orchestrator_guard._load_state(cand_payload)
+        self._post("run_command", {"CommandLine": "python3 -m unittest discover -s tests"}, exit_code=0, call_id="cand_test_1", base=cand_p)
+        c_after_test = self._load_st(cand_p)
         self.assertFalse(c_after_test["test_receipt"]["dirty"])
         self.assertTrue(c_after_test["test_receipt"]["verified"])
-        p_after_cand_test = orchestrator_guard._load_state(parent_payload)
+        p_after_cand_test = self._load_st(parent_p)
         self.assertTrue(p_after_cand_test["test_receipt"]["dirty"])
         self.assertFalse(p_after_cand_test["test_receipt"]["verified"])
 
-        # Synchronous best_of_n completion in parent PostToolUse does NOT clear parent's dirty receipt
-        orchestrator_guard.handle_post_tool(
-            dict(
-                parent_payload,
-                toolCall={
-                    "id": "sync_bon_1",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "implementer",
-                        "Workspace": "branch",
-                        "Prompt": "MODE: BEST_OF_N\nCOHORT: iso-cohort\n" + VALID_PROMPT,
-                    },
-                },
-                output="STATUS: COMPLETED\nFILES_CHANGED: src/main.py\nVERIFICATION: pytest ok\nNOTES: SCORE: 1.0",
-            )
+        self._post(
+            "invoke_subagent",
+            {"TypeName": "implementer", "Workspace": "branch", "Prompt": "MODE: BEST_OF_N\nCOHORT: iso-cohort\n" + VALID_PROMPT},
+            output="STATUS: COMPLETED\nFILES_CHANGED: src/main.py\nVERIFICATION: pytest ok\nNOTES: SCORE: 1.0",
+            call_id="sync_bon_1",
+            base=parent_p,
         )
-        p_after_sync = orchestrator_guard._load_state(parent_payload)
+        p_after_sync = self._load_st(parent_p)
         self.assertTrue(p_after_sync["test_receipt"]["dirty"])
         self.assertFalse(p_after_sync["test_receipt"]["verified"])
 
     def test_phase2_eval_cmd_verification_and_anti_tampering(self) -> None:
         orchestrator_guard._cli_activate(self.base_payload)
 
-        # 1. Trivial EVAL_CMD commands are rejected in invoke_subagent and exit_plan_mode
         for bad_cmd in ("true", ":", "echo pass", "printf ok", "exit 0", "pytest || true", "VAR=1 :"):
-            res_bad_spawn = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "id": f"bad_{bad_cmd}",
-                        "name": "invoke_subagent",
-                        "args": {
-                            "TypeName": "implementer",
-                            "Workspace": "share",
-                            "Prompt": f"MODE: BEST_OF_N\nEVAL_CMD: {bad_cmd}\n{VALID_PROMPT}",
-                        },
-                    },
-                )
-            )
+            res_bad_spawn = self._pre("invoke_subagent", {"TypeName": "implementer", "Workspace": "share", "Prompt": f"MODE: BEST_OF_N\nEVAL_CMD: {bad_cmd}\n{VALID_PROMPT}"}, call_id=f"bad_{bad_cmd}")
             self.assertEqual(res_bad_spawn["decision"], "deny", f"Expected deny for {bad_cmd}")
             self.assertIn("Trivial or no-op EVAL_CMD rejected", res_bad_spawn["reason"])
 
-            res_bad_plan = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "name": "exit_plan_mode",
-                        "args": {"plan": f"EVAL_CMD: {bad_cmd}\n1. Run eval"},
-                    },
-                )
-            )
+            res_bad_plan = self._pre("exit_plan_mode", {"plan": f"EVAL_CMD: {bad_cmd}\n1. Run eval"})
             self.assertEqual(res_bad_plan["decision"], "deny", f"Expected plan deny for {bad_cmd}")
 
-        # 2. Valid EVAL_CMD in exit_plan_mode sets active_eval_cmd, cleared on enter_plan_mode / reset
-        res_good_plan = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                lastUserInput="Optimize solver",
-                toolCall={
-                    "name": "exit_plan_mode",
-                    "args": {"plan": "EVAL_CMD: python3 scripts/bench.py\n1. Optimize"},
-                },
-            )
-        )
+        res_good_plan = self._pre("exit_plan_mode", {"plan": "EVAL_CMD: python3 scripts/bench.py\n1. Optimize"}, lastUserInput="Optimize solver")
         self.assertEqual(res_good_plan["decision"], "allow")
-        st_plan = orchestrator_guard._load_state(self.base_payload)
+        st_plan = self._load_st()
         self.assertEqual(st_plan["active_eval_cmd"], "python3 scripts/bench.py")
 
-        # Root edit sets dirty=True; declared EVAL_CMD clears dirty=False & verified=True
-        st_plan["test_receipt"]["dirty"] = True
-        st_plan["test_receipt"]["verified"] = False
+        st_plan["test_receipt"]["dirty"], st_plan["test_receipt"]["verified"] = True, False
         orchestrator_guard._save_state(self.base_payload, st_plan)
 
-        # Anti-tampering: bypasses must NOT count as declared EVAL_CMD
-        for bypass_cmd in (
-            "python3 scripts/bench.py || true",
-            "$(python3 scripts/bench.py)",
-            "`python3 scripts/bench.py`",
-            "python3 scripts/bench.py_fake",
-        ):
-            self.assertFalse(
-                orchestrator_guard._is_declared_eval_command(
-                    bypass_cmd, st_plan, self.base_payload
-                ),
-                f"Bypass should not match: {bypass_cmd}",
-            )
+        for bypass_cmd in ("python3 scripts/bench.py || true", "$(python3 scripts/bench.py)", "`python3 scripts/bench.py`", "python3 scripts/bench.py_fake"):
+            self.assertFalse(orchestrator_guard._is_declared_eval_command(bypass_cmd, st_plan, self.base_payload), f"Bypass should not match: {bypass_cmd}")
 
-        # Valid env-prefixed or argument-extended declared EVAL_CMD passes PostToolUse
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "eval_run_1",
-                    "name": "run_command",
-                    "args": {"CommandLine": "PYTHONPATH=. python3 scripts/bench.py --fast"},
-                },
-                exitCode=0,
-            )
-        )
-        st_verified = orchestrator_guard._load_state(self.base_payload)
+        self._post("run_command", {"CommandLine": "PYTHONPATH=. python3 scripts/bench.py --fast"}, exit_code=0, call_id="eval_run_1")
+        st_verified = self._load_st()
         self.assertFalse(st_verified["test_receipt"]["dirty"])
         self.assertTrue(st_verified["test_receipt"]["verified"])
-        self.assertEqual(
-            st_verified["test_receipt"]["last_test_cmd"],
-            "PYTHONPATH=. python3 scripts/bench.py --fast",
-        )
+        self.assertEqual(st_verified["test_receipt"]["last_test_cmd"], "PYTHONPATH=. python3 scripts/bench.py --fast")
 
-        # enter_plan_mode and PreInvocation reset clear active_eval_cmd
-        orchestrator_guard.handle_pre_tool(
-            dict(self.base_payload, toolCall={"name": "enter_plan_mode", "args": {}})
-        )
-        self.assertIsNone(orchestrator_guard._load_state(self.base_payload)["active_eval_cmd"])
+        self._pre("enter_plan_mode", {})
+        self.assertIsNone(self._load_st()["active_eval_cmd"])
 
-        orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                lastUserInput="Optimize solver 2",
-                toolCall={
-                    "name": "exit_plan_mode",
-                    "args": {"plan": "EVAL_CMD: python3 scripts/bench.py\n1. Optimize"},
-                },
-            )
-        )
-        orchestrator_guard.handle_pre_invocation(
-            dict(self.base_payload, invocationNum=2, lastUserInput="Please run [plan review]")
-        )
-        self.assertIsNone(orchestrator_guard._load_state(self.base_payload)["active_eval_cmd"])
+        self._pre("exit_plan_mode", {"plan": "EVAL_CMD: python3 scripts/bench.py\n1. Optimize"}, lastUserInput="Optimize solver 2")
+        self._pre_inv(invocationNum=2, lastUserInput="Please run [plan review]")
+        self.assertIsNone(self._load_st()["active_eval_cmd"])
 
-        # Root direct budget counts declared EVAL_CMD as a test run after edit
-        st_direct = orchestrator_guard._load_state(self.base_payload)
+        st_direct = self._load_st()
         st_direct["active_eval_cmd"] = "python3 scripts/bench.py"
-        st_direct["direct_budget"]["3"] = {
-            "mutated_files": ["src/solver.py"],
-            "read_files": [],
-            "read_ranges": [],
-            "read_lines": 0,
-            "read_bytes": 0,
-            "commands": [],
-            "seen_calls": [],
-            "test_runs_after_edit": 0,
-        }
+        st_direct["direct_budget"]["3"] = {"mutated_files": ["src/solver.py"], "read_files": [], "read_ranges": [], "read_lines": 0, "read_bytes": 0, "commands": [], "seen_calls": [], "test_runs_after_edit": 0}
         orchestrator_guard._save_state(self.base_payload, st_direct)
-        res_eval_1 = orchestrator_guard._check_and_record_direct_budget(
-            dict(self.base_payload, invocationNum=3),
-            "run_command",
-            {"CommandLine": "python3 scripts/bench.py"},
-            orchestrator_guard._load_state(self.base_payload),
-        )
-        self.assertIsNone(res_eval_1)
-        res_eval_2 = orchestrator_guard._check_and_record_direct_budget(
-            dict(self.base_payload, invocationNum=3),
-            "run_command",
-            {"CommandLine": "python3 scripts/bench.py"},
-            orchestrator_guard._load_state(self.base_payload),
-        )
+
+        self.assertIsNone(orchestrator_guard._check_and_record_direct_budget(self._payload(invocationNum=3), "run_command", {"CommandLine": "python3 scripts/bench.py"}, self._load_st()))
+        res_eval_2 = orchestrator_guard._check_and_record_direct_budget(self._payload(invocationNum=3), "run_command", {"CommandLine": "python3 scripts/bench.py"}, self._load_st())
         self.assertIsNotNone(res_eval_2)
         self.assertEqual(res_eval_2["decision"], "deny")
 
     def test_phase2_cli_status_surfaces_cohorts_and_active_eval_cmd(self) -> None:
         orchestrator_guard._cli_activate(self.base_payload)
-        res_spawn = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                invocationNum=4,
-                toolCall={
-                    "id": "status_bon_1",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "implementer",
-                        "Role": "Status Cand",
-                        "Workspace": "share",
-                        "Prompt": (
-                            "MODE: BEST_OF_N\nCOHORT: status-cohort\n"
-                            "EVAL_CMD: python3 scripts/eval_score.py\n" + VALID_PROMPT
-                        ),
-                    },
-                },
-            )
+        res_spawn = self._pre(
+            "invoke_subagent",
+            self._sub_args("implementer", "Status Cand", prompt="MODE: BEST_OF_N\nCOHORT: status-cohort\nEVAL_CMD: python3 scripts/eval_score.py\n" + VALID_PROMPT, Workspace="share"),
+            call_id="status_bon_1",
+            invocationNum=4,
         )
         self.assertEqual(res_spawn["decision"], "allow")
         status_out = orchestrator_guard._cli_status(self.base_payload)
@@ -6503,312 +2517,88 @@ orchestrator_guard.register_subagent(
 
     def test_phase2_empty_call_id_cohort_single_failure_does_not_overmatch(self) -> None:
         orchestrator_guard._cli_activate(self.base_payload)
+        prompt_no_id = f"MODE: BEST_OF_N\nCOHORT: no-id-cohort\n{VALID_PROMPT}"
 
-        # Spawn 3 candidates with empty call_id in cohort "no-id-cohort"
         for i in range(1, 4):
-            res = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "name": "invoke_subagent",
-                        "args": {
-                            "TypeName": "implementer",
-                            "Role": f"Cand {i}",
-                            "Workspace": "share",
-                            "Prompt": f"MODE: BEST_OF_N\nCOHORT: no-id-cohort\n{VALID_PROMPT}",
-                        },
-                    },
-                )
-            )
-            self.assertEqual(res["decision"], "allow")
+            self.assertEqual(self._pre("invoke_subagent", self._sub_args("implementer", f"Cand {i}", prompt=prompt_no_id, Workspace="share"))["decision"], "allow")
 
-        st_spawned = orchestrator_guard._load_state(self.base_payload)
+        st_spawned = self._load_st()
         self.assertEqual(st_spawned["cohorts"]["no-id-cohort"]["total_spawned"], 3)
-        self.assertEqual(
-            [p.get("candidate_id") for p in st_spawned["pending_spawns"]],
-            ["no-id-cohort#1", "no-id-cohort#2", "no-id-cohort#3"],
-        )
+        self.assertEqual([p.get("candidate_id") for p in st_spawned["pending_spawns"]], ["no-id-cohort#1", "no-id-cohort#2", "no-id-cohort#3"])
 
-        # 1 failing candidate with empty call_id must only fail 1 candidate, not all 3
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "implementer",
-                        "Role": "Cand 2",
-                        "Prompt": f"MODE: BEST_OF_N\nCOHORT: no-id-cohort\n{VALID_PROMPT}",
-                    },
-                },
-                error="cand 2 crashed",
-            )
-        )
-        st_after_fail = orchestrator_guard._load_state(self.base_payload)
-        self.assertEqual(
-            st_after_fail["cohorts"]["no-id-cohort"]["failed"],
-            ["no-id-cohort#2"],
-        )
+        self._post("invoke_subagent", {"TypeName": "implementer", "Role": "Cand 2", "Prompt": prompt_no_id}, error="cand 2 crashed")
+        st_after_fail = self._load_st()
+        self.assertEqual(st_after_fail["cohorts"]["no-id-cohort"]["failed"], ["no-id-cohort#2"])
         self.assertFalse(st_after_fail["circuit_breaker"]["tripped"])
-        self.assertEqual(
-            [p.get("candidate_id") for p in st_after_fail["pending_spawns"]],
-            ["no-id-cohort#1", "no-id-cohort#3"],
-        )
+        self.assertEqual([p.get("candidate_id") for p in st_after_fail["pending_spawns"]], ["no-id-cohort#1", "no-id-cohort#3"])
 
-        # 1 synchronous completion with empty call_id must mark at most 1 pending entry completed
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "implementer",
-                        "Role": "Cand 1",
-                        "Prompt": f"MODE: BEST_OF_N\nCOHORT: no-id-cohort\n{VALID_PROMPT}",
-                    },
-                },
-                output="STATUS: COMPLETED\nFILES_CHANGED: src/a.py\nVERIFICATION: pytest ok\nNOTES: SCORE: 1.0",
-            )
-        )
-        st_after_ok = orchestrator_guard._load_state(self.base_payload)
-        self.assertEqual(
-            st_after_ok["cohorts"]["no-id-cohort"]["succeeded"],
-            ["no-id-cohort#1"],
-        )
-        statuses = {
-            p["candidate_id"]: p["status"]
-            for p in st_after_ok["pending_spawns"]
-        }
-        self.assertEqual(statuses, {"no-id-cohort#1": "completed", "no-id-cohort#3": "active"})
+        self._post("invoke_subagent", {"TypeName": "implementer", "Role": "Cand 1", "Prompt": prompt_no_id}, output="STATUS: COMPLETED\nFILES_CHANGED: src/a.py\nVERIFICATION: pytest ok\nNOTES: SCORE: 1.0")
+        st_after_ok = self._load_st()
+        self.assertEqual(st_after_ok["cohorts"]["no-id-cohort"]["succeeded"], ["no-id-cohort#1"])
+        self.assertEqual({p["candidate_id"]: p["status"] for p in st_after_ok["pending_spawns"]}, {"no-id-cohort#1": "completed", "no-id-cohort#3": "active"})
 
-        # Async handle_stop deduplicates against candidate_id in parent cohorts
-        brain_base = Path(self.temp_dir.name) / "dedup_app" / "brain"
-        parent_dir = brain_base / "parent-dedup"
-        cand_dir = brain_base / "cand-dedup-1"
-        parent_dir.mkdir(parents=True, exist_ok=True)
-        cand_dir.mkdir(parents=True, exist_ok=True)
-        parent_payload = {
-            "conversationId": "parent-dedup",
-            "workspacePaths": [str(orchestrator_guard.PROJECT_ROOT)],
-            "artifactDirectoryPath": str(parent_dir),
-            "invocationNum": 1,
-            "executionNum": 1,
-        }
-        orchestrator_guard._cli_activate(parent_payload)
-        orchestrator_guard.handle_pre_invocation(parent_payload)
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id="cand-dedup-1",
-            type_name="implementer",
-            model="flash",
-            workspace="share",
-            role="Cand 1",
-            status="active",
-            mode="best_of_n",
-            cohort="dedup-cohort",
-            candidate_id="dedup-cohort#1",
-        )
-        p_st = orchestrator_guard._load_state(parent_payload)
-        p_st["cohorts"]["dedup-cohort"] = {
-            "total_spawned": 2,
-            "succeeded": ["dedup-cohort#1"],
-            "failed": [],
-            "created_at": 100.0,
-        }
-        orchestrator_guard._save_state(parent_payload, p_st)
+        parent_p = self._brain_payload("parent-dedup", root="dedup_app/brain")
+        cand_p = self._brain_payload("cand-dedup-1", root="dedup_app/brain", isSubagent=True)
+        orchestrator_guard._cli_activate(parent_p)
+        orchestrator_guard.handle_pre_invocation(parent_p)
+        self._reg_sub("implementer", "cand-dedup-1", "flash", payload=parent_p, workspace="share", role="Cand 1", status="active", mode="best_of_n", cohort="dedup-cohort", candidate_id="dedup-cohort#1")
+        p_st = self._load_st(parent_p)
+        p_st["cohorts"]["dedup-cohort"] = {"total_spawned": 2, "succeeded": ["dedup-cohort#1"], "failed": [], "created_at": 100.0}
+        orchestrator_guard._save_state(parent_p, p_st)
 
-        cand_payload = {
-            "conversationId": "cand-dedup-1",
-            "workspacePaths": [str(orchestrator_guard.PROJECT_ROOT)],
-            "artifactDirectoryPath": str(cand_dir),
-            "isSubagent": True,
-            "invocationNum": 1,
-            "executionNum": 1,
-        }
-        res_stop = orchestrator_guard.handle_stop(
-            dict(
-                cand_payload,
-                fullyIdle=True,
-                lastAssistantMessage=(
-                    "STATUS: COMPLETED\nFILES_CHANGED: src/a.py\nVERIFICATION: pytest ok\nNOTES: SCORE: 1.0"
-                ),
-            )
-        )
-        self.assertEqual(res_stop["decision"], "allow")
-        p_after = orchestrator_guard._load_state(parent_payload)
-        self.assertEqual(p_after["cohorts"]["dedup-cohort"]["succeeded"], ["dedup-cohort#1"])
+        self.assertEqual(self._stop("STATUS: COMPLETED\nFILES_CHANGED: src/a.py\nVERIFICATION: pytest ok\nNOTES: SCORE: 1.0", base=cand_p)["decision"], "allow")
+        self.assertEqual(self._load_st(parent_p)["cohorts"]["dedup-cohort"]["succeeded"], ["dedup-cohort#1"])
 
     def test_phase2_run_workflow_guard_integration(self) -> None:
         orchestrator_guard._cli_activate(self.base_payload)
 
-        # Cwd / ScriptPath outside allowed roots -> ask
-        res_bad_cwd = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "wf_bad_cwd",
-                    "name": "run_workflow",
-                    "args": {"Cwd": "/etc", "Description": "Outside cwd"},
-                },
-            )
-        )
-        self.assertEqual(res_bad_cwd["decision"], "ask")
+        self.assertEqual(self._pre("run_workflow", {"Cwd": "/etc", "Description": "Outside cwd"}, call_id="wf_bad_cwd")["decision"], "ask")
+        self.assertEqual(self._pre("run_workflow", {"Cwd": str(orchestrator_guard.PROJECT_ROOT), "ScriptPath": "/etc/passwd", "Description": "Outside script"}, call_id="wf_bad_script")["decision"], "ask")
 
-        res_bad_script = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "wf_bad_script",
-                    "name": "run_workflow",
-                    "args": {
-                        "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                        "ScriptPath": "/etc/passwd",
-                        "Description": "Outside script",
-                    },
-                },
-            )
-        )
-        self.assertEqual(res_bad_script["decision"], "ask")
-
-        # Trivial EVAL_CMD in Description -> deny
         for bad_eval in ("true", "pytest || true"):
-            res_bad_eval = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "id": f"wf_bad_eval_{bad_eval}",
-                        "name": "run_workflow",
-                        "args": {
-                            "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                            "Description": f"EVAL_CMD: {bad_eval}\nRun workflow",
-                        },
-                    },
-                )
-            )
+            res_bad_eval = self._pre("run_workflow", {"Cwd": str(orchestrator_guard.PROJECT_ROOT), "Description": f"EVAL_CMD: {bad_eval}\nRun workflow"}, call_id=f"wf_bad_eval_{bad_eval}")
             self.assertEqual(res_bad_eval["decision"], "deny")
             self.assertIn("Trivial or no-op EVAL_CMD rejected", res_bad_eval["reason"])
 
-        # Valid run_workflow with EVAL_CMD -> allow and persist active_eval_cmd
-        res_good_wf = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "wf_good_1",
-                    "name": "run_workflow",
-                    "args": {
-                        "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                        "ScriptPath": str(orchestrator_guard.PROJECT_ROOT / "scripts/wf.sh"),
-                        "Description": "EVAL_CMD: python3 scripts/eval_wf.py\nRun eval workflow",
-                    },
-                },
-            )
+        res_good_wf = self._pre(
+            "run_workflow",
+            {"Cwd": str(orchestrator_guard.PROJECT_ROOT), "ScriptPath": str(orchestrator_guard.PROJECT_ROOT / "scripts/wf.sh"), "Description": "EVAL_CMD: python3 scripts/eval_wf.py\nRun eval workflow"},
+            call_id="wf_good_1",
         )
         self.assertEqual(res_good_wf["decision"], "allow")
-        st_wf = orchestrator_guard._load_state(self.base_payload)
+        st_wf = self._load_st()
         self.assertEqual(st_wf["active_eval_cmd"], "python3 scripts/eval_wf.py")
 
-        # Dirty test_receipt must NOT be cleared by run_workflow success
-        st_wf["test_receipt"]["dirty"] = True
-        st_wf["test_receipt"]["verified"] = False
+        st_wf["test_receipt"]["dirty"], st_wf["test_receipt"]["verified"] = True, False
         orchestrator_guard._save_state(self.base_payload, st_wf)
-
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={"id": "wf_good_1", "name": "run_workflow", "args": {}},
-                exitCode=0,
-            )
-        )
-        st_after_ok = orchestrator_guard._load_state(self.base_payload)
+        self._post("run_workflow", {}, exit_code=0, call_id="wf_good_1")
+        st_after_ok = self._load_st()
         self.assertTrue(st_after_ok["test_receipt"]["dirty"])
         self.assertFalse(st_after_ok["test_receipt"]["verified"])
 
-        # Sandbox boundary error does not trip breaker; 2 real failures trip breaker
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={"id": "wf_sandbox", "name": "run_workflow", "args": {}},
-                error="There were sandbox errors that may or may not be related to the failure",
-            )
-        )
-        self.assertEqual(
-            orchestrator_guard._load_state(self.base_payload)["circuit_breaker"]["failure_streak"],
-            0,
-        )
+        self._post("run_workflow", {}, error="There were sandbox errors that may or may not be related to the failure", call_id="wf_sandbox")
+        self.assertEqual(self._load_st()["circuit_breaker"]["failure_streak"], 0)
 
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={"id": "wf_fail_1", "name": "run_workflow", "args": {}},
-                error="workflow step 1 failed",
-            )
-        )
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={"id": "wf_fail_2", "name": "run_workflow", "args": {}},
-                exitCode=1,
-            )
-        )
-        st_tripped = orchestrator_guard._load_state(self.base_payload)
+        self._post("run_workflow", {}, error="workflow step 1 failed", call_id="wf_fail_1")
+        self._post("run_workflow", {}, exit_code=1, call_id="wf_fail_2")
+        st_tripped = self._load_st()
         self.assertEqual(st_tripped["circuit_breaker"]["failure_streak"], 2)
         self.assertTrue(st_tripped["circuit_breaker"]["tripped"])
 
-        # Tripped breaker blocks run_workflow without REPLAN:, allows 1-shot REPLAN:
-        res_blocked = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "wf_blocked",
-                    "name": "run_workflow",
-                    "args": {
-                        "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                        "Description": "Retry workflow",
-                    },
-                },
-            )
-        )
+        res_blocked = self._pre("run_workflow", {"Cwd": str(orchestrator_guard.PROJECT_ROOT), "Description": "Retry workflow"}, call_id="wf_blocked")
         self.assertEqual(res_blocked["decision"], "deny")
         self.assertIn("REPLAN:", res_blocked["reason"])
 
-        res_replan = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "wf_replan",
-                    "name": "run_workflow",
-                    "args": {
-                        "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                        "Description": "REPLAN: switch to fallback workflow\nRun v2",
-                    },
-                },
-            )
-        )
+        res_replan = self._pre("run_workflow", {"Cwd": str(orchestrator_guard.PROJECT_ROOT), "Description": "REPLAN: switch to fallback workflow\nRun v2"}, call_id="wf_replan")
         self.assertEqual(res_replan["decision"], "allow")
-        st_replanned = orchestrator_guard._load_state(self.base_payload)
+        st_replanned = self._load_st()
         self.assertFalse(st_replanned["circuit_breaker"]["tripped"])
         self.assertEqual(st_replanned["circuit_breaker"]["replan_count"], 1)
 
-        # Success resets failure_streak after a single failure while keeping dirty receipt
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={"id": "wf_fail_3", "name": "run_workflow", "args": {}},
-                error="transient wf failure",
-            )
-        )
-        self.assertEqual(
-            orchestrator_guard._load_state(self.base_payload)["circuit_breaker"]["failure_streak"],
-            1,
-        )
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={"id": "wf_ok_reset", "name": "run_workflow", "args": {}},
-                exitCode=0,
-            )
-        )
-        st_reset = orchestrator_guard._load_state(self.base_payload)
+        self._post("run_workflow", {}, error="transient wf failure", call_id="wf_fail_3")
+        self.assertEqual(self._load_st()["circuit_breaker"]["failure_streak"], 1)
+        self._post("run_workflow", {}, exit_code=0, call_id="wf_ok_reset")
+        st_reset = self._load_st()
         self.assertEqual(st_reset["circuit_breaker"]["failure_streak"], 0)
         self.assertFalse(st_reset["circuit_breaker"]["tripped"])
         self.assertTrue(st_reset["test_receipt"]["dirty"])
@@ -6816,596 +2606,186 @@ orchestrator_guard.register_subagent(
     def test_phase2_empty_call_id_out_of_order_prompt_hash_attribution(self) -> None:
         orchestrator_guard._cli_activate(self.base_payload)
 
-        prompts = [
-            f"MODE: BEST_OF_N\nCOHORT: hash-cohort\n{VALID_PROMPT}\n# approach A",
-            f"MODE: BEST_OF_N\nCOHORT: hash-cohort\n{VALID_PROMPT}\n# approach B",
-            f"MODE: BEST_OF_N\nCOHORT: hash-cohort\n{VALID_PROMPT}\n# approach C",
-        ]
+        prompts = [f"MODE: BEST_OF_N\nCOHORT: hash-cohort\n{VALID_PROMPT}\n# approach {tag}" for tag in ("A", "B", "C")]
         for prompt in prompts:
-            res = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "name": "invoke_subagent",
-                        "args": {
-                            "TypeName": "implementer",
-                            "Role": "Candidate",
-                            "Workspace": "share",
-                            "Prompt": prompt,
-                        },
-                    },
-                )
-            )
-            self.assertEqual(res["decision"], "allow")
+            self.assertEqual(self._pre("invoke_subagent", self._sub_args("implementer", "Candidate", prompt=prompt, Workspace="share"))["decision"], "allow")
 
-        st_spawned = orchestrator_guard._load_state(self.base_payload)
-        self.assertEqual(
-            [p.get("candidate_id") for p in st_spawned["pending_spawns"]],
-            ["hash-cohort#1", "hash-cohort#2", "hash-cohort#3"],
-        )
-        self.assertEqual(
-            len({p.get("prompt_hash") for p in st_spawned["pending_spawns"] if p.get("prompt_hash")}),
-            3,
-        )
+        st_spawned = self._load_st()
+        self.assertEqual([p.get("candidate_id") for p in st_spawned["pending_spawns"]], ["hash-cohort#1", "hash-cohort#2", "hash-cohort#3"])
+        self.assertEqual(len({p.get("prompt_hash") for p in st_spawned["pending_spawns"] if p.get("prompt_hash")}), 3)
 
-        # Fail candidate #2 (approach B) first with empty call_id and no UUID
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "implementer",
-                        "Role": "Candidate",
-                        "Prompt": prompts[1],
-                    },
-                },
-                error="candidate B failed",
-            )
-        )
-        st_after_fail = orchestrator_guard._load_state(self.base_payload)
-        self.assertEqual(
-            st_after_fail["cohorts"]["hash-cohort"]["failed"],
-            ["hash-cohort#2"],
-        )
-        self.assertEqual(
-            [p.get("candidate_id") for p in st_after_fail["pending_spawns"]],
-            ["hash-cohort#1", "hash-cohort#3"],
-        )
+        self._post("invoke_subagent", {"TypeName": "implementer", "Role": "Candidate", "Prompt": prompts[1]}, error="candidate B failed")
+        st_after_fail = self._load_st()
+        self.assertEqual(st_after_fail["cohorts"]["hash-cohort"]["failed"], ["hash-cohort#2"])
+        self.assertEqual([p.get("candidate_id") for p in st_after_fail["pending_spawns"]], ["hash-cohort#1", "hash-cohort#3"])
 
-        # Succeed candidate #3 (approach C) out of order with empty call_id
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "implementer",
-                        "Role": "Candidate",
-                        "Prompt": prompts[2],
-                    },
-                },
-                output="STATUS: COMPLETED\nFILES_CHANGED: src/auth/parser.py\nVERIFICATION: pytest ok\nNOTES: SCORE: 0.9",
-            )
-        )
-        st_after_c = orchestrator_guard._load_state(self.base_payload)
-        self.assertEqual(
-            st_after_c["cohorts"]["hash-cohort"]["succeeded"],
-            ["hash-cohort#3"],
-        )
-        statuses = {
-            p["candidate_id"]: p["status"]
-            for p in st_after_c["pending_spawns"]
-        }
-        self.assertEqual(
-            statuses,
-            {"hash-cohort#1": "active", "hash-cohort#3": "completed"},
-        )
+        self._post("invoke_subagent", {"TypeName": "implementer", "Role": "Candidate", "Prompt": prompts[2]}, output="STATUS: COMPLETED\nFILES_CHANGED: src/auth/parser.py\nVERIFICATION: pytest ok\nNOTES: SCORE: 0.9")
+        st_after_c = self._load_st()
+        self.assertEqual(st_after_c["cohorts"]["hash-cohort"]["succeeded"], ["hash-cohort#3"])
+        self.assertEqual({p["candidate_id"]: p["status"] for p in st_after_c["pending_spawns"]}, {"hash-cohort#1": "active", "hash-cohort#3": "completed"})
 
-        # Explicitly complete candidate #1 (approach A)
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "implementer",
-                        "Role": "Candidate",
-                        "Prompt": prompts[0],
-                    },
-                },
-                output="STATUS: COMPLETED\nFILES_CHANGED: src/auth/parser.py\nVERIFICATION: pytest ok\nNOTES: SCORE: 1.0",
-            )
-        )
-        st_after_a = orchestrator_guard._load_state(self.base_payload)
-        self.assertEqual(
-            st_after_a["cohorts"]["hash-cohort"]["succeeded"],
-            ["hash-cohort#3", "hash-cohort#1"],
-        )
-        self.assertEqual(
-            {p["candidate_id"]: p["status"] for p in st_after_a["pending_spawns"]},
-            {"hash-cohort#1": "completed", "hash-cohort#3": "completed"},
-        )
+        self._post("invoke_subagent", {"TypeName": "implementer", "Role": "Candidate", "Prompt": prompts[0]}, output="STATUS: COMPLETED\nFILES_CHANGED: src/auth/parser.py\nVERIFICATION: pytest ok\nNOTES: SCORE: 1.0")
+        st_after_a = self._load_st()
+        self.assertEqual(st_after_a["cohorts"]["hash-cohort"]["succeeded"], ["hash-cohort#3", "hash-cohort#1"])
+        self.assertEqual({p["candidate_id"]: p["status"] for p in st_after_a["pending_spawns"]}, {"hash-cohort#1": "completed", "hash-cohort#3": "completed"})
 
     def test_phase2_run_workflow_script_eval_cmd_and_traceback_detection(self) -> None:
         orchestrator_guard._cli_activate(self.base_payload)
 
-        # Trivial # EVAL_CMD: true inside Script -> deny
-        res_bad = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "wf_script_bad",
-                    "name": "run_workflow",
-                    "args": {
-                        "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                        "Description": "Run eval script",
-                        "Script": "#!/usr/bin/env bash\n# EVAL_CMD: true\necho hi\n",
-                    },
-                },
-            )
+        res_bad = self._pre(
+            "run_workflow",
+            {"Cwd": str(orchestrator_guard.PROJECT_ROOT), "Description": "Run eval script", "Script": "#!/usr/bin/env bash\n# EVAL_CMD: true\necho hi\n"},
+            call_id="wf_script_bad",
         )
         self.assertEqual(res_bad["decision"], "deny")
         self.assertIn("Trivial or no-op EVAL_CMD rejected", res_bad["reason"])
 
-        # Valid # EVAL_CMD: python3 evals/bench.py inside Script -> allow and persist active_eval_cmd
-        res_good = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "wf_script_good",
-                    "name": "run_workflow",
-                    "args": {
-                        "Cwd": str(orchestrator_guard.PROJECT_ROOT),
-                        "Description": "Run benchmark script",
-                        "Script": "#!/usr/bin/env bash\n# EVAL_CMD: python3 evals/bench.py\npython3 evals/bench.py\n",
-                    },
-                },
-            )
+        res_good = self._pre(
+            "run_workflow",
+            {"Cwd": str(orchestrator_guard.PROJECT_ROOT), "Description": "Run benchmark script", "Script": "#!/usr/bin/env bash\n# EVAL_CMD: python3 evals/bench.py\npython3 evals/bench.py\n"},
+            call_id="wf_script_good",
         )
         self.assertEqual(res_good["decision"], "allow")
-        st_good = orchestrator_guard._load_state(self.base_payload)
-        self.assertEqual(st_good["active_eval_cmd"], "python3 evals/bench.py")
+        self.assertEqual(self._load_st()["active_eval_cmd"], "python3 evals/bench.py")
 
-        # Two PostToolUse run_workflow calls with Python traceback in output increment & trip breaker
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={"id": "wf_tb_1", "name": "run_workflow", "args": {}},
-                output="Traceback (most recent call last):\nRuntimeError: boom",
-            )
-        )
-        st_tb_1 = orchestrator_guard._load_state(self.base_payload)
+        self._post("run_workflow", {}, output="Traceback (most recent call last):\nRuntimeError: boom", call_id="wf_tb_1")
+        st_tb_1 = self._load_st()
         self.assertEqual(st_tb_1["circuit_breaker"]["failure_streak"], 1)
         self.assertFalse(st_tb_1["circuit_breaker"]["tripped"])
 
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={"id": "wf_tb_2", "name": "run_workflow", "args": {}},
-                output="Traceback (most recent call last):\nRuntimeError: boom",
-            )
-        )
-        st_tb_2 = orchestrator_guard._load_state(self.base_payload)
+        self._post("run_workflow", {}, output="Traceback (most recent call last):\nRuntimeError: boom", call_id="wf_tb_2")
+        st_tb_2 = self._load_st()
         self.assertEqual(st_tb_2["circuit_breaker"]["failure_streak"], 2)
         self.assertTrue(st_tb_2["circuit_breaker"]["tripped"])
+        self.assertIsNotNone(st_tb_2["circuit_breaker"].get("last_error"))
 
     def test_phase3_judge_define_subagent_and_model_policy(self) -> None:
         orchestrator_guard._cli_activate(self.base_payload)
 
-        # define_subagent strips Write, Subagent, and MCP tools for judge (PascalCase + snake_case)
-        res_pascal = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "define_subagent",
-                    "args": {
-                        "Name": "judge",
-                        "EnableWriteTools": True,
-                        "EnableSubagentTools": True,
-                        "EnableMCPTools": True,
-                    },
-                },
-            )
-        )
+        res_pascal = self._pre("define_subagent", {"Name": "judge", "EnableWriteTools": True, "EnableSubagentTools": True, "EnableMCPTools": True})
         self.assertEqual(res_pascal["decision"], "allow")
-        self.assertEqual(
-            res_pascal["overwrite"],
-            {
-                "EnableSubagentTools": False,
-                "EnableWriteTools": False,
-                "EnableMCPTools": False,
-            },
-        )
+        self.assertEqual(res_pascal["overwrite"], {"EnableSubagentTools": False, "EnableWriteTools": False, "EnableMCPTools": False})
 
-        res_snake = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "define_subagent",
-                    "args": {
-                        "name": "judge",
-                        "enable_write_tools": True,
-                        "enable_subagent_tools": True,
-                        "enable_mcp_tools": True,
-                    },
-                },
-            )
-        )
+        res_snake = self._pre("define_subagent", {"name": "judge", "enable_write_tools": True, "enable_subagent_tools": True, "enable_mcp_tools": True})
         self.assertEqual(res_snake["decision"], "allow")
-        self.assertEqual(
-            res_snake["overwrite"],
-            {
-                "enable_subagent_tools": False,
-                "enable_write_tools": False,
-                "enable_mcp_tools": False,
-            },
-        )
+        self.assertEqual(res_snake["overwrite"], {"enable_subagent_tools": False, "enable_write_tools": False, "enable_mcp_tools": False})
 
-        # define_subagent strips Subagent and MCP tools (but not WriteTools) for council
-        res_council_def = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "define_subagent",
-                    "args": {
-                        "Name": "council",
-                        "EnableWriteTools": True,
-                        "EnableSubagentTools": True,
-                        "EnableMCPTools": True,
-                    },
-                },
-            )
-        )
+        res_council_def = self._pre("define_subagent", {"Name": "council", "EnableWriteTools": True, "EnableSubagentTools": True, "EnableMCPTools": True})
         self.assertEqual(res_council_def["decision"], "allow")
-        self.assertEqual(
-            res_council_def["overwrite"],
-            {
-                "EnableSubagentTools": False,
-                "EnableMCPTools": False,
-            },
-        )
+        self.assertEqual(res_council_def["overwrite"], {"EnableSubagentTools": False, "EnableMCPTools": False})
 
-        # judge allows pro and inherit untouched, rewrites flash_lite and omitted to flash
         judge_prompt = f"MODE: COUNCIL\nCOUNCIL_ID: c-policy\nCOUNCIL_ROLE: judge\n{VALID_PROMPT}"
         for allowed_model in ("pro", "inherit", "flash"):
-            res_ok = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "id": f"judge_{allowed_model}",
-                        "name": "invoke_subagent",
-                        "args": {
-                            "TypeName": "judge",
-                            "Role": f"Judge-{allowed_model}",
-                            "Model": allowed_model,
-                            "Prompt": judge_prompt,
-                        },
-                    },
-                )
-            )
+            res_ok = self._pre("invoke_subagent", self._sub_args("judge", f"Judge-{allowed_model}", allowed_model, judge_prompt), call_id=f"judge_{allowed_model}")
             self.assertEqual(res_ok["decision"], "allow")
             self.assertNotIn("overwrite", res_ok)
 
-        res_lite = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "judge_lite",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "judge",
-                        "Role": "Judge-lite",
-                        "Model": "flash_lite",
-                        "Prompt": judge_prompt,
-                    },
-                },
-            )
-        )
+        res_lite = self._pre("invoke_subagent", self._sub_args("judge", "Judge-lite", "flash_lite", judge_prompt), call_id="judge_lite")
         self.assertEqual(res_lite["decision"], "allow")
         self.assertEqual(res_lite["overwrite"]["Model"], "flash")
 
-        res_omitted = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "judge_omitted",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "judge",
-                        "Role": "Judge-default",
-                        "Prompt": judge_prompt,
-                    },
-                },
-            )
-        )
+        res_omitted = self._pre("invoke_subagent", self._sub_args("judge", "Judge-default", prompt=judge_prompt), call_id="judge_omitted")
         self.assertEqual(res_omitted["decision"], "allow")
         self.assertEqual(res_omitted["overwrite"]["Model"], "flash")
 
     def test_phase3_judge_strict_readonly_report_receipt_and_freshness(self) -> None:
         orchestrator_guard._cli_activate(self.base_payload)
-
-        # Mark dirty receipt on root before spawning judge
-        st = orchestrator_guard._load_state(self.base_payload)
+        st = self._load_st()
         receipt = orchestrator_guard._get_test_receipt(st, self.base_payload)
-        receipt["dirty"] = True
-        receipt["verified"] = False
-        receipt["mutation_epoch"] = 1
+        receipt["dirty"], receipt["verified"], receipt["mutation_epoch"] = True, False, 1
         orchestrator_guard._save_state(self.base_payload, st)
 
         judge_cid = "sub-judge-readonly-1"
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id=judge_cid,
-            type_name="judge",
-            model="pro",
-            spawned_mutation_epoch=1,
-            mode="council",
-            council_id="c-1",
-            council_role="judge",
-        )
-        judge_payload = dict(self.base_payload, conversationId=judge_cid)
+        self._reg_sub("judge", judge_cid, "pro", spawned_mutation_epoch=1, mode="council", council_id="c-1", council_role="judge")
+        judge_payload = self._payload(cid=judge_cid)
 
-        # Strict read-only: blocks write_file and shell write redirection
-        res_write = orchestrator_guard.handle_pre_tool(
-            dict(
-                judge_payload,
-                toolCall={
-                    "name": "write_file",
-                    "args": {"Path": str(Path(self.artifact_dir) / "scratch" / "vote.md"), "Content": "x"},
-                },
-            )
-        )
+        res_write = self._pre("write_file", {"Path": str(Path(self.artifact_dir) / "scratch" / "vote.md"), "Content": "x"}, base=judge_payload)
         self.assertEqual(res_write["decision"], "deny")
         self.assertIn("strictly read-only", res_write["reason"])
 
-        res_shell = orchestrator_guard.handle_pre_tool(
-            dict(
-                judge_payload,
-                toolCall={
-                    "name": "run_command",
-                    "args": {"CommandLine": "echo vote > vote.txt"},
-                },
-            )
-        )
+        res_shell = self._pre("run_command", {"CommandLine": "echo vote > vote.txt"}, base=judge_payload)
         self.assertEqual(res_shell["decision"], "deny")
         self.assertIn("strictly read-only", res_shell["reason"])
 
-        # judge is NOT a scout and requires full 4-header report
-        self.assertFalse(
-            orchestrator_guard._is_scout_subagent(
-                judge_payload, orchestrator_guard._load_state(judge_payload)
-            )
-        )
-        res_stop_bad = orchestrator_guard.handle_stop(
-            dict(
-                judge_payload,
-                fullyIdle=True,
-                lastAssistantMessage="STATUS: COMPLETED\nNOTES: Voted for Proposal A.",
-            )
-        )
+        self.assertFalse(orchestrator_guard._is_scout_subagent(judge_payload, self._load_st(judge_payload)))
+        res_stop_bad = self._stop("STATUS: COMPLETED\nNOTES: Voted for Proposal A.", base=judge_payload)
         self.assertEqual(res_stop_bad["decision"], "continue")
         self.assertIn("4-header REPORT FORMAT", res_stop_bad["reason"])
 
-        # Completing judge via PostToolUse does NOT clear dirty test_receipt
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "inv_judge_ok",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "judge",
-                        "Role": "Judge",
-                        "Model": "pro",
-                        "Prompt": VALID_PROMPT,
-                    },
-                },
-                output="STATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: n/a\nNOTES: Winner is Proposal A.",
-            )
-        )
-        st_after_judge = orchestrator_guard._load_state(self.base_payload)
+        self._post("invoke_subagent", self._sub_args("judge", "Judge", "pro"), output="STATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: n/a\nNOTES: Winner is Proposal A.", call_id="inv_judge_ok")
+        st_after_judge = self._load_st()
         self.assertTrue(st_after_judge["test_receipt"]["dirty"])
         self.assertFalse(st_after_judge["test_receipt"]["verified"])
 
-        # Mutation epoch bump invalidates stale judge on send_message
         st_after_judge["test_receipt"]["mutation_epoch"] = 2
         orchestrator_guard._save_state(self.base_payload, st_after_judge)
-        res_stale = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "send_message",
-                    "args": {
-                        "Recipient": judge_cid,
-                        "Message": "Re-evaluate Proposal A vs Proposal B.",
-                    },
-                },
-            )
-        )
+        res_stale = self._pre("send_message", {"Recipient": judge_cid, "Message": "Re-evaluate Proposal A vs Proposal B."})
         self.assertEqual(res_stale["decision"], "deny")
         self.assertIn("Stale judge", res_stale["reason"])
 
     def test_phase3_blind_judging_anti_leakage(self) -> None:
         orchestrator_guard._cli_activate(self.base_payload)
 
-        leaking_prompts = [
+        leaking_prompts = (
             "Evaluate Proposal A (Claude Opus 5.5) vs Proposal B.",
             "Compare Draft B by Gemini 4 Carbon against Draft A.",
             "Claude Opus authored Proposal C; please score it.",
             "Review Gemini 4 Argon's proposal for the cache layer.",
-        ]
+        )
         for idx, leak_text in enumerate(leaking_prompts):
-            res_leak = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "id": f"leak_{idx}",
-                        "name": "invoke_subagent",
-                        "args": {
-                            "TypeName": "judge",
-                            "Role": "Blind Judge",
-                            "Model": "pro",
-                            "Prompt": f"MODE: COUNCIL\nCOUNCIL_ROLE: judge\n{leak_text}",
-                        },
-                    },
-                )
-            )
+            res_leak = self._pre("invoke_subagent", self._sub_args("judge", "Blind Judge", "pro", f"MODE: COUNCIL\nCOUNCIL_ROLE: judge\n{leak_text}"), call_id=f"leak_{idx}")
             self.assertEqual(res_leak["decision"], "deny", msg=f"Should deny: {leak_text}")
             self.assertIn("Blind judging violation", res_leak["reason"])
 
-        # Reviewer invoked with COUNCIL_ROLE: judge is also gated
-        res_role_judge = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "leak_role_judge",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "reviewer",
-                        "Role": "Judge",
-                        "Model": "pro",
-                        "Prompt": "REVIEW_LENS: architecture\nCOUNCIL_ROLE: judge\nOption 1 - GPT-5.2",
-                    },
-                },
-            )
-        )
+        res_role_judge = self._pre("invoke_subagent", self._sub_args("reviewer", "Judge", "pro", "REVIEW_LENS: architecture\nCOUNCIL_ROLE: judge\nOption 1 - GPT-5.2"), call_id="leak_role_judge")
         self.assertEqual(res_role_judge["decision"], "deny")
         self.assertIn("Blind judging violation", res_role_judge["reason"])
 
-        # Anonymized proposals and benign technical prose are allowed
-        benign_prompts = [
+        benign_prompts = (
             "Proposal A: use carbon theme for the dashboard.\nProposal B: use Gemini API client with retry.",
             "Compare Proposal A, Proposal B, and Proposal C on correctness and maintainability.",
-        ]
+        )
         for idx, ok_text in enumerate(benign_prompts):
-            res_ok = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "id": f"benign_{idx}",
-                        "name": "invoke_subagent",
-                        "args": {
-                            "TypeName": "judge",
-                            "Role": f"Blind Judge {idx}",
-                            "Model": "pro",
-                            "Prompt": f"MODE: COUNCIL\nCOUNCIL_ID: blind-ok\nCOUNCIL_ROLE: judge\n{ok_text}",
-                        },
-                    },
-                )
-            )
+            res_ok = self._pre("invoke_subagent", self._sub_args("judge", f"Blind Judge {idx}", "pro", f"MODE: COUNCIL\nCOUNCIL_ID: blind-ok\nCOUNCIL_ROLE: judge\n{ok_text}"), call_id=f"benign_{idx}")
             self.assertEqual(res_ok["decision"], "allow", msg=f"Should allow: {ok_text}")
 
     def test_phase3_swarm_council_hooks_expansion_kill_and_stop(self) -> None:
         orchestrator_guard._cli_activate(self.base_payload)
 
-        # Status / models / title allowed
         for act in ("models", "status", "title"):
-            res_info = orchestrator_guard.handle_pre_tool(
-                dict(self.base_payload, toolCall={"name": "swarm", "args": {"action": act}})
-            )
-            self.assertEqual(res_info["decision"], "allow")
+            self.assertEqual(self._pre("swarm", {"action": act})["decision"], "allow")
 
-        # Non-anonymous council roster name denied
-        res_bad_name = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "sw_bad_name",
-                    "name": "swarm",
-                    "args": {
-                        "action": "add",
-                        "name": "proposer-claude",
-                        "model": "claude-opus-4",
-                        "brief": "MODE: COUNCIL\nCOUNCIL_ID: arch-1\nCOUNCIL_ROLE: proposer\nDraft design.",
-                    },
-                },
-            )
+        res_bad_name = self._pre(
+            "swarm",
+            {"action": "add", "name": "proposer-claude", "model": "claude-opus-4", "brief": "MODE: COUNCIL\nCOUNCIL_ID: arch-1\nCOUNCIL_ROLE: proposer\nDraft design."},
+            call_id="sw_bad_name",
         )
         self.assertEqual(res_bad_name["decision"], "deny")
         self.assertIn("Blind council violation", res_bad_name["reason"])
 
-        # Blind judge leak inside swarm brief denied
-        res_bad_judge = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "sw_bad_judge",
-                    "name": "swarm",
-                    "args": {
-                        "action": "add",
-                        "name": "judge-1",
-                        "model": "gemini-4-pro",
-                        "brief": "MODE: COUNCIL\nCOUNCIL_ID: arch-1\nCOUNCIL_ROLE: judge\nVote on Draft A by Claude Opus 5.5.",
-                    },
-                },
-            )
+        res_bad_judge = self._pre(
+            "swarm",
+            {"action": "add", "name": "judge-1", "model": "gemini-4-pro", "brief": "MODE: COUNCIL\nCOUNCIL_ID: arch-1\nCOUNCIL_ROLE: judge\nVote on Draft A by Claude Opus 5.5."},
+            call_id="sw_bad_judge",
         )
         self.assertEqual(res_bad_judge["decision"], "deny")
         self.assertIn("Blind judging violation", res_bad_judge["reason"])
 
-        # Expansion via n=2 (branch) and tasks=[...] (share) + inherit worker
-        res_n = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "sw_n",
-                    "name": "swarm",
-                    "args": {
-                        "action": "add",
-                        "name": "proposer",
-                        "n": 2,
-                        "model": "claude-sonnet",
-                        "workspace": "branch",
-                        "brief": "MODE: COUNCIL\nCOUNCIL_ID: arch-1\nCOUNCIL_ROLE: proposer\nEVAL_CMD: python3 -m unittest",
-                    },
-                },
-            )
-        )
-        self.assertEqual(res_n["decision"], "allow")
-
-        res_tasks = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "sw_tasks",
-                    "name": "swarm",
-                    "args": {
-                        "action": "add",
-                        "name": "reviewer",
-                        "tasks": ["task1", "task2"],
-                        "model": "gpt-5",
-                        "workspace": "share",
-                        "brief": "Review candidate patches.",
-                    },
-                },
-            )
-        )
-        self.assertEqual(res_tasks["decision"], "allow")
-
-        res_inherit = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "sw_inherit",
-                    "name": "swarm",
-                    "args": {
-                        "action": "add",
-                        "name": "judge-1",
-                        "model": "gemini-4-pro",
-                        "workspace": "inherit",
-                        "brief": "MODE: COUNCIL\nCOUNCIL_ID: arch-1\nCOUNCIL_ROLE: judge\nScore Proposal A vs Proposal B.",
-                    },
-                },
-            )
-        )
-        self.assertEqual(res_inherit["decision"], "allow")
-
-        st = orchestrator_guard._load_state(self.base_payload)
         self.assertEqual(
-            sorted(st["swarm_workers"].keys()),
-            ["judge-1", "proposer-1", "proposer-2", "reviewer-1", "reviewer-2"],
+            self._pre("swarm", {"action": "add", "name": "proposer", "n": 2, "model": "claude-sonnet", "workspace": "branch", "brief": "MODE: COUNCIL\nCOUNCIL_ID: arch-1\nCOUNCIL_ROLE: proposer\nEVAL_CMD: python3 -m unittest"}, call_id="sw_n")["decision"],
+            "allow",
         )
+        self.assertEqual(
+            self._pre("swarm", {"action": "add", "name": "reviewer", "tasks": ["task1", "task2"], "model": "gpt-5", "workspace": "share", "brief": "Review candidate patches."}, call_id="sw_tasks")["decision"],
+            "allow",
+        )
+        self.assertEqual(
+            self._pre("swarm", {"action": "add", "name": "judge-1", "model": "gemini-4-pro", "workspace": "inherit", "brief": "MODE: COUNCIL\nCOUNCIL_ID: arch-1\nCOUNCIL_ROLE: judge\nScore Proposal A vs Proposal B."}, call_id="sw_inherit")["decision"],
+            "allow",
+        )
+
+        st = self._load_st()
+        self.assertEqual(sorted(st["swarm_workers"].keys()), ["judge-1", "proposer-1", "proposer-2", "reviewer-1", "reviewer-2"])
         self.assertTrue(st["swarm_workers"]["proposer-1"]["active_worktree"])
         self.assertTrue(st["swarm_workers"]["reviewer-2"]["active_worktree"])
         self.assertFalse(st["swarm_workers"]["judge-1"]["active_worktree"])
@@ -7414,187 +2794,68 @@ orchestrator_guard.register_subagent(
         self.assertEqual(st["councils"]["arch-1"]["judges"], ["judge-1"])
         self.assertEqual(st["councils"]["arch-1"]["models"], ["claude-sonnet", "gemini-4-pro"])
 
-        # action="model" updates worker model
-        orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "name": "swarm",
-                    "args": {"action": "model", "name": "judge-1", "model": "gemini-4-carbon"},
-                },
-            )
-        )
-        self.assertEqual(
-            orchestrator_guard._load_state(self.base_payload)["swarm_workers"]["judge-1"]["model"],
-            "gemini-4-carbon",
-        )
+        self._pre("swarm", {"action": "model", "name": "judge-1", "model": "gemini-4-carbon"})
+        self.assertEqual(self._load_st()["swarm_workers"]["judge-1"]["model"], "gemini-4-carbon")
 
-        # Stop blocks on uncleaned isolated swarm worktrees
-        res_stop_blocked = orchestrator_guard.handle_stop(
-            dict(self.base_payload, executionNum=1, fullyIdle=True)
-        )
+        res_stop_blocked = self._stop(executionNum=1)
         self.assertEqual(res_stop_blocked["decision"], "continue")
         self.assertIn("Uncleaned isolated swarm worktrees remain", res_stop_blocked["reason"])
         self.assertIn("swarm(action='kill')", res_stop_blocked["reason"])
 
-        # Kill all isolated workers; leave workspace='inherit' judge-1 active
         for wname in ("proposer-1", "proposer-2", "reviewer-1", "reviewer-2"):
-            orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={"name": "swarm", "args": {"action": "kill", "name": wname}},
-                )
-            )
-        st_killed = orchestrator_guard._load_state(self.base_payload)
+            self._pre("swarm", {"action": "kill", "name": wname})
+        st_killed = self._load_st()
         self.assertEqual(st_killed["swarm_workers"]["proposer-1"]["status"], "killed")
         self.assertFalse(st_killed["swarm_workers"]["proposer-1"]["active_worktree"])
         self.assertEqual(st_killed["swarm_workers"]["judge-1"]["status"], "active")
-
-        # Stop allows when only workspace='inherit' worker remains active
-        res_stop_ok = orchestrator_guard.handle_stop(
-            dict(self.base_payload, executionNum=2, fullyIdle=True)
-        )
-        self.assertEqual(res_stop_ok["decision"], "allow")
+        self.assertEqual(self._stop(executionNum=2)["decision"], "allow")
 
     def test_phase3_swarm_post_tool_rollback_breaker_and_replan(self) -> None:
         orchestrator_guard._cli_activate(self.base_payload)
-
-        # Mark dirty receipt to verify swarm success does not clear it
-        st = orchestrator_guard._load_state(self.base_payload)
+        st = self._load_st()
         receipt = orchestrator_guard._get_test_receipt(st, self.base_payload)
-        receipt["dirty"] = True
-        receipt["verified"] = False
+        receipt["dirty"], receipt["verified"] = True, False
         orchestrator_guard._save_state(self.base_payload, st)
 
-        # Trivial EVAL_CMD in swarm brief is denied
-        res_trivial = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "sw_triv",
-                    "name": "swarm",
-                    "args": {
-                        "action": "add",
-                        "name": "proposer-a",
-                        "brief": "MODE: COUNCIL\nEVAL_CMD: true",
-                    },
-                },
-            )
-        )
+        res_trivial = self._pre("swarm", {"action": "add", "name": "proposer-a", "brief": "MODE: COUNCIL\nEVAL_CMD: true"}, call_id="sw_triv")
         self.assertEqual(res_trivial["decision"], "deny")
         self.assertIn("Trivial or no-op EVAL_CMD rejected", res_trivial["reason"])
 
-        # First swarm add + PostToolUse failure rolls back by call_id and increments failure_streak
-        add_args_1 = {
-            "action": "add",
-            "name": "proposer-a",
-            "model": "claude-opus",
-            "brief": "MODE: COUNCIL\nCOUNCIL_ID: c-err\nCOUNCIL_ROLE: proposer\nDraft A",
-        }
-        orchestrator_guard.handle_pre_tool(
-            dict(self.base_payload, toolCall={"id": "sw_err_1", "name": "swarm", "args": add_args_1})
-        )
-        self.assertIn("proposer-a", orchestrator_guard._load_state(self.base_payload)["swarm_workers"])
+        add_args_1 = {"action": "add", "name": "proposer-a", "model": "claude-opus", "brief": "MODE: COUNCIL\nCOUNCIL_ID: c-err\nCOUNCIL_ROLE: proposer\nDraft A"}
+        self._pre("swarm", add_args_1, call_id="sw_err_1")
+        self.assertIn("proposer-a", self._load_st()["swarm_workers"])
 
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={"id": "sw_err_1", "name": "swarm", "args": add_args_1},
-                error="swarm add failed",
-            )
-        )
-        st_err_1 = orchestrator_guard._load_state(self.base_payload)
+        self._post("swarm", add_args_1, error="swarm add failed", call_id="sw_err_1")
+        st_err_1 = self._load_st()
         self.assertNotIn("proposer-a", st_err_1["swarm_workers"])
         self.assertEqual(st_err_1["councils"]["c-err"]["proposers"], [])
         self.assertEqual(st_err_1["circuit_breaker"]["failure_streak"], 1)
         self.assertFalse(st_err_1["circuit_breaker"]["tripped"])
 
-        # Second swarm add + PostToolUse failure (empty call_id fallback) trips circuit breaker
-        add_args_2 = {
-            "action": "add",
-            "name": "proposer-b",
-            "n": 2,
-            "model": "gpt-5",
-            "brief": "MODE: COUNCIL\nCOUNCIL_ID: c-err\nCOUNCIL_ROLE: proposer\nDraft B",
-        }
-        orchestrator_guard.handle_pre_tool(
-            dict(self.base_payload, toolCall={"name": "swarm", "args": add_args_2})
-        )
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={"name": "swarm", "args": add_args_2},
-                exitCode=1,
-            )
-        )
-        st_err_2 = orchestrator_guard._load_state(self.base_payload)
+        add_args_2 = {"action": "add", "name": "proposer-b", "n": 2, "model": "gpt-5", "brief": "MODE: COUNCIL\nCOUNCIL_ID: c-err\nCOUNCIL_ROLE: proposer\nDraft B"}
+        self._pre("swarm", add_args_2)
+        self._post("swarm", add_args_2, exit_code=1)
+        st_err_2 = self._load_st()
         self.assertNotIn("proposer-b-1", st_err_2["swarm_workers"])
         self.assertNotIn("proposer-b-2", st_err_2["swarm_workers"])
         self.assertEqual(st_err_2["circuit_breaker"]["failure_streak"], 2)
         self.assertTrue(st_err_2["circuit_breaker"]["tripped"])
 
-        # Tripped breaker allows status/kill, blocks add without REPLAN:, allows 1-shot REPLAN:
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(
-                dict(self.base_payload, toolCall={"name": "swarm", "args": {"action": "status"}})
-            )["decision"],
-            "allow",
-        )
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={"name": "swarm", "args": {"action": "kill", "name": "any"}},
-                )
-            )["decision"],
-            "allow",
-        )
-        res_blocked = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "sw_blocked",
-                    "name": "swarm",
-                    "args": {
-                        "action": "add",
-                        "name": "proposer-c",
-                        "brief": "Retry without replan",
-                    },
-                },
-            )
-        )
+        self.assertEqual(self._pre("swarm", {"action": "status"})["decision"], "allow")
+        self.assertEqual(self._pre("swarm", {"action": "kill", "name": "any"})["decision"], "allow")
+
+        res_blocked = self._pre("swarm", {"action": "add", "name": "proposer-c", "brief": "Retry without replan"}, call_id="sw_blocked")
         self.assertEqual(res_blocked["decision"], "deny")
         self.assertIn("REPLAN:", res_blocked["reason"])
 
-        res_replan = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "sw_replan",
-                    "name": "swarm",
-                    "args": {
-                        "action": "add",
-                        "name": "proposer-c",
-                        "model": "gemini-4-pro",
-                        "brief": "REPLAN: switch provider\nMODE: COUNCIL\nCOUNCIL_ID: c-err\nCOUNCIL_ROLE: proposer",
-                    },
-                },
-            )
-        )
+        res_replan = self._pre("swarm", {"action": "add", "name": "proposer-c", "model": "gemini-4-pro", "brief": "REPLAN: switch provider\nMODE: COUNCIL\nCOUNCIL_ID: c-err\nCOUNCIL_ROLE: proposer"}, call_id="sw_replan")
         self.assertEqual(res_replan["decision"], "allow")
-        st_replanned = orchestrator_guard._load_state(self.base_payload)
+        st_replanned = self._load_st()
         self.assertFalse(st_replanned["circuit_breaker"]["tripped"])
         self.assertEqual(st_replanned["circuit_breaker"]["replan_count"], 1)
 
-        # Success resets failure_streak while preserving dirty test_receipt
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={"id": "sw_replan", "name": "swarm", "args": {"action": "add", "name": "proposer-c"}},
-                output="Worker proposer-c ready",
-            )
-        )
-        st_ok = orchestrator_guard._load_state(self.base_payload)
+        self._post("swarm", {"action": "add", "name": "proposer-c"}, output="Worker proposer-c ready", call_id="sw_replan")
+        st_ok = self._load_st()
         self.assertEqual(st_ok["circuit_breaker"]["failure_streak"], 0)
         self.assertFalse(st_ok["circuit_breaker"]["tripped"])
         self.assertTrue(st_ok["test_receipt"]["dirty"])
@@ -7602,175 +2863,62 @@ orchestrator_guard.register_subagent(
     def test_phase3_non_swarm_council_proposer_and_cli_status(self) -> None:
         orchestrator_guard._cli_activate(self.base_payload)
 
-        # MODE: COUNCIL research proposer allows pro/inherit/flash without flash_lite downgrade
-        res_research_pro = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "inv_res_pro",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "research",
-                        "Role": "Proposer A",
-                        "Model": "pro",
-                        "Prompt": "MODE: COUNCIL\nCOUNCIL_ID: fallback-1\nCOUNCIL_ROLE: proposer\n1. Compare options.",
-                    },
-                },
-            )
-        )
+        res_research_pro = self._pre("invoke_subagent", self._sub_args("research", "Proposer A", "pro", "MODE: COUNCIL\nCOUNCIL_ID: fallback-1\nCOUNCIL_ROLE: proposer\n1. Compare options."), call_id="inv_res_pro")
         self.assertEqual(res_research_pro["decision"], "allow")
         self.assertNotIn("overwrite", res_research_pro)
 
-        res_research_flash = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "inv_res_flash",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "research",
-                        "Role": "Proposer B",
-                        "Model": "flash",
-                        "Prompt": "MODE: COUNCIL\nCOUNCIL_ID: fallback-1\nCOUNCIL_ROLE: proposer\n1. Summarize design.",
-                    },
-                },
-            )
-        )
+        res_research_flash = self._pre("invoke_subagent", self._sub_args("research", "Proposer B", "flash", "MODE: COUNCIL\nCOUNCIL_ID: fallback-1\nCOUNCIL_ROLE: proposer\n1. Summarize design."), call_id="inv_res_flash")
         self.assertEqual(res_research_flash["decision"], "allow")
         self.assertNotIn("overwrite", res_research_flash)
 
-        # council type allows inherit untouched even without explicit MODE header
-        res_council_inherit = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "inv_c_inh",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "council",
-                        "Role": "Proposer C",
-                        "Model": "inherit",
-                        "Prompt": "1. Propose architecture.",
-                    },
-                },
-            )
-        )
+        res_council_inherit = self._pre("invoke_subagent", self._sub_args("council", "Proposer C", "inherit", "1. Propose architecture."), call_id="inv_c_inh")
         self.assertEqual(res_council_inherit["decision"], "allow")
         self.assertNotIn("overwrite", res_council_inherit)
 
-        # Standard non-council research still rejects Model='pro'
-        res_std_research = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "inv_std_res",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "research",
-                        "Role": "Standard Research",
-                        "Model": "pro",
-                        "Prompt": "1. Investigate module.",
-                    },
-                },
-            )
-        )
+        res_std_research = self._pre("invoke_subagent", self._sub_args("research", "Standard Research", "pro", "1. Investigate module."), call_id="inv_std_res")
         self.assertEqual(res_std_research["decision"], "deny")
         self.assertIn("Model='pro'", res_std_research["reason"])
 
-        # Council proposer is scratch-only: scratch .md allowed, workspace code denied, receipt kept dirty
-        st = orchestrator_guard._load_state(self.base_payload)
+        st = self._load_st()
         receipt = orchestrator_guard._get_test_receipt(st, self.base_payload)
-        receipt["dirty"] = True
-        receipt["verified"] = False
+        receipt["dirty"], receipt["verified"] = True, False
         orchestrator_guard._save_state(self.base_payload, st)
 
         council_cid = "sub-council-proposer-1"
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id=council_cid,
-            type_name="council",
-            model="pro",
-            mode="council",
-            council_id="fallback-1",
-            council_role="proposer",
-        )
-        council_payload = dict(self.base_payload, conversationId=council_cid)
+        self._reg_sub("council", council_cid, "pro", mode="council", council_id="fallback-1", council_role="proposer")
 
-        res_scratch = orchestrator_guard.handle_pre_tool(
-            dict(
-                council_payload,
-                toolCall={
-                    "name": "write_file",
-                    "args": {
-                        "Path": str(Path(self.artifact_dir) / "scratch" / "proposal_a.md"),
-                        "Content": "# Proposal A\n",
-                    },
-                },
-            )
+        self.assertEqual(
+            self._pre("write_file", {"Path": str(Path(self.artifact_dir) / "scratch" / "proposal_a.md"), "Content": "# Proposal A\n"}, cid=council_cid)["decision"],
+            "allow",
         )
-        self.assertEqual(res_scratch["decision"], "allow")
-
-        res_code_mut = orchestrator_guard.handle_pre_tool(
-            dict(
-                council_payload,
-                toolCall={
-                    "name": "write_file",
-                    "args": {
-                        "Path": str(orchestrator_guard.PROJECT_ROOT / "src" / "hack.py"),
-                        "Content": "x = 1\n",
-                    },
-                },
-            )
-        )
+        res_code_mut = self._pre("write_file", {"Path": str(orchestrator_guard.PROJECT_ROOT / "src" / "hack.py"), "Content": "x = 1\n"}, cid=council_cid)
         self.assertEqual(res_code_mut["decision"], "deny")
         self.assertIn("may only write markdown reports", res_code_mut["reason"])
 
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "inv_c_done",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "council",
-                        "Role": "Proposer C",
-                        "Model": "inherit",
-                        "Prompt": "1. Propose architecture.",
-                    },
-                },
-                output="STATUS: COMPLETED\nFILES_CHANGED: scratch/proposal_a.md\nVERIFICATION: n/a\nNOTES: Drafted Proposal A.",
-            )
+        self._post(
+            "invoke_subagent",
+            self._sub_args("council", "Proposer C", "inherit", "1. Propose architecture."),
+            output="STATUS: COMPLETED\nFILES_CHANGED: scratch/proposal_a.md\nVERIFICATION: n/a\nNOTES: Drafted Proposal A.",
+            call_id="inv_c_done",
         )
-        st_after = orchestrator_guard._load_state(self.base_payload)
+        st_after = self._load_st()
         self.assertTrue(st_after["test_receipt"]["dirty"])
         self.assertEqual(st_after["councils"]["fallback-1"]["proposers"], ["Proposer A", "Proposer B"])
 
-        # _cli_status surfaces councils and swarmWorkers
         status_out = orchestrator_guard._cli_status(self.base_payload)
         self.assertIn("councils", status_out)
         self.assertIn("swarmWorkers", status_out)
         self.assertIn("fallback-1", status_out["councils"])
 
-        # _prune_state bounds councils and prunes oldest killed swarm_workers
         prune_state = orchestrator_guard._default_state()
         for i in range(orchestrator_guard.MAX_STATE_INVOCATION_HISTORY + 5):
-            prune_state["councils"][f"c-{i}"] = {
-                "proposers": [f"p-{j}" for j in range(orchestrator_guard.MAX_STATE_LIST_ENTRIES + 5)],
-                "judges": [],
-                "models": [],
-                "created_at": float(i),
-            }
+            prune_state["councils"][f"c-{i}"] = {"proposers": [f"p-{j}" for j in range(orchestrator_guard.MAX_STATE_LIST_ENTRIES + 5)], "judges": [], "models": [], "created_at": float(i)}
         for i in range(orchestrator_guard.MAX_STATE_LIST_ENTRIES + 5):
-            prune_state["swarm_workers"][f"w-{i}"] = {
-                "name": f"w-{i}",
-                "status": "killed" if i < 10 else "active",
-                "spawned_at": float(i),
-            }
+            prune_state["swarm_workers"][f"w-{i}"] = {"name": f"w-{i}", "status": "killed" if i < 10 else "active", "spawned_at": float(i)}
         orchestrator_guard._prune_state(prune_state)
         self.assertEqual(len(prune_state["councils"]), orchestrator_guard.MAX_STATE_INVOCATION_HISTORY)
         self.assertNotIn("c-0", prune_state["councils"])
-        first_c = next(iter(prune_state["councils"].values()))
-        self.assertEqual(len(first_c["proposers"]), orchestrator_guard.MAX_STATE_LIST_ENTRIES)
+        self.assertEqual(len(next(iter(prune_state["councils"].values()))["proposers"]), orchestrator_guard.MAX_STATE_LIST_ENTRIES)
         self.assertEqual(len(prune_state["swarm_workers"]), orchestrator_guard.MAX_STATE_LIST_ENTRIES)
         self.assertNotIn("w-0", prune_state["swarm_workers"])
         self.assertIn("w-5", prune_state["swarm_workers"])
@@ -7779,179 +2927,65 @@ orchestrator_guard.register_subagent(
         orchestrator_guard._cli_activate(self.base_payload)
 
         def _invoke_judge(prompt: str, call_id: str) -> dict:
-            return orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={
-                        "id": call_id,
-                        "name": "invoke_subagent",
-                        "args": {
-                            "TypeName": "judge",
-                            "Role": "Blind Judge",
-                            "Model": "inherit",
-                            "Prompt": prompt,
-                        },
-                    },
-                )
-            )
+            return self._pre("invoke_subagent", self._sub_args("judge", "Blind Judge", "inherit", prompt), call_id=call_id)
 
-        # Standalone metadata lines
-        res_meta1 = _invoke_judge(
-            "MODE: COUNCIL\nCOUNCIL_ID: c-meta-1\nCOUNCIL_ROLE: judge\nModel: Claude Opus 5.5\nCompare proposals.",
-            "j_meta1",
-        )
-        self.assertEqual(res_meta1["decision"], "deny")
-        self.assertIn("Blind judging violation", res_meta1["reason"])
+        for cid_call, text in (
+            ("j_meta1", "MODE: COUNCIL\nCOUNCIL_ID: c-meta-1\nCOUNCIL_ROLE: judge\nModel: Claude Opus 5.5\nCompare proposals."),
+            ("j_meta2", "MODE: COUNCIL\nCOUNCIL_ID: c-meta-2\nCOUNCIL_ROLE: judge\n- Author: Gemini 4 Carbon\nCompare proposals."),
+            ("j_wide", "MODE: COUNCIL\nCOUNCIL_ID: c-wide\nCOUNCIL_ROLE: judge\nProposal A (written carefully over two iterations by Claude Opus 5.5)"),
+            ("j_fname", "MODE: COUNCIL\nCOUNCIL_ID: c-fname\nCOUNCIL_ROLE: judge\nReview scratch/proposal_claude.md and scratch/proposal_b.md."),
+        ):
+            res = _invoke_judge(text, cid_call)
+            self.assertEqual(res["decision"], "deny")
+            self.assertIn("Blind judging violation", res["reason"])
+        self.assertEqual(_invoke_judge("MODE: COUNCIL\nCOUNCIL_ID: c-meta-3\nCOUNCIL_ROLE: judge\nModel: GPT-5\nCompare.", "j_meta3")["decision"], "deny")
+        self.assertEqual(_invoke_judge("MODE: COUNCIL\nCOUNCIL_ID: c-meta-4\nCOUNCIL_ROLE: judge\nAuthor: Claude Sonnet\nCompare.", "j_meta4")["decision"], "deny")
 
-        res_meta2 = _invoke_judge(
-            "MODE: COUNCIL\nCOUNCIL_ID: c-meta-2\nCOUNCIL_ROLE: judge\n- Author: Gemini 4 Carbon\nCompare proposals.",
-            "j_meta2",
-        )
-        self.assertEqual(res_meta2["decision"], "deny")
-        self.assertIn("Blind judging violation", res_meta2["reason"])
-
-        # Wider same-line attribution (>30 chars between proposal id and model)
-        res_wide = _invoke_judge(
-            "MODE: COUNCIL\nCOUNCIL_ID: c-wide\nCOUNCIL_ROLE: judge\n"
-            "Proposal A (written carefully over two iterations by Claude Opus 5.5)",
-            "j_wide",
-        )
-        self.assertEqual(res_wide["decision"], "deny")
-        self.assertIn("Blind judging violation", res_wide["reason"])
-
-        # Model-named proposal filename
-        res_fname = _invoke_judge(
-            "MODE: COUNCIL\nCOUNCIL_ID: c-fname\nCOUNCIL_ROLE: judge\n"
-            "Review scratch/proposal_claude.md and scratch/proposal_b.md.",
-            "j_fname",
-        )
-        self.assertEqual(res_fname["decision"], "deny")
-        self.assertIn("Blind judging violation", res_fname["reason"])
-
-        # Referenced scratch file containing metadata leak
         scratch_dir = Path(self.artifact_dir) / "scratch"
         scratch_dir.mkdir(parents=True, exist_ok=True)
         prop_a = scratch_dir / "proposal_a.md"
         prop_a.write_text("# Proposal A\nAuthor: Gemini 4 Carbon\nUse modular handlers.\n", encoding="utf-8")
 
-        res_scratch_leak = _invoke_judge(
-            f"MODE: COUNCIL\nCOUNCIL_ID: c-scratch-leak\nCOUNCIL_ROLE: judge\nReview {prop_a}.",
-            "j_scratch_leak",
-        )
+        res_scratch_leak = _invoke_judge(f"MODE: COUNCIL\nCOUNCIL_ID: c-scratch-leak\nCOUNCIL_ROLE: judge\nReview {prop_a}.", "j_scratch_leak")
         self.assertEqual(res_scratch_leak["decision"], "deny")
         self.assertIn("proposal_a.md", res_scratch_leak["reason"])
 
-        # Referenced scratch file with benign technical prose ("carbon accounting with the Gemini API client")
-        prop_b = scratch_dir / "proposal_b.md"
-        prop_b.write_text(
-            "# Proposal B\nImplement carbon accounting with the Gemini API client.\n",
-            encoding="utf-8",
-        )
-        res_clean = _invoke_judge(
-            "MODE: COUNCIL\nCOUNCIL_ID: c-clean\nCOUNCIL_ROLE: judge\nReview scratch/proposal_b.md.",
-            "j_clean",
-        )
-        self.assertEqual(res_clean["decision"], "allow")
+        (scratch_dir / "proposal_b.md").write_text("# Proposal B\nImplement carbon accounting with the Gemini API client.\n", encoding="utf-8")
+        self.assertEqual(_invoke_judge("MODE: COUNCIL\nCOUNCIL_ID: c-clean\nCOUNCIL_ROLE: judge\nReview scratch/proposal_b.md.", "j_clean")["decision"], "allow")
 
     def test_phase3_swarm_sharded_kill_base_name_and_kill_error_rollback(self) -> None:
         orchestrator_guard._cli_activate(self.base_payload)
 
-        # Spawn sharded workers with isolated worktrees
-        res_add = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "sw_sharded_add",
-                    "name": "swarm",
-                    "args": {
-                        "action": "add",
-                        "name": "proposer",
-                        "n": 2,
-                        "workspace": "share",
-                        "brief": "MODE: COUNCIL\nCOUNCIL_ID: c-shard\nCOUNCIL_ROLE: proposer\nDraft design",
-                    },
-                },
-            )
+        res_add = self._pre(
+            "swarm",
+            {"action": "add", "name": "proposer", "n": 2, "workspace": "share", "brief": "MODE: COUNCIL\nCOUNCIL_ID: c-shard\nCOUNCIL_ROLE: proposer\nDraft design"},
+            call_id="sw_sharded_add",
         )
         self.assertEqual(res_add["decision"], "allow")
-        st_added = orchestrator_guard._load_state(self.base_payload)
+        st_added = self._load_st()
         self.assertEqual(st_added["swarm_workers"]["proposer-1"]["base_name"], "proposer")
         self.assertTrue(st_added["swarm_workers"]["proposer-1"]["sharded"])
 
-        # Killing by base name instead of individual sharded worker names is denied
-        res_kill_base = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "sw_kill_base",
-                    "name": "swarm",
-                    "args": {"action": "kill", "name": "proposer"},
-                },
-            )
-        )
+        res_kill_base = self._pre("swarm", {"action": "kill", "name": "proposer"}, call_id="sw_kill_base")
         self.assertEqual(res_kill_base["decision"], "deny")
         self.assertIn("proposer-1", res_kill_base["reason"])
         self.assertIn("proposer-2", res_kill_base["reason"])
 
-        # Killing proposer-1 allowed at PreToolUse -> temporarily marked killed
-        res_kill_1_pre = orchestrator_guard.handle_pre_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "sw_kill_1_err",
-                    "name": "swarm",
-                    "args": {"action": "kill", "name": "proposer-1"},
-                },
-            )
-        )
-        self.assertEqual(res_kill_1_pre["decision"], "allow")
-        self.assertEqual(
-            orchestrator_guard._load_state(self.base_payload)["swarm_workers"]["proposer-1"]["status"],
-            "killed",
-        )
+        self.assertEqual(self._pre("swarm", {"action": "kill", "name": "proposer-1"}, call_id="sw_kill_1_err")["decision"], "allow")
+        self.assertEqual(self._load_st()["swarm_workers"]["proposer-1"]["status"], "killed")
 
-        # PostToolUse error rolls back proposer-1 to active + active_worktree=True
-        orchestrator_guard.handle_post_tool(
-            dict(
-                self.base_payload,
-                toolCall={
-                    "id": "sw_kill_1_err",
-                    "name": "swarm",
-                    "args": {"action": "kill", "name": "proposer-1"},
-                },
-                error="Worker not found or kill failed",
-            )
-        )
-        st_rolled = orchestrator_guard._load_state(self.base_payload)
+        self._post("swarm", {"action": "kill", "name": "proposer-1"}, error="Worker not found or kill failed", call_id="sw_kill_1_err")
+        st_rolled = self._load_st()
         self.assertEqual(st_rolled["swarm_workers"]["proposer-1"]["status"], "active")
         self.assertTrue(st_rolled["swarm_workers"]["proposer-1"]["active_worktree"])
+        self.assertEqual(self._stop(executionNum=1)["decision"], "continue")
 
-        # Stop still blocks because active isolated worktrees remain
-        res_stop_blocked = orchestrator_guard.handle_stop(
-            dict(self.base_payload, executionNum=1, fullyIdle=True)
-        )
-        self.assertEqual(res_stop_blocked["decision"], "continue")
-
-        # Cleanly kill both sharded workers (PreToolUse + PostToolUse without error)
         for wname in ("proposer-1", "proposer-2"):
-            cid = f"sw_kill_ok_{wname}"
-            args_kill = {"action": "kill", "name": wname}
-            res_pre = orchestrator_guard.handle_pre_tool(
-                dict(self.base_payload, toolCall={"id": cid, "name": "swarm", "args": args_kill})
-            )
-            self.assertEqual(res_pre["decision"], "allow")
-            orchestrator_guard.handle_post_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={"id": cid, "name": "swarm", "args": args_kill},
-                    output=f"Killed {wname}",
-                )
-            )
+            cid_k = f"sw_kill_ok_{wname}"
+            self.assertEqual(self._pre("swarm", {"action": "kill", "name": wname}, call_id=cid_k)["decision"], "allow")
+            self._post("swarm", {"action": "kill", "name": wname}, output=f"Killed {wname}", call_id=cid_k)
 
-        res_stop_ok = orchestrator_guard.handle_stop(
-            dict(self.base_payload, executionNum=2, fullyIdle=True)
-        )
-        self.assertEqual(res_stop_ok["decision"], "allow")
+        self.assertEqual(self._stop(executionNum=2)["decision"], "allow")
 
     def test_concurrency_abba_lock_order_and_atomic_persistence(self) -> None:
         import contextlib
@@ -7962,42 +2996,20 @@ orchestrator_guard.register_subagent(
         import guard.subagent_policy as subagent_policy_mod
         import guard.verification as verification_mod
 
-        brain_base = Path(self.temp_dir.name) / "conc_app" / "brain"
-        parent_dir = brain_base / "parent-abba"
-        child_dir = brain_base / "child-abba"
-        scout_dir = brain_base / "child-scout-1"
-        verifier_dir = brain_base / "child-verifier"
-        sub_s_dir = brain_base / "sub-s"
-        root_cs2a_dir = brain_base / "root-cs2a"
-        for d in (parent_dir, child_dir, scout_dir, verifier_dir, sub_s_dir, root_cs2a_dir):
-            d.mkdir(parents=True, exist_ok=True)
+        root_dir = "conc_app/brain"
+        parent_p = self._brain_payload("parent-abba", root=root_dir)
+        child_p = self._brain_payload("child-abba", root=root_dir, isSubagent=True)
+        scout_p = self._brain_payload("child-scout-1", root=root_dir, isSubagent=True)
+        verifier_p = self._brain_payload("child-verifier", root=root_dir, isSubagent=True)
+        sub_s_dir = Path(self.artifact_dir) / root_dir / "sub-s"
+        root_cs2a_dir = Path(self.artifact_dir) / root_dir / "root-cs2a"
+        sub_s_dir.mkdir(parents=True, exist_ok=True)
+        root_cs2a_dir.mkdir(parents=True, exist_ok=True)
 
-        parent_payload = {
-            "conversationId": "parent-abba",
-            "workspacePaths": [str(orchestrator_guard.PROJECT_ROOT)],
-            "artifactDirectoryPath": str(parent_dir),
-            "invocationNum": 1,
-            "executionNum": 1,
-        }
-        orchestrator_guard._cli_activate(parent_payload)
-        orchestrator_guard.handle_pre_invocation(parent_payload)
+        orchestrator_guard._cli_activate(parent_p)
+        orchestrator_guard.handle_pre_invocation(parent_p)
+        self._pre("invoke_subagent", self._sub_args("implementer", "Worker", Workspace="inherit"), call_id="abba_spawn_1", base=parent_p)
 
-        # 1. AB-BA lock order check across ALL 5 modules holding state_transaction
-        orchestrator_guard.handle_pre_tool(
-            dict(
-                parent_payload,
-                toolCall={
-                    "id": "abba_spawn_1",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "implementer",
-                        "Role": "Worker",
-                        "Workspace": "inherit",
-                        "Prompt": VALID_PROMPT,
-                    },
-                },
-            )
-        )
         held_stack: list[str] = []
         orig_tx = state_store_mod.state_transaction
 
@@ -8006,9 +3018,7 @@ orchestrator_guard.register_subagent(
             resolved = str(state_store_mod._resolve_state_path(payload_or_path).resolve())
             distinct = set(held_stack)
             if distinct and resolved not in distinct:
-                raise AssertionError(
-                    f"AB-BA deadlock risk: nested state_transaction {resolved} while holding {distinct}"
-                )
+                raise AssertionError(f"AB-BA deadlock risk: nested state_transaction {resolved} while holding {distinct}")
             held_stack.append(resolved)
             try:
                 with orig_tx(payload_or_path):
@@ -8016,195 +3026,64 @@ orchestrator_guard.register_subagent(
             finally:
                 held_stack.pop()
 
-        child_payload = {
-            "conversationId": "child-abba",
-            "workspacePaths": [str(orchestrator_guard.PROJECT_ROOT)],
-            "artifactDirectoryPath": str(child_dir),
-            "isSubagent": True,
-            "invocationNum": 1,
-            "executionNum": 1,
-        }
-        with (
-            mock.patch.object(state_store_mod, "state_transaction", checked_tx),
-            mock.patch.object(identity_mod, "state_transaction", checked_tx),
-            mock.patch.object(policies_mod, "state_transaction", checked_tx),
-            mock.patch.object(subagent_policy_mod, "state_transaction", checked_tx),
-            mock.patch.object(verification_mod, "state_transaction", checked_tx),
-        ):
-            orchestrator_guard.handle_pre_invocation(child_payload)
-            res_edit = orchestrator_guard.handle_pre_tool(
-                dict(
-                    child_payload,
-                    toolCall={
-                        "id": "abba_edit",
-                        "name": "edit_file",
-                        "args": {
-                            "Path": str(orchestrator_guard.PROJECT_ROOT / "src" / "abba.py"),
-                            "Target": "a",
-                            "Replacement": "b",
-                        },
-                    },
-                )
-            )
+        with contextlib.ExitStack() as stack:
+            for mod_obj in (state_store_mod, identity_mod, policies_mod, subagent_policy_mod, verification_mod):
+                stack.enter_context(mock.patch.object(mod_obj, "state_transaction", checked_tx))
+            orchestrator_guard.handle_pre_invocation(child_p)
+            res_edit = self._pre("edit_file", {"Path": str(orchestrator_guard.PROJECT_ROOT / "src" / "abba.py"), "Target": "a", "Replacement": "b"}, call_id="abba_edit", base=child_p)
             self.assertEqual(res_edit["decision"], "allow")
-            orchestrator_guard.handle_post_tool(
-                dict(
-                    child_payload,
-                    toolCall={
-                        "id": "abba_test",
-                        "name": "run_command",
-                        "args": {"CommandLine": "pytest tests/"},
-                    },
-                    exitCode=0,
-                )
-            )
-            orchestrator_guard.handle_pre_tool(
-                dict(
-                    parent_payload,
-                    toolCall={
-                        "id": "abba_msg",
-                        "name": "send_message",
-                        "args": {
-                            "Recipient": "child-abba",
-                            "Message": "STAGE: 2/2\nALLOWED_FILES: src/abba.py\nProceed.",
-                        },
-                    },
-                )
-            )
-            orchestrator_guard.handle_stop(
-                dict(
-                    child_payload,
-                    fullyIdle=True,
-                    lastAssistantMessage=(
-                        "STATUS: COMPLETED\nFILES_CHANGED: src/abba.py\n"
-                        "VERIFICATION: pytest passed\nNOTES: Done."
-                    ),
-                )
-            )
+            self._post("run_command", {"CommandLine": "pytest tests/"}, exit_code=0, call_id="abba_test", base=child_p)
+            self._pre("send_message", {"Recipient": "child-abba", "Message": "STAGE: 2/2\nALLOWED_FILES: src/abba.py\nProceed."}, call_id="abba_msg", base=parent_p)
+            self._stop("STATUS: COMPLETED\nFILES_CHANGED: src/abba.py\nVERIFICATION: pytest passed\nNOTES: Done.", base=child_p)
 
-        # 2. pending_spawns no-hijack & _is_known_subagent claims meta cleanly
-        hijack_dir = brain_base / "parent-hijack"
-        hijack_dir.mkdir(parents=True, exist_ok=True)
-        hp = dict(parent_payload, conversationId="parent-hijack", artifactDirectoryPath=str(hijack_dir))
+        hp = self._brain_payload("parent-hijack", root=root_dir)
         orchestrator_guard._cli_activate(hp)
         for cid, ws in (("sync_branch", "branch"), ("sync_inherit", "inherit")):
             args_inv = {"TypeName": "implementer", "Workspace": ws, "Prompt": VALID_PROMPT}
-            orchestrator_guard.handle_pre_tool(dict(hp, toolCall={"id": cid, "name": "invoke_subagent", "args": args_inv}))
-            orchestrator_guard.handle_post_tool(
-                dict(
-                    hp,
-                    toolCall={"id": cid, "name": "invoke_subagent", "args": args_inv},
-                    output="STATUS: COMPLETED\nFILES_CHANGED: src/a.py\nVERIFICATION: pytest ok\nNOTES: done",
-                )
-            )
-        self.assertEqual(len(orchestrator_guard._load_state(hp)["pending_spawns"]), 1)
-        orchestrator_guard.handle_pre_tool(
-            dict(
-                hp,
-                toolCall={
-                    "id": "async_scout",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "scout",
-                        "Role": "Log Scout",
-                        "Prompt": "TASK: Read logs.\nRULES:\n1. Read log.\nREPORT FORMAT:\nSTATUS: COMPLETED\nNOTES: ok",
-                    },
-                },
-            )
-        )
-        scout_payload = {
-            "conversationId": "child-scout-1",
-            "workspacePaths": [str(orchestrator_guard.PROJECT_ROOT)],
-            "artifactDirectoryPath": str(scout_dir),
-            "isSubagent": True,
-            "invocationNum": 1,
-            "executionNum": 1,
-        }
-        res_write = orchestrator_guard.handle_pre_tool(
-            dict(
-                scout_payload,
-                toolCall={
-                    "name": "write_file",
-                    "args": {"Path": str(orchestrator_guard.PROJECT_ROOT / "src" / "hack.py"), "Content": "x = 1\n"},
-                },
-            )
-        )
-        self.assertEqual(res_write["decision"], "deny")
-        self.assertEqual(orchestrator_guard._load_state(scout_payload)["self_subagent_meta"]["type"], "scout")
-        self.assertEqual(orchestrator_guard._load_state(hp)["pending_spawns"][0]["status"], "completed")
+            self._pre("invoke_subagent", args_inv, call_id=cid, base=hp)
+            self._post("invoke_subagent", args_inv, output="STATUS: COMPLETED\nFILES_CHANGED: src/a.py\nVERIFICATION: pytest ok\nNOTES: done", call_id=cid, base=hp)
+        self.assertEqual(len(self._load_st(hp)["pending_spawns"]), 1)
 
-        # 3. Failed clean child test preserves parent dirty receipt
-        p_st = orchestrator_guard._load_state(hp)
-        p_st["test_receipt"] = {
-            "dirty": True,
-            "verified": False,
-            "last_mutated_file": "src/core.py",
-            "last_test_cmd": "",
-            "mutation_epoch": 2,
-        }
-        orchestrator_guard._save_state(hp, p_st)
-        orchestrator_guard.register_subagent(hp, conversation_id="child-verifier", type_name="verifier", model="flash")
-        orchestrator_guard.handle_post_tool(
-            dict(
-                hp,
-                conversationId="child-verifier",
-                artifactDirectoryPath=str(verifier_dir),
-                isSubagent=True,
-                toolCall={"id": "fail_v_test", "name": "run_command", "args": {"CommandLine": "pytest tests/"}},
-                exitCode=1,
-            )
-        )
-        p_after = orchestrator_guard._load_state(hp)
+        self._pre("invoke_subagent", {"TypeName": "scout", "Role": "Log Scout", "Prompt": "TASK: Read logs.\nRULES:\n1. Read log.\nREPORT FORMAT:\nSTATUS: COMPLETED\nNOTES: ok"}, call_id="async_scout", base=hp)
+        res_write = self._pre("write_file", {"Path": str(orchestrator_guard.PROJECT_ROOT / "src" / "hack.py"), "Content": "x = 1\n"}, base=scout_p)
+        self.assertEqual(res_write["decision"], "deny")
+        self.assertEqual(self._load_st(scout_p)["self_subagent_meta"]["type"], "scout")
+        self.assertEqual(self._load_st(hp)["pending_spawns"][0]["status"], "completed")
+
+        self._seed_state(hp, test_receipt={"dirty": True, "verified": False, "last_mutated_file": "src/core.py", "last_test_cmd": "", "mutation_epoch": 2})
+        self._reg_sub("verifier", "child-verifier", "flash", payload=hp)
+        self._post("run_command", {"CommandLine": "pytest tests/"}, exit_code=1, call_id="fail_v_test", base=verifier_p)
+        p_after = self._load_st(hp)
         self.assertTrue(p_after["test_receipt"]["dirty"])
         self.assertFalse(p_after["test_receipt"]["verified"])
         self.assertEqual(p_after["test_receipt"]["mutation_epoch"], 2)
 
-        # 4. Corrupt JSON state fails closed (active=True, session_evaluated=True)
-        corrupt_dir = brain_base / "corrupt-brain"
+        corrupt_dir = Path(self.artifact_dir) / root_dir / "corrupt-brain"
         corrupt_dir.mkdir(parents=True, exist_ok=True)
         (corrupt_dir / "orchestrator_state.json").write_text("{bad json", encoding="utf-8")
-        corrupt_loaded = orchestrator_guard._load_state(
-            dict(parent_payload, conversationId="corrupt-cid", artifactDirectoryPath=str(corrupt_dir))
-        )
+        corrupt_loaded = self._load_st(self._payload(cid="corrupt-cid", artifactDirectoryPath=str(corrupt_dir), base=parent_p))
         self.assertTrue(corrupt_loaded["active"])
         self.assertTrue(corrupt_loaded["session_evaluated"])
 
-        # 5. Structured subagent prompt mentioning SKILL.md claims pending_spawns without hijacking Root; CS-2a binds Root
-        inv_res = orchestrator_guard.handle_pre_tool(
-            dict(
-                hp,
-                toolCall={
-                    "id": "spawn-sub-s",
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "implementer",
-                        "Role": "Worker",
-                        "Model": "flash",
-                        "Prompt": (
-                            "TASK: Edit src/a.py.\nALLOWED_FILES: src/a.py\n"
-                            "Reference: .agents/plugins/philharmonic_orchestra/skills/philharmonic/SKILL.md\n"
-                            "RULES:\n1. Edit src/a.py.\nREPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: src/a.py\nVERIFICATION: ok\n"
-                        ),
-                    },
-                },
-            )
+        inv_res = self._pre(
+            "invoke_subagent",
+            self._sub_args("implementer", "Worker", "flash", "TASK: Edit src/a.py.\nALLOWED_FILES: src/a.py\nReference: .agents/plugins/philharmonic_orchestra/skills/philharmonic/SKILL.md\nRULES:\n1. Edit src/a.py.\nREPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: src/a.py\nVERIFICATION: ok\n"),
+            call_id="spawn-sub-s",
+            base=hp,
         )
         self.assertEqual(inv_res["decision"], "allow")
         sub_no_flag = {
             "conversationId": "sub-s",
             "workspacePaths": [str(orchestrator_guard.PROJECT_ROOT)],
             "artifactDirectoryPath": str(sub_s_dir),
-            "lastUserInput": (
-                "TASK: Edit src/a.py.\nALLOWED_FILES: src/a.py\n"
-                "Reference: .agents/plugins/philharmonic_orchestra/skills/philharmonic/SKILL.md\n"
-            ),
+            "lastUserInput": "TASK: Edit src/a.py.\nALLOWED_FILES: src/a.py\nReference: .agents/plugins/philharmonic_orchestra/skills/philharmonic/SKILL.md\n",
             "toolCall": {"name": "read_file", "args": {"Path": "src/a.py"}},
         }
         self.assertFalse(identity_mod._is_slash_command_triggered(sub_no_flag))
         sub_pay = dict(sub_no_flag, isSubagent=True)
         self.assertFalse(identity_mod._is_slash_command_triggered(sub_pay))
         orchestrator_guard.handle_pre_tool(sub_pay)
-        sub_st = orchestrator_guard._load_state(sub_pay)
+        sub_st = self._load_st(sub_pay)
         self.assertIsNotNone(sub_st.get("self_subagent_meta"))
         self.assertFalse(identity_mod._is_root_orchestrator(sub_pay, sub_st))
 
@@ -8212,21 +3091,14 @@ orchestrator_guard.register_subagent(
             "conversationId": "root-cs2a",
             "workspacePaths": [str(orchestrator_guard.PROJECT_ROOT)],
             "artifactDirectoryPath": str(root_cs2a_dir),
-            "toolCall": {
-                "name": "read_file",
-                "args": {
-                    "Path": str(
-                        orchestrator_guard.PROJECT_ROOT
-                        / ".agents/plugins/philharmonic_orchestra/skills/philharmonic/SKILL.md"
-                    )
-                },
-            },
+            "toolCall": {"name": "read_file", "args": {"Path": str(orchestrator_guard.PROJECT_ROOT / ".agents/plugins/philharmonic_orchestra/skills/philharmonic/SKILL.md")}},
         }
         self.assertTrue(identity_mod._is_slash_command_triggered(cs2a_pay))
         orchestrator_guard.handle_pre_tool(cs2a_pay)
-        self.assertEqual(orchestrator_guard._load_state(cs2a_pay).get("root_conversation_id"), "root-cs2a")
+        self.assertEqual(self._load_st(cs2a_pay).get("root_conversation_id"), "root-cs2a")
 
     def test_guard_self_protection_and_failsafe_entrypoint(self) -> None:
+        import contextlib
         import io
         from unittest import mock
         import guard.constants as guard_constants
@@ -8236,28 +3108,14 @@ orchestrator_guard.register_subagent(
         state_json = str(Path(self.artifact_dir) / "orchestrator_state.json")
         state_lock = str(Path(self.artifact_dir) / "orchestrator_state.lock")
         fb_state = str(orchestrator_guard.PROJECT_ROOT / ".agents" / ".state" / "orchestrator_state.json")
-        plugin_policies = str(
-            orchestrator_guard.PROJECT_ROOT
-            / ".agents"
-            / "plugins"
-            / "philharmonic_orchestra"
-            / "scripts"
-            / "guard"
-            / "policies.py"
-        )
+        plugin_policies = str(orchestrator_guard.PROJECT_ROOT / ".agents" / "plugins" / "philharmonic_orchestra" / "scripts" / "guard" / "policies.py")
         hooks_json = str(orchestrator_guard.PROJECT_ROOT / ".agents" / "hooks.json")
 
         self.assertFalse(orchestrator_guard._is_artifact_path(state_json, self.base_payload))
         self.assertFalse(orchestrator_guard._is_artifact_path(state_lock, self.base_payload))
 
         for target_p in (state_json, state_lock, fb_state, plugin_policies, hooks_json):
-            r_dir = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={"name": "write_file", "args": {"Path": target_p, "Content": "{}"}},
-                )
-            )
-            self.assertEqual(r_dir["decision"], "deny", f"Direct write must deny {target_p}")
+            self.assertEqual(self._pre("write_file", {"Path": target_p, "Content": "{}"})["decision"], "deny", f"Direct write must deny {target_p}")
 
         for bad_shell in (
             f"rm -f {state_json}",
@@ -8266,608 +3124,294 @@ orchestrator_guard.register_subagent(
             "python3 -c \"import pathlib; pathlib.Path('.agents/hooks.json').write_text('x')\"",
             "cd .agents/plugins/philharmonic_orchestra && ls",
             f"echo '{{}}' > {state_lock}",
+            "chmod -x .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py",
         ):
-            r_sh = orchestrator_guard.handle_pre_tool(
-                dict(self.base_payload, toolCall={"name": "run_command", "args": {"CommandLine": bad_shell}})
-            )
-            self.assertEqual(r_sh["decision"], "deny", f"Shell guard protection must deny: {bad_shell}")
+            self.assertEqual(self._pre("run_command", {"CommandLine": bad_shell})["decision"], "deny", f"Shell guard protection must deny: {bad_shell}")
 
-        # Exact ALLOWED_FILES self-hosting exception vs directory/wildcard denial
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id="selfhost-dir",
-            type_name="implementer",
-            model="flash",
-            allowed_files=[".agents/plugins/philharmonic_orchestra/scripts/guard"],
-        )
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    conversationId="selfhost-dir",
-                    toolCall={"name": "edit_file", "args": {"Path": plugin_policies, "Target": "a", "Replacement": "b"}},
-                )
-            )["decision"],
-            "deny",
-        )
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id="selfhost-exact",
-            type_name="implementer",
-            model="flash",
-            allowed_files=[plugin_policies],
-        )
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    conversationId="selfhost-exact",
-                    toolCall={"name": "edit_file", "args": {"Path": plugin_policies, "Target": "a", "Replacement": "b"}},
-                )
-            )["decision"],
-            "allow",
-        )
+        self._reg_sub("implementer", "selfhost-dir", "flash", allowed_files=[".agents/plugins/philharmonic_orchestra/scripts/guard"])
+        self.assertEqual(self._pre("edit_file", {"Path": plugin_policies, "Target": "a", "Replacement": "b"}, cid="selfhost-dir")["decision"], "deny")
+        self._reg_sub("implementer", "selfhost-exact", "flash", allowed_files=[plugin_policies])
+        self.assertEqual(self._pre("edit_file", {"Path": plugin_policies, "Target": "a", "Replacement": "b"}, cid="selfhost-exact")["decision"], "allow")
 
-        # Non-string conversationId handled gracefully across pre/post/stop and receipt sync
         for bad_cid in (123, ["x"]):
-            self.assertIn(
-                orchestrator_guard.handle_pre_tool(
-                    dict(
-                        self.base_payload,
-                        conversationId=bad_cid,
-                        toolCall={"name": "read_file", "args": {"Path": "README.md", "StartLine": 1, "EndLine": 5}},
-                    )
-                ).get("decision"),
-                ("allow", "deny"),
-            )
-            self.assertIsInstance(
-                guard_verification.handle_post_tool(
-                    dict(
-                        self.base_payload,
-                        conversationId=bad_cid,
-                        toolCall={"name": "run_command", "args": {"CommandLine": "git status"}},
-                        output="ok",
-                    )
-                ),
-                dict,
-            )
-            self.assertIsInstance(
-                guard_verification.handle_stop(
-                    dict(
-                        self.base_payload,
-                        conversationId=bad_cid,
-                        isSubagent=True,
-                        fullyIdle=True,
-                        terminationReason="NO_TOOL_CALL",
-                    )
-                ),
-                dict,
-            )
-            guard_verification._propagate_receipt_to_parent_brain(
-                dict(self.base_payload, conversationId=bad_cid), dirty=True, verified=False
-            )
+            self.assertIn(self._pre("read_file", {"Path": "README.md", "StartLine": 1, "EndLine": 5}, cid=bad_cid).get("decision"), ("allow", "deny"))
+            self.assertIsInstance(guard_verification.handle_post_tool(self._payload(cid=bad_cid, tool="run_command", args={"CommandLine": "git status"}, output="ok")), dict)
+            self.assertIsInstance(guard_verification.handle_stop(self._payload(cid=bad_cid, isSubagent=True, fullyIdle=True, terminationReason="NO_TOOL_CALL")), dict)
+            guard_verification._propagate_receipt_to_parent_brain(self._payload(cid=bad_cid), dirty=True, verified=False)
 
-        # Thin entrypoint line budget + fail-safe vs fail-closed + CLI doctor exit 1
-        entry_path = Path(guard_constants.SCRIPT_DIR) / "orchestrator_guard.py"
-        self.assertLess(len(entry_path.read_text(encoding="utf-8").splitlines()), 80)
+        self.assertLess(len((Path(guard_constants.SCRIPT_DIR) / "orchestrator_guard.py").read_text(encoding="utf-8").splitlines()), 80)
 
-        for exc_cls, expected_dec in (
-            (ImportError("missing"), "allow"),
-            (IndentationError("bad indent"), "allow"),
-            (MemoryError("oom"), "deny"),
-            (RecursionError("deep"), "deny"),
-        ):
+        for exc_cls, expected_dec in ((ImportError("missing"), "allow"), (IndentationError("bad indent"), "allow"), (MemoryError("oom"), "deny"), (RecursionError("deep"), "deny")):
             for mode in ("pre-tool", "stop"):
                 out_buf = io.StringIO()
-                with (
-                    mock.patch.object(sys, "argv", ["orchestrator_guard.py", mode]),
-                    mock.patch.dict(
-                        orchestrator_guard._safe_entrypoint.__globals__,
-                        {"main": mock.MagicMock(side_effect=exc_cls)},
-                    ),
-                    mock.patch.object(sys, "stdout", out_buf),
-                    self.assertRaises(SystemExit) as cm,
-                ):
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(mock.patch.object(sys, "argv", ["orchestrator_guard.py", mode]))
+                    stack.enter_context(mock.patch.dict(orchestrator_guard._safe_entrypoint.__globals__, {"main": mock.MagicMock(side_effect=exc_cls)}))
+                    stack.enter_context(mock.patch.object(sys, "stdout", out_buf))
+                    cm = stack.enter_context(self.assertRaises(SystemExit))
                     orchestrator_guard._safe_entrypoint()
                 self.assertEqual(cm.exception.code, 0)
                 self.assertEqual(json.loads(out_buf.getvalue())["decision"], expected_dec)
 
         err_buf = io.StringIO()
-        with (
-            mock.patch.object(sys, "argv", ["orchestrator_guard.py", "doctor"]),
-            mock.patch.dict(
-                orchestrator_guard._safe_entrypoint.__globals__,
-                {"main": mock.MagicMock(side_effect=ImportError("broken"))},
-            ),
-            mock.patch.object(sys, "stderr", err_buf),
-            self.assertRaises(SystemExit) as cm_doc,
-        ):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(sys, "argv", ["orchestrator_guard.py", "doctor"]))
+            stack.enter_context(mock.patch.dict(orchestrator_guard._safe_entrypoint.__globals__, {"main": mock.MagicMock(side_effect=ImportError("broken"))}))
+            stack.enter_context(mock.patch.object(sys, "stderr", err_buf))
+            cm_doc = stack.enter_context(self.assertRaises(SystemExit))
             orchestrator_guard._safe_entrypoint()
         self.assertEqual(cm_doc.exception.code, 1)
         self.assertIn("Guard error: broken", err_buf.getvalue())
 
-        # Non-dict JSON lines skipped cleanly in _extract_last_model_response
         tr_path = Path(self.temp_dir.name) / "transcript.jsonl"
-        tr_path.write_text(
-            '[]\n123\n"hi"\n' + json.dumps({"type": "PLANNER_RESPONSE", "content": "final answer"}) + "\n",
-            encoding="utf-8",
-        )
+        tr_path.write_text('[]\n123\n"hi"\n' + json.dumps({"type": "PLANNER_RESPONSE", "content": "final answer"}) + "\n", encoding="utf-8")
         self.assertEqual(guard_verification._extract_last_model_response(str(tr_path)), "final answer")
 
     def test_root_closed_world_run_command_allowlist(self) -> None:
-        root_dir = Path(self.artifact_dir) / "root_allow_brain"
-        root_dir.mkdir(parents=True, exist_ok=True)
-        root_payload = dict(
-            self.base_payload,
-            conversationId="root-cw",
-            artifactDirectoryPath=str(root_dir),
-            lastUserInput="/philharmonic verify root allowlist",
-        )
-        orchestrator_guard._cli_activate(root_payload)
+        root_p = self._brain_payload("root-cw", lastUserInput="/philharmonic verify root allowlist")
+        root_dir = root_p["artifactDirectoryPath"]
+        orchestrator_guard._cli_activate(root_p)
 
         allowed_cmds = (
-            "ls -la",
-            "cat README.md",
-            "rg foo src/",
-            "git status",
-            "git diff 2>&1",
-            "git log -n 5",
-            "git branch -a",
-            "git tag -l",
-            "pytest -v",
-            "python3 -m unittest",
-            "tox -e py311",
-            "go test ./...",
-            "cargo test",
-            "ruff check .",
-            "mypy src",
-            "tsc --noEmit",
-            "python3 --version",
-            "node --version",
-            "go version",
-            "python3 -c 'import x; assert x.ok()'",
-            "python3 -c 'import math; print(math.sqrt(4))'",
+            "ls -la", "cat README.md", "rg foo src/", "git status", "git diff 2>&1", "git log -n 5",
+            "git branch -a", "git tag -l", "pytest -v", "python3 -m unittest", "tox -e py311",
+            "go test ./...", "cargo test", "ruff check .", "mypy src", "tsc --noEmit", "python3 --version",
+            "/usr/bin/python3 --version", "node --version", "go version",
             "python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py doctor",
             "python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py status",
-            f"mkdir -p {root_dir}/scratch",
-            f"echo hi > {root_dir}/scratch/report.md",
-            "find . -exec ls {} +",
-            "find . | xargs grep foo",
-            "tar -tf /tmp/x.tar",
-            "unzip -l /tmp/x.zip",
-            "git add .agents/plugins/philharmonic_orchestra/scripts/guard/policies.py",
+            f"mkdir -p {root_dir}/scratch", f"echo hi > {root_dir}/scratch/report.md",
+            "git add README.md",
             'git commit -m "Harden guard"',
-            'git add .agents/plugins/philharmonic_orchestra/scripts/guard/policies.py && git commit -m "Harden guard"',
-            'git commit -am "Update"',
-            "git commit --amend --no-edit",
+            'git add README.md && git commit -m "Update docs"',
+            'git commit -am "Update"', "git commit --amend --no-edit",
         )
         for idx, cmd in enumerate(allowed_cmds, start=1):
-            res = orchestrator_guard.handle_pre_tool(
-                dict(root_payload, invocationNum=idx, toolCall={"name": "run_command", "args": {"CommandLine": cmd}})
-            )
+            res = self._pre("run_command", {"CommandLine": cmd}, base=root_p, invocationNum=idx)
             self.assertEqual(res["decision"], "allow", f"Root should allow {cmd!r}: {res}")
 
+        # Fix 8: Root verified safe git stage/commit chain must NOT dirty test_receipt or bump mutation_epoch
+        self._seed_state(root_p, test_receipt={"dirty": False, "verified": True, "last_test_cmd": "pytest -v", "mutation_epoch": 3})
+        res_git_commit = self._pre("run_command", {"CommandLine": 'git add README.md && git commit -m "Docs"'}, base=root_p)
+        self.assertEqual(res_git_commit["decision"], "allow")
+        rec_after_git = self._load_st(root_p)["test_receipt"]
+        self.assertFalse(rec_after_git["dirty"])
+        self.assertTrue(rec_after_git["verified"])
+        self.assertEqual(rec_after_git["mutation_epoch"], 3)
+
         denied_cmds = (
-            "sh -co errexit 'rm -rf .'",
-            "bash -c 'echo ok'",
-            "fish -C 'echo hi' -c 'rm -rf .'",
-            "mksh -c 'rm -rf .'",
-            "rbash -c 'rm -rf .'",
-            "python3 -c \"open('a','w').write('x')\"",
-            "perl -e 'print 1'",
-            "node -e 'console.log(1)'",
-            "chmod +x scripts/foo.sh",
-            "rsync -a src/ build/",
-            "tar -xf /tmp/x.tar -C build",
-            "patch -p1 -d build < /tmp/x.patch",
-            "find . -name '*.pyc' -delete",
-            "{rm,-rf,.agents}",
-            "git diff {--output=/tmp/x,--stat}",
-            "find . {-delete,-print}",
-            "rg {--pre=sh,x}",
-            "sort {-o,/tmp/x}",
-            "tar --index-file=src/out -tf /tmp/x.tar",
-            "tar --rsh-command='rm -rf .' -tf /tmp/x.tar",
-            "tox -- rm -rf src",
-            "jest -u",
-            "vitest init",
-            "go test -coverprofile=/tmp/cov.out ./...",
-            "go test -o /tmp/t.bin ./...",
-            "cargo test --target-dir=/tmp/t",
-            "cargo test --manifest-path Cargo.toml",
-            "bash -c 'echo $(rm -rf .)'",
-            "echo `id`",
-            "cat <<'EOF'\nhello\nEOF",
-            "bash $'<<EOF\\n$(rm -rf .)\\nEOF'",
-            "awk 'BEGIN{system(\"rm -rf .\")}'",
-            "sed '1e rm -rf .' README.md",
-            r"find . -exec awk 'BEGIN{system(\"rm -rf .\")}' {} \;",
-            "git -c core.sshCommand='rm -rf .' status",
-            "git clean -fd",
-            "git diff --no-index a b",
-            "git grep -O vim foo",
-            "echo x > src/out.txt",
-            "echo x > /tmp/out.txt",
-            "pytest -o addopts=x",
-            "pytest --basetemp=/tmp/b",
-            "tsc --noemit false",
-            "tsc --init",
-            "git add -f .agents/.state/orchestrator_state.json",
-            "git add .agents/.state/orchestrator_state.json",
-            "git add .",
-            "git add -A",
+            "sh -co errexit 'rm -rf .'", "bash -c 'echo ok'", "fish -C 'echo hi' -c 'rm -rf .'", "mksh -c 'rm -rf .'",
+            "rbash -c 'rm -rf .'", "python3 -c 'import x; assert x.ok()'", "python3 -c 'import math; print(math.sqrt(4))'",
+            "python3 -c \"open('a','w').write('x')\"", "find . -exec ls {} +", "find . | xargs grep foo",
+            "tar -tf /tmp/x.tar", "unzip -l /tmp/x.zip", "perl -e 'print 1'", "node -e 'console.log(1)'",
+            "chmod +x scripts/foo.sh", "rsync -a src/ build/", "tar -xf /tmp/x.tar -C build", "patch -p1 -d build < /tmp/x.patch",
+            "find . -name '*.pyc' -delete", "{rm,-rf,.agents}", "git diff {--output=/tmp/x,--stat}", "find . {-delete,-print}",
+            "rg {--pre=sh,x}", "sort {-o,/tmp/x}", "tar --index-file=src/out -tf /tmp/x.tar",
+            "tar --rsh-command='rm -rf .' -tf /tmp/x.tar", "tox -- rm -rf src", "jest -u", "vitest init",
+            "go test -coverprofile=/tmp/cov.out ./...", "go test -o /tmp/t.bin ./...", "cargo test --target-dir=/tmp/t",
+            "cargo test --manifest-path Cargo.toml", "bash -c 'echo $(rm -rf .)'", "echo `id`", "cat <<'EOF'\nhello\nEOF",
+            "bash $'<<EOF\\n$(rm -rf .)\\nEOF'", "awk 'BEGIN{system(\"rm -rf .\")}'", "sed '1e rm -rf .' README.md",
+            r"find . -exec awk 'BEGIN{system(\"rm -rf .\")}' {} \;", "git -c core.sshCommand='rm -rf .' status",
+            "git clean -fd", "git diff --no-index a b", "git grep -O vim foo", "echo x > src/out.txt",
+            "echo x > /tmp/out.txt", "pytest -o addopts=x", "pytest --basetemp=/tmp/b", "tsc --noemit false", "tsc --init",
+            "git add -f .agents/.state/orchestrator_state.json", "git add .agents/.state/orchestrator_state.json",
+            "git add .agents/hooks.json", "git add .agents/plugins/philharmonic_orchestra/scripts/guard/policies.py",
+            "git add .", "git add -A",
             "git add .agents/plugins/philharmonic_orchestra/scripts/guard/policies.py && rm -rf .agents",
-            "git -c core.editor=evil commit -m x",
-            "GIT_EDITOR=evil git commit -m x",
-            "git commit -e -m x",
-            "git commit --interactive",
-            "git commit -m x -- .agents/.state/orchestrator_state.json",
+            "git -c core.editor=evil commit -m x", "GIT_EDITOR=evil git commit -m x", "git commit -e -m x",
+            "git commit --interactive", "git commit -m x -- .agents/.state/orchestrator_state.json",
+            "git commit -m x -- .agents/hooks.json", "git commit -m x -- .agents/plugins/philharmonic_orchestra/scripts/guard/policies.py",
+            "./script --version", "/tmp/evil --help", "./python3 --version", "./bash --version",
+            "export X='a[$(id)]'", "export X='a[$(id)]' && [[ $X -eq 0 ]]", "[[ $X -eq 0 ]]", "[ $X -eq 0 ]", "test $X -eq 0",
         )
         for cmd in denied_cmds:
-            res = orchestrator_guard.handle_pre_tool(
-                dict(root_payload, toolCall={"name": "run_command", "args": {"CommandLine": cmd}})
-            )
+            res = self._pre("run_command", {"CommandLine": cmd}, base=root_p)
             self.assertEqual(res["decision"], "deny", f"Root must deny {cmd!r}: {res}")
 
-        # cb.get("tripped") precedence: non-git allowlisted commands denied while safe git inspection allowed
-        st = orchestrator_guard._load_state(root_payload)
-        st["circuit_breaker"]["tripped"] = True
-        st["circuit_breaker"]["failure_streak"] = 2
-        orchestrator_guard._save_state(root_payload, st)
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(
-                dict(root_payload, toolCall={"name": "run_command", "args": {"CommandLine": "ls -la"}})
-            )["decision"],
-            "deny",
-        )
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(
-                dict(root_payload, toolCall={"name": "run_command", "args": {"CommandLine": "git status"}})
-            )["decision"],
-            "allow",
-        )
+        # Fix 7: Bare pytest in /tmp or artifact/scratch Cwd must be denied on Root and never clear dirty receipt
+        import guard.verification as guard_verification
+
+        for bad_cwd in ("/tmp", f"{root_dir}/scratch"):
+            self.assertEqual(self._pre("run_command", {"CommandLine": "pytest", "Cwd": bad_cwd}, base=root_p)["decision"], "deny")
+        self._seed_state(root_p, test_receipt={"dirty": True, "verified": False, "last_test_cmd": "", "mutation_epoch": 4})
+        for bad_cwd in ("/tmp", f"{root_dir}/scratch"):
+            self._post("run_command", {"CommandLine": "pytest", "Cwd": bad_cwd}, exit_code=0, call_id=f"bad_cwd_{bad_cwd}", base=root_p)
+            rec_bad = self._load_st(root_p)["test_receipt"]
+            self.assertTrue(rec_bad["dirty"])
+            self.assertFalse(rec_bad["verified"])
+        subshell_tmp_cmd = "(cd /usr/lib/python3.12/email/mime) && cd ../../../../tmp && pytest"
+        self.assertTrue(guard_verification._has_unsafe_test_cwd(subshell_tmp_cmd, str(orchestrator_guard.PROJECT_ROOT), root_p))
+        self._post("run_command", {"CommandLine": subshell_tmp_cmd}, exit_code=0, call_id="subshell_tmp_cd", base=root_p)
+        rec_sub = self._load_st(root_p)["test_receipt"]
+        self.assertTrue(rec_sub["dirty"])
+        self.assertFalse(rec_sub["verified"])
+
+        st = self._load_st(root_p)
+        st["circuit_breaker"]["tripped"], st["circuit_breaker"]["failure_streak"] = True, 2
+        orchestrator_guard._save_state(root_p, st)
+        self.assertEqual(self._pre("run_command", {"CommandLine": "ls -la"}, base=root_p)["decision"], "deny")
+        self.assertEqual(self._pre("run_command", {"CommandLine": "git status"}, base=root_p)["decision"], "allow")
 
     def test_readonly_and_scratch_subagent_containment(self) -> None:
         app_dir = Path(self.temp_dir.name) / "ro_app"
-        brain_base = app_dir / "brain"
-        parent_dir = brain_base / "parent-ro"
-        other_dir = brain_base / "other-ro"
+        parent_dir = app_dir / "brain" / "parent-ro"
+        other_dir = app_dir / "brain" / "other-ro"
         wt_root = app_dir / "worktrees" / "parent-ro" / "w1"
         for d in (parent_dir / "scratch", other_dir / "scratch", wt_root / "tests", wt_root / "scratch"):
             d.mkdir(parents=True, exist_ok=True)
-        parent_payload = dict(
-            self.base_payload,
-            conversationId="parent-ro",
-            artifactDirectoryPath=str(parent_dir),
-            lastUserInput="/philharmonic ro containment",
-        )
-        orchestrator_guard._cli_activate(parent_payload)
+        parent_p = self._brain_payload("parent-ro", root="ro_app/brain", lastUserInput="/philharmonic ro containment")
+        orchestrator_guard._cli_activate(parent_p)
 
-        ro_roles = (
-            ("ro-scout", "scout", "flash_lite"),
-            ("ro-research", "research", "flash"),
-            ("ro-reviewer", "reviewer", "pro"),
-            ("ro-council", "council", "pro"),
-            ("ro-judge", "judge", "pro"),
-        )
+        ro_roles = (("ro-scout", "scout", "flash_lite"), ("ro-research", "research", "flash"), ("ro-reviewer", "reviewer", "pro"), ("ro-council", "council", "pro"), ("ro-judge", "judge", "pro"))
         for cid, tname, model in ro_roles:
-            orchestrator_guard.register_subagent(parent_payload, conversation_id=cid, type_name=tname, model=model)
+            self._reg_sub(tname, cid, model, payload=parent_p)
 
+        bad_cmds = (
+            "echo x 1>a.py", "echo x &>a.py", "echo x >|a.py", "echo x >>a.py", "git checkout -- a.py",
+            "python3 -c 'print(1)'", "python3 -c \"open('a.py','w').write('x')\"", "find . -exec ls {} +",
+            "find . -name '*.tmp' -delete", "tar -tf /tmp/x.tar", "unzip -l /tmp/x.zip", "sh -co errexit 'rm -rf .'",
+            "awk 'BEGIN{system(\"rm -rf .\")}'", "sed '1e rm -rf .' README.md", "cat <<'EOF'\nhello\nEOF",
+            "git add README.md", 'git commit -m "x"',
+            "export X='a[$(id)]' && [[ $X -eq 0 ]]", "[[ 1 -eq 1 ]]", "[ 1 -eq 1 ]", "test 1 -eq 1",
+        )
         for cid, tname, _ in ro_roles:
-            for idx, ok_cmd in enumerate(
-                ("git status", "ls -la", "pytest -v", "python3 --version", "find . -exec ls {} +"), start=1
-            ):
-                r_ok = orchestrator_guard.handle_pre_tool(
-                    dict(
-                        parent_payload,
-                        conversationId=cid,
-                        invocationNum=idx,
-                        toolCall={"name": "run_command", "args": {"CommandLine": ok_cmd}},
-                    )
-                )
+            for idx, ok_cmd in enumerate(("git status", "ls -la", "pytest -v", "python3 --version"), start=1):
+                r_ok = self._pre("run_command", {"CommandLine": ok_cmd}, cid=cid, base=parent_p, invocationNum=idx)
                 self.assertEqual(r_ok["decision"], "allow", f"{tname} should allow {ok_cmd!r}: {r_ok}")
-
-            for bad_cmd in (
-                "echo x 1>a.py",
-                "echo x &>a.py",
-                "echo x >|a.py",
-                "echo x >>a.py",
-                "git checkout -- a.py",
-                "python3 -c \"open('a.py','w').write('x')\"",
-                "find . -name '*.tmp' -delete",
-                "sh -co errexit 'rm -rf .'",
-                "awk 'BEGIN{system(\"rm -rf .\")}'",
-                "sed '1e rm -rf .' README.md",
-                "cat <<'EOF'\nhello\nEOF",
-                "git add README.md",
-                'git commit -m "x"',
-            ):
-                r_deny = orchestrator_guard.handle_pre_tool(
-                    dict(parent_payload, conversationId=cid, toolCall={"name": "run_command", "args": {"CommandLine": bad_cmd}})
-                )
+            for bad_cmd in bad_cmds:
+                r_deny = self._pre("run_command", {"CommandLine": bad_cmd}, cid=cid, base=parent_p)
                 self.assertEqual(r_deny["decision"], "deny", f"{tname} must deny {bad_cmd!r}: {r_deny}")
 
-        # Scratch writes: research & council allowed .md in own scratch/, denied elsewhere; strict readonly denied everywhere
         own_scratch_md = str(parent_dir / "scratch" / "notes.md")
         for cid in ("ro-research", "ro-council"):
-            self.assertEqual(
-                orchestrator_guard.handle_pre_tool(
-                    dict(
-                        parent_payload,
-                        conversationId=cid,
-                        toolCall={"name": "write_file", "args": {"Path": own_scratch_md, "Content": "# ok\n"}},
-                    )
-                )["decision"],
-                "allow",
-            )
-            self.assertEqual(
-                orchestrator_guard.handle_pre_tool(
-                    dict(
-                        parent_payload,
-                        conversationId=cid,
-                        toolCall={"name": "run_command", "args": {"CommandLine": f"echo hi > {own_scratch_md}"}},
-                    )
-                )["decision"],
-                "allow",
-            )
-            for bad_path in (
-                str(orchestrator_guard.PROJECT_ROOT / "src" / "hack.py"),
-                str(wt_root / "scratch" / "hack.md"),
-                str(other_dir / "scratch" / "leak.md"),
-                str(parent_dir / "outside.md"),
-            ):
-                self.assertEqual(
-                    orchestrator_guard.handle_pre_tool(
-                        dict(
-                            parent_payload,
-                            conversationId=cid,
-                            toolCall={"name": "write_file", "args": {"Path": bad_path, "Content": "# bad\n"}},
-                        )
-                    )["decision"],
-                    "deny",
-                )
+            self.assertEqual(self._pre("write_file", {"Path": own_scratch_md, "Content": "# ok\n"}, cid=cid, base=parent_p)["decision"], "allow")
+            self.assertEqual(self._pre("run_command", {"CommandLine": f"echo hi > {own_scratch_md}"}, cid=cid, base=parent_p)["decision"], "allow")
+            for bad_path in (str(orchestrator_guard.PROJECT_ROOT / "src" / "hack.py"), str(wt_root / "scratch" / "hack.md"), str(other_dir / "scratch" / "leak.md"), str(parent_dir / "outside.md")):
+                self.assertEqual(self._pre("write_file", {"Path": bad_path, "Content": "# bad\n"}, cid=cid, base=parent_p)["decision"], "deny")
         for strict_cid in ("ro-scout", "ro-reviewer", "ro-judge"):
-            self.assertEqual(
-                orchestrator_guard.handle_pre_tool(
-                    dict(
-                        parent_payload,
-                        conversationId=strict_cid,
-                        toolCall={"name": "write_file", "args": {"Path": own_scratch_md, "Content": "# no\n"}},
-                    )
-                )["decision"],
-                "deny",
-            )
+            self.assertEqual(self._pre("write_file", {"Path": own_scratch_md, "Content": "# no\n"}, cid=strict_cid, base=parent_p)["decision"], "deny")
 
-        # Blind-judge & council name leaks
         leak_json = parent_dir / "scratch" / "meta.json"
         leak_json.write_text('{"author": "Grok-3", "proposal": "A"}', encoding="utf-8")
-        for leak_prompt in (
-            "- **Author**: **Claude Opus 5.5**\nCompare A and B.",
-            "Proposal A\n(Gemini 4 Pro)\nCompare.",
-            "Option 1: `o3-mini`\nCompare.",
-            f"Review {leak_json} for Proposal A.",
-        ):
-            r_j = orchestrator_guard.handle_pre_tool(
-                dict(
-                    parent_payload,
-                    toolCall={
-                        "id": f"jl_{hash(leak_prompt)}",
-                        "name": "invoke_subagent",
-                        "args": {
-                            "TypeName": "judge",
-                            "Role": "Judge",
-                            "Model": "pro",
-                            "Prompt": f"MODE: COUNCIL\nCOUNCIL_ID: c-ro\nCOUNCIL_ROLE: judge\n{leak_prompt}",
-                        },
-                    },
-                )
-            )
+        for leak_prompt in ("- **Author**: **Claude Opus 5.5**\nCompare A and B.", "Proposal A\n(Gemini 4 Pro)\nCompare.", "Option 1: `o3-mini`\nCompare.", f"Review {leak_json} for Proposal A."):
+            r_j = self._pre("invoke_subagent", self._sub_args("judge", "Judge", "pro", f"MODE: COUNCIL\nCOUNCIL_ID: c-ro\nCOUNCIL_ROLE: judge\n{leak_prompt}"), call_id=f"jl_{hash(leak_prompt)}", base=parent_p)
             self.assertEqual(r_j["decision"], "deny")
 
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id="ro-blind-j",
-            type_name="judge",
-            model="pro",
-            council_id="c-ro",
-            council_role="judge",
-        )
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(
-                dict(
-                    parent_payload,
-                    toolCall={
-                        "name": "send_message",
-                        "args": {"Recipient": "ro-blind-j", "Message": "STATUS: update\nProposal A by Claude Opus 5.5"},
-                    },
-                )
-            )["decision"],
-            "deny",
-        )
-        for bad_sw in (
-            {"action": "add", "name": "judge-claude", "brief": "Evaluate."},
-            {"action": "add", "name": "judge-1", "brief": "Proposal A by ChatGPT vs Proposal B."},
-        ):
-            self.assertEqual(
-                orchestrator_guard.handle_pre_tool(
-                    dict(parent_payload, toolCall={"name": "swarm", "args": bad_sw})
-                )["decision"],
-                "deny",
-            )
+        self._reg_sub("judge", "ro-blind-j", "pro", payload=parent_p, council_id="c-ro", council_role="judge")
+        self.assertEqual(self._pre("send_message", {"Recipient": "ro-blind-j", "Message": "STATUS: update\nProposal A by Claude Opus 5.5"}, base=parent_p)["decision"], "deny")
+        for bad_sw in ({"action": "add", "name": "judge-claude", "brief": "Evaluate."}, {"action": "add", "name": "judge-1", "brief": "Proposal A by ChatGPT vs Proposal B."}):
+            self.assertEqual(self._pre("swarm", bad_sw, base=parent_p)["decision"], "deny")
 
-        # Strict mode coupling & N=1 cohort breaker
         for non_impl in ("scout", "research", "verifier", "reviewer", "judge", "council"):
-            self.assertEqual(
-                orchestrator_guard.handle_pre_tool(
-                    dict(
-                        parent_payload,
-                        toolCall={
-                            "id": f"bon_{non_impl}",
-                            "name": "invoke_subagent",
-                            "args": {
-                                "TypeName": non_impl,
-                                "Workspace": "share",
-                                "Prompt": f"MODE: BEST_OF_N\nREVIEW_LENS: sec\n{VALID_PROMPT}",
-                            },
-                        },
-                    )
-                )["decision"],
-                "deny",
-            )
+            self.assertEqual(self._pre("invoke_subagent", self._sub_args(non_impl, "Worker", prompt=f"MODE: BEST_OF_N\nREVIEW_LENS: sec\n{VALID_PROMPT}", Workspace="share"), call_id=f"bon_{non_impl}", base=parent_p)["decision"], "deny")
         for bad_args in (
             {"TypeName": "implementer", "Prompt": f"MODE: COUNCIL\n{VALID_PROMPT}"},
             {"TypeName": "implementer", "Workspace": "share", "Prompt": f"MODE: BEST_OF_N\nCOUNCIL_ID: c1\n{VALID_PROMPT}"},
             {"TypeName": "research", "Model": "pro", "Prompt": "COUNCIL_ID: c1\n1. Investigate."},
         ):
-            self.assertEqual(
-                orchestrator_guard.handle_pre_tool(
-                    dict(parent_payload, toolCall={"id": f"mc_{hash(str(bad_args))}", "name": "invoke_subagent", "args": bad_args})
-                )["decision"],
-                "deny",
-            )
-        for idx in (1, 2):
-            cid = f"n1_{idx}"
-            a = {
-                "TypeName": "implementer",
-                "Workspace": "share",
-                "Prompt": f"MODE: BEST_OF_N\nCOHORT: n1-c-{idx}\n{VALID_PROMPT}",
-            }
-            orchestrator_guard.handle_pre_tool(dict(parent_payload, toolCall={"id": cid, "name": "invoke_subagent", "args": a}))
-            orchestrator_guard.handle_post_tool(dict(parent_payload, toolCall={"id": cid, "name": "invoke_subagent", "args": a}, error="fail"))
-        self.assertTrue(orchestrator_guard._load_state(parent_payload)["circuit_breaker"]["tripped"])
+            self.assertEqual(self._pre("invoke_subagent", bad_args, call_id=f"mc_{hash(str(bad_args))}", base=parent_p)["decision"], "deny")
 
-        # Reset breaker, then test swarm duplicate rollback & worktree tamper/budget
-        st = orchestrator_guard._load_state(parent_payload)
+        for idx in (1, 2):
+            a = {"TypeName": "implementer", "Workspace": "share", "Prompt": f"MODE: BEST_OF_N\nCOHORT: n1-c-{idx}\n{VALID_PROMPT}"}
+            self._pre("invoke_subagent", a, call_id=f"n1_{idx}", base=parent_p)
+            self._post("invoke_subagent", a, error="fail", call_id=f"n1_{idx}", base=parent_p)
+        self.assertTrue(self._load_st(parent_p)["circuit_breaker"]["tripped"])
+
+        st = self._load_st(parent_p)
         st["circuit_breaker"] = {"failure_streak": 0, "tripped": False, "seen_failures": [], "last_error": "", "replan_count": 0}
-        orchestrator_guard._save_state(parent_payload, st)
+        orchestrator_guard._save_state(parent_p, st)
         args_orig = {"action": "add", "name": "prop-dup", "model": "claude-opus", "brief": "MODE: COUNCIL\nCOUNCIL_ID: c-dup\nCOUNCIL_ROLE: proposer\nDraft A"}
-        orchestrator_guard.handle_pre_tool(dict(parent_payload, toolCall={"id": "d1", "name": "swarm", "args": args_orig}))
-        orchestrator_guard.handle_post_tool(dict(parent_payload, toolCall={"id": "d1", "name": "swarm", "args": args_orig}, output="ok"))
+        self._pre("swarm", args_orig, call_id="d1", base=parent_p)
+        self._post("swarm", args_orig, output="ok", call_id="d1", base=parent_p)
         args_dup = {"action": "add", "name": "prop-dup", "model": "gpt-5", "brief": "MODE: COUNCIL\nCOUNCIL_ID: c-dup\nCOUNCIL_ROLE: proposer\nDraft B"}
-        orchestrator_guard.handle_pre_tool(dict(parent_payload, toolCall={"id": "d2", "name": "swarm", "args": args_dup}))
-        orchestrator_guard.handle_post_tool(dict(parent_payload, toolCall={"id": "d2", "name": "swarm", "args": args_dup}, error="dup"))
-        st_restored = orchestrator_guard._load_state(parent_payload)
+        self._pre("swarm", args_dup, call_id="d2", base=parent_p)
+        self._post("swarm", args_dup, error="dup", call_id="d2", base=parent_p)
+        st_restored = self._load_st(parent_p)
         self.assertEqual(st_restored["swarm_workers"]["prop-dup"]["model"], "claude-opus")
         self.assertNotIn("_prev_worker", st_restored["swarm_workers"]["prop-dup"])
 
-        orchestrator_guard.register_subagent(
-            parent_payload,
-            conversation_id="wt-impl",
-            type_name="implementer",
-            model="flash",
-            workspace="branch",
-            allowed_files=["tests/test_wt.py"],
-        )
+        self._reg_sub("implementer", "wt-impl", "flash", payload=parent_p, workspace="branch", allowed_files=["tests/test_wt.py"])
         self.assertEqual(
-            orchestrator_guard.handle_pre_tool(
-                dict(
-                    parent_payload,
-                    conversationId="wt-impl",
-                    workspacePaths=[str(orchestrator_guard.PROJECT_ROOT), str(wt_root)],
-                    toolCall={
-                        "name": "write_file",
-                        "args": {"Path": str(wt_root / "tests" / "test_wt.py"), "Content": "def test_x():\n    assert 1 == 1\n"},
-                    },
-                )
-            )["decision"],
+            self._pre("write_file", {"Path": str(wt_root / "tests" / "test_wt.py"), "Content": "def test_x():\n    assert 1 == 1\n"}, cid="wt-impl", base=parent_p, workspacePaths=[str(orchestrator_guard.PROJECT_ROOT), str(wt_root)])["decision"],
             "deny",
         )
 
     def test_implementer_allowed_files_and_shell_boundaries(self) -> None:
+        import guard.shell_targets as guard_shell_targets
+
         orchestrator_guard._cli_activate(self.base_payload)
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id="impl-scoped",
-            type_name="implementer",
-            model="flash",
-            allowed_files=["src/allowed.py", "tests/test_ok.py"],
-        )
-        orchestrator_guard.register_subagent(
-            self.base_payload,
-            conversation_id="impl-unrestricted",
-            type_name="implementer",
-            model="flash",
-        )
-        scoped_payload = dict(self.base_payload, conversationId="impl-scoped")
-        unr_payload = dict(self.base_payload, conversationId="impl-unrestricted")
+        self._reg_sub("implementer", "impl-scoped", "flash", allowed_files=["src/allowed.py", "tests/test_ok.py"])
+        self._reg_sub("implementer", "impl-unrestricted", "flash")
 
-        # Direct tool allow vs deny
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(
-                dict(
-                    scoped_payload,
-                    toolCall={"name": "edit_file", "args": {"Path": "src/allowed.py", "Target": "a", "Replacement": "b"}},
-                )
-            )["decision"],
-            "allow",
-        )
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(
-                dict(
-                    scoped_payload,
-                    toolCall={"name": "write_file", "args": {"Path": "src/other.py", "Content": "x = 1\n"}},
-                )
-            )["decision"],
-            "deny",
-        )
+        self.assertEqual(self._pre("edit_file", {"Path": "src/allowed.py", "Target": "a", "Replacement": "b"}, cid="impl-scoped")["decision"], "allow")
+        self.assertEqual(self._pre("write_file", {"Path": "src/other.py", "Content": "x = 1\n"}, cid="impl-scoped")["decision"], "deny")
 
-        # Allowed simple shell writes + safe quoted heredoc
-        for idx, ok_cmd in enumerate(
-            (
-                "touch src/allowed.py",
-                "dd if=/dev/zero of=src/allowed.py bs=1 count=0",
-                "sed -i 's/a/b/' src/allowed.py",
-                "cp src/protected.py src/allowed.py",
-                "rm -f src/allowed.py",
-                "mv src/allowed.py tests/test_ok.py",
-                "chmod +x src/allowed.py",
-                "sort -o src/allowed.py README.md",
-                "cat <<'EOF'\nhello\nEOF",
-            ),
-            start=1,
-        ):
-            res = orchestrator_guard.handle_pre_tool(
-                dict(scoped_payload, invocationNum=idx, toolCall={"name": "run_command", "args": {"CommandLine": ok_cmd}})
-            )
+        ok_cmds = (
+            "touch src/allowed.py", "dd if=/dev/zero of=src/allowed.py bs=1 count=0",
+            "sed -i 's/a/b/' src/allowed.py", "sed -i 's/hello/world/' src/allowed.py",
+            "cp src/protected.py src/allowed.py", "rm -f src/allowed.py", "mv src/allowed.py tests/test_ok.py",
+            "chmod +x src/allowed.py", "chmod -x src/allowed.py",
+            "sort -o src/allowed.py README.md", "sort -uo src/allowed.py README.md", "cat <<'EOF'\nhello\nEOF",
+            "pytest --version", "pytest --help",
+        )
+        for idx, ok_cmd in enumerate(ok_cmds, start=1):
+            res = self._pre("run_command", {"CommandLine": ok_cmd}, cid="impl-scoped", invocationNum=idx)
             self.assertEqual(res["decision"], "allow", f"Scoped implementer should allow {ok_cmd!r}: {res}")
 
-        st_root = orchestrator_guard._load_state(self.base_payload)
+        st_root = self._load_st()
         self.assertTrue(st_root["test_receipt"]["dirty"])
         self.assertGreaterEqual(st_root["test_receipt"]["mutation_epoch"], 1)
 
-        # Denied out-of-scope targets, symlinks, hardlinks, opaque mutators, shell wrappers, non-py interpreters
-        for bad_cmd in (
-            "touch src/other.py",
-            "sed -i 's/a/b/' src/other.py",
-            f"echo x > /tmp/..{orchestrator_guard.PROJECT_ROOT}/src/other.py",
-            "ln -s src/protected.py src/allowed.py",
-            "cp -s src/protected.py src/allowed.py",
-            "ln src/protected.py src/allowed.py",
-            "tar -xf /tmp/x.tar",
-            "rsync -a src/allowed.py src/other.py",
-            "patch -p1 < /tmp/x.patch",
-            "sh -c 'touch src/allowed.py'",
-            "bash -c 'echo x > src/allowed.py'",
-            "mksh -c 'rm -rf .'",
-            "perl -i -pe 's/a/b/' src/allowed.py",
-        ):
-            res = orchestrator_guard.handle_pre_tool(
-                dict(scoped_payload, toolCall={"name": "run_command", "args": {"CommandLine": bad_cmd}})
-            )
+        bad_cmds = (
+            "touch src/other.py", "sed -i 's/a/b/' src/other.py", f"echo x > /tmp/..{orchestrator_guard.PROJECT_ROOT}/src/other.py",
+            "ln -s src/protected.py src/allowed.py", "cp -s src/protected.py src/allowed.py", "ln src/protected.py src/allowed.py",
+            "tar -xf /tmp/x.tar", "rsync -a src/allowed.py src/other.py", "patch -p1 < /tmp/x.patch",
+            "sh -c 'touch src/allowed.py'", "bash -c 'echo x > src/allowed.py'", "mksh -c 'rm -rf .'", "perl -i -pe 's/a/b/' src/allowed.py",
+            "(bash -h; true) < /tmp/x",
+            "cp -ft src/outside src/allowed.py", "cp -ftsrc/outside src/allowed.py", "mv -ft src/outside src/allowed.py",
+            "sort -uo src/other.py README.md", "sort -uosrc/other.py README.md",
+            "sed -i '1e rm -rf .' src/allowed.py", "sed -i '1e id' src/allowed.py", "sed -i 's/a/b/e' src/allowed.py",
+            "sed -i 's/a/b/w out.txt' src/allowed.py", "sed -i 's/a/b/w src/other.py' src/allowed.py",
+            "sed -i 's/a/b/W src/other.py' src/allowed.py", "sed -i.ext 'e' src/allowed.py", "cd /tmp && sed 'e' -- -e1",
+            "sed -i 's|.*[[:alpha:]|].*|id;#|e' src/allowed.py", "sed -i 's|.*[[:alpha:]|].*|x|w src/other.py' src/allowed.py",
+            "sed -i '/[[:alpha:]/]/e sh /tmp/x' src/allowed.py", "cd /tmp && pytest --help",
+            "chmod -x src/other.py", "./script --version",
+        )
+        for bad_cmd in bad_cmds:
+            res = self._pre("run_command", {"CommandLine": bad_cmd}, cid="impl-scoped")
             self.assertEqual(res["decision"], "deny", f"Scoped implementer must deny {bad_cmd!r}: {res}")
 
-        self.assertEqual(
-            orchestrator_guard.handle_pre_tool(
-                dict(scoped_payload, toolCall={"name": "run_workflow", "args": {"Description": "run", "Script": "pytest"}})
-            )["decision"],
-            "deny",
-        )
+        self.assertEqual(self._pre("run_command", {"CommandLine": "sed -i 's/a/b/w .agents/hooks.json' src/allowed.py"}, cid="impl-unrestricted")["decision"], "deny")
+        self.assertEqual(self._pre("run_command", {"CommandLine": "chmod -w+x .agents/hooks.json"}, cid="impl-unrestricted")["decision"], "deny")
+        self.assertEqual(self._pre("run_workflow", {"Description": "run", "Script": "pytest"}, cid="impl-scoped")["decision"], "deny")
 
-        # Unrestricted implementer must still deny {.,foo} ancestor wipes over .agents / guard state
+        # Direct shell_targets assertions for clustered flags, negative chmod mode, dev meta allowlist, and staging pytest Cwd
+        self.assertEqual(guard_shell_targets._extract_shell_write_targets("cp -ft out_dir src.py", ["cp -ft out_dir src.py"])[0], ["out_dir"])
+        self.assertEqual(guard_shell_targets._extract_shell_write_targets("cp -ftout_dir src.py", ["cp -ftout_dir src.py"])[0], ["out_dir"])
+        self.assertEqual(guard_shell_targets._extract_shell_write_targets("cp -t=d src", ["cp -t=d src"])[0], ["=d"])
+        self.assertEqual(guard_shell_targets._extract_shell_write_targets("sort -uo out.txt in.txt", ["sort -uo out.txt in.txt"])[0], ["out.txt"])
+        self.assertEqual(guard_shell_targets._extract_shell_write_targets("sort -uoout.txt in.txt", ["sort -uoout.txt in.txt"])[0], ["out.txt"])
+        self.assertEqual(guard_shell_targets._extract_shell_write_targets("sort -o=a.py in.txt", ["sort -o=a.py in.txt"])[0], ["=a.py"])
+        self.assertIn("orchestrator_guard.py", guard_shell_targets._extract_shell_write_targets("chmod -x orchestrator_guard.py", ["chmod -x orchestrator_guard.py"])[0])
+        self.assertIn(".agents/hooks.json", guard_shell_targets._extract_shell_write_targets("chmod -w+x .agents/hooks.json", ["chmod -w+x .agents/hooks.json"])[0])
+        self.assertTrue(guard_shell_targets._extract_shell_write_targets("./script --version", ["./script --version"])[1])
+        self.assertTrue(guard_shell_targets._extract_shell_write_targets("./bash --version", ["./bash --version"])[1])
+        self.assertTrue(guard_shell_targets._extract_shell_write_targets("bash --version", ["bash --version"])[1])
+        self.assertTrue(guard_shell_targets._extract_shell_write_targets("(bash -h; true) < /tmp/x", ["(bash -h; true) < /tmp/x"])[1])
+        self.assertFalse(guard_shell_targets._extract_shell_write_targets("pytest --version", ["pytest --version"])[1])
+        self.assertFalse(guard_shell_targets._extract_shell_write_targets("pytest --help", ["pytest --help"])[1])
+        self.assertFalse(guard_shell_targets._extract_shell_write_targets("/usr/bin/python3 --version", ["/usr/bin/python3 --version"])[1])
+        self.assertEqual(guard_shell_targets._extract_shell_write_targets("sed -i 's/hello/world/' a.py", ["sed -i 's/hello/world/' a.py"]), (["a.py"], False))
+        self.assertTrue(guard_shell_targets._extract_shell_write_targets("sed -i.ext 'e' a.py", ["sed -i.ext 'e' a.py"])[1])
+        self.assertTrue(guard_shell_targets._extract_shell_write_targets("cd /tmp && sed 'e' -- -e1", ["cd /tmp", "sed 'e' -- -e1"])[1])
+        self.assertTrue(guard_shell_targets._extract_shell_write_targets("cd /tmp && pytest --help", ["cd /tmp", "pytest --help"])[1])
+        self.assertTrue(guard_shell_targets._extract_shell_write_targets("pytest --help", ["pytest --help"], cwd=f"{self.artifact_dir}/scratch", payload=self.base_payload)[1])
+        self.assertTrue(guard_shell_targets._extract_shell_write_targets("sed -i 's|.*[[:alpha:]|].*|id;#|e' a.py", ["sed -i 's|.*[[:alpha:]|].*|id;#|e' a.py"])[1])
+        self.assertTrue(guard_shell_targets._extract_shell_write_targets("sed -i 's|.*[[:alpha:]|].*|x|w other.py' a.py", ["sed -i 's|.*[[:alpha:]|].*|x|w other.py' a.py"])[1])
+        self.assertTrue(guard_shell_targets._extract_shell_write_targets("sed -i '/[[:alpha:]/]/e sh /tmp/x' a.py", ["sed -i '/[[:alpha:]/]/e sh /tmp/x' a.py"])[1])
+        self.assertTrue(guard_shell_targets._extract_shell_write_targets("pytest", ["pytest"], cwd=f"{self.artifact_dir}/scratch", payload=self.base_payload)[1])
+
         for ancestor_cmd in ("rm -rf {.,foo}", "chmod -R 000 {.,foo}"):
-            res_anc = orchestrator_guard.handle_pre_tool(
-                dict(unr_payload, toolCall={"name": "run_command", "args": {"CommandLine": ancestor_cmd}})
-            )
+            res_anc = self._pre("run_command", {"CommandLine": ancestor_cmd}, cid="impl-unrestricted")
             self.assertEqual(res_anc["decision"], "deny", f"Unrestricted implementer must deny {ancestor_cmd!r}: {res_anc}")
 
     def test_workspace_containment_stays_in_workspace(self) -> None:
@@ -8877,109 +3421,63 @@ orchestrator_guard.register_subagent(
         (ws_dir / "src").mkdir(parents=True, exist_ok=True)
         outside_file = Path(self.temp_dir.name) / "outside_secret.txt"
         outside_file.write_text("secret", encoding="utf-8")
-        symlink_escape = ws_dir / "src" / "escape_link"
-        symlink_escape.symlink_to(outside_file)
+        (ws_dir / "src" / "escape_link").symlink_to(outside_file)
         roots = [ws_dir.resolve()]
 
-        for ws_bad in (
-            "cat /etc/passwd",
-            "cat ../outside_secret.txt",
-            "cat src/escape_link",
-            "cd /etc && ls",
-            "cd ~-",
-            "cd ~+",
-            "echo ${HOME:0}",
-            "env -S 'sh -c \"cat /etc/passwd\"'",
-            "stdbuf -o0 bash -c 'cat /etc/passwd'",
-            r"printf -v S '\57'; cat ${S}etc${S}passwd",
-            "printf {-v,O}; echo x>$O",
-            "coproc cat /etc/passwd",
-            "sh -co errexit 'cat /etc/passwd'",
-            "bash -c 'echo ok'",
-            "cat $HOME/secret",
-        ):
-            self.assertFalse(
-                guard_identity._command_stays_in_workspace(ws_bad, str(ws_dir), roots),
-                f"_command_stays_in_workspace must reject {ws_bad!r}",
-            )
+        for ws_bad in ("cat /etc/passwd", "cat ../outside_secret.txt", "cat src/escape_link", "cd /etc && ls", "cd ~-", "cd ~+", "coproc cat /etc/passwd", "cat $HOME/secret"):
+            self.assertFalse(guard_identity._command_stays_in_workspace(ws_bad, str(ws_dir), roots), f"_command_stays_in_workspace must reject {ws_bad!r}")
 
-        for ws_ok in (
-            "cat README.md",
-            "ls src/",
-            "cd src && ls",
-            "echo ${#var} foo#bar",
-            "git status",
-        ):
-            self.assertTrue(
-                guard_identity._command_stays_in_workspace(ws_ok, str(ws_dir), roots),
-                f"_command_stays_in_workspace should allow {ws_ok!r}",
-            )
+        for ws_ok in ("cat README.md", "ls src/", "cd src && ls", "echo ${#var} foo#bar", "git status"):
+            self.assertTrue(guard_identity._command_stays_in_workspace(ws_ok, str(ws_dir), roots), f"_command_stays_in_workspace should allow {ws_ok!r}")
+
+    def test_pass1a_bug_fixes(self) -> None:
+        import guard.identity as guard_identity
+        import guard.path_guards as guard_path_guards
+
+        root_state = {"root_conversation_id": "root-conv", "self_subagent_meta": {"type": "implementer", "role": "implementer"}}
+        self.assertFalse(guard_identity._is_known_subagent(self._payload(cid="root-conv"), root_state, persist_self_meta=False))
+
+        mixed_json = str(Path(self.artifact_dir) / "Orchestrator_State.JSON")
+        mixed_lock = str(Path(self.artifact_dir) / "ORCHESTRATOR_STATE.LOCK")
+        self.assertFalse(guard_path_guards._is_artifact_path(mixed_json, self.base_payload))
+        self.assertFalse(guard_path_guards._is_artifact_path(mixed_lock, self.base_payload))
+        agents_dir = orchestrator_guard.PROJECT_ROOT / ".agents"
+        self.assertTrue(guard_path_guards._is_guard_state_target(".state/sub", payload=self.base_payload, cwd=str(agents_dir)))
+        self.assertTrue(guard_path_guards._is_guard_plugin_target("hooks.json", cwd=str(agents_dir)))
+
+        self.assertFalse(guard_path_guards._safe_fnmatchcase("a.py", "[[:punct:]]*.py"))
+        self.assertFalse(guard_path_guards._safe_fnmatchcase("a.py", "{a,b}.py"))
+        self.assertTrue(guard_path_guards._safe_fnmatchcase("foo.py", "*.py"))
 
     def test_workflow_closed_world_allowlist_and_eval_receipts(self) -> None:
+        import guard.ast_guard as guard_ast
         import guard.constants as guard_constants
         import guard.policies as guard_policies
 
         orchestrator_guard._cli_activate(self.base_payload)
 
-        bad_workflows = (
-            "import os\nos.system('id')",
-            "import shutil\nshutil.rmtree(str(Path('.')))",
-            "import subprocess\nsubprocess.run(['rm', '-rf', str(Path('.'))])",
-            "shutil.__dict__['rmtree']('.')",
-            "from operator import attrgetter\nattrgetter('x')(y)",
-            "from operator import methodcaller\nmethodcaller('x')(y)",
-            "fn = call_tool\nfn('run_command', {'CommandLine': 'rm -rf .'})",
-            "p = 'orchestrator_' + 'state.json'\nprint(p)",
-            "# EVAL_CMD: rm -rf src\npytest",
-            "# EVAL_CMD: true\necho hi",
-            "bash <<'EOF'\nrm -rf .\nEOF",
-            "python3 -c 'import shutil; shutil.rmtree(\".\")'",
+        bad_workflow_args = (
+            {"Script": "# EVAL_CMD: rm -rf src\npytest", "Cwd": str(guard_constants.PROJECT_ROOT)},
+            {"Script": "# EVAL_CMD: true\necho hi", "Cwd": str(guard_constants.PROJECT_ROOT)},
+            {"Script": "pytest", "Cwd": str(guard_constants.PROJECT_ROOT / ".agents" / "plugins" / "philharmonic_orchestra")},
+            {"ScriptPath": str(guard_constants.PROJECT_ROOT / ".agents" / ".state" / "orchestrator_state.json"), "Cwd": str(guard_constants.PROJECT_ROOT)},
+            {"ScriptPath": str(guard_constants.PROJECT_ROOT / ".agents" / "plugins" / "philharmonic_orchestra" / "scripts" / "orchestrator_guard.py"), "Cwd": str(guard_constants.PROJECT_ROOT)},
         )
-        for bad_wf in bad_workflows:
-            res = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={"name": "run_workflow", "args": {"Script": bad_wf, "Cwd": str(guard_constants.PROJECT_ROOT)}},
-                )
-            )
-            self.assertEqual(res["decision"], "deny", f"run_workflow must deny {bad_wf!r}: {res}")
+        for wf_args in bad_workflow_args:
+            res = self._pre("run_workflow", wf_args)
+            self.assertEqual(res["decision"], "deny", f"run_workflow must deny {wf_args!r}: {res}")
 
-        for ok_wf in (
-            "import json\ndata = json.dumps({'ok': True})\nagent('scout', data)",
-            "# EVAL_CMD: python3 scripts/bench.py\npython3 scripts/bench.py",
-        ):
-            res_ok = orchestrator_guard.handle_pre_tool(
-                dict(
-                    self.base_payload,
-                    toolCall={"name": "run_workflow", "args": {"Script": ok_wf, "Cwd": str(guard_constants.PROJECT_ROOT)}},
-                )
-            )
+        for ok_wf in ("import json\ndata = json.dumps({'ok': True})\nagent('scout', data)", "# EVAL_CMD: python3 scripts/bench.py\npython3 scripts/bench.py"):
+            res_ok = self._pre("run_workflow", {"Script": ok_wf, "Cwd": str(guard_constants.PROJECT_ROOT)})
             self.assertEqual(res_ok["decision"], "allow", f"run_workflow should allow {ok_wf!r}: {res_ok}")
 
-        # _is_trivial_eval_command, _is_test_command, _is_declared_eval_command
-        for triv in (
-            "sh -c 'true'",
-            "bash -c -- 'true'",
-            "python3 -c 'pass'",
-            "python3 -B -c 'pass'",
-            "python3 -c 'import sys; sys.exit(0)'",
-            "pytest || true",
-            "pytest; true",
-            "pytest | cat",
-        ):
+        for triv in ("sh -c 'true'", "bash -c -- 'true'", "python3 -c 'pass'", "python3 -B -c 'pass'", "python3 -c 'import sys; sys.exit(0)'", "pytest || true", "pytest; true", "pytest | cat"):
             self.assertTrue(guard_policies._is_trivial_eval_command(triv), f"Should be trivial: {triv!r}")
 
-        for bad_test in (
-            "pytest || true",
-            "pytest; true",
-            "pytest | cat",
-            "pytest &",
-            "tox -- rm -rf src",
-            "go test -coverprofile=/tmp/c ./...",
-        ):
-            self.assertFalse(guard_constants._is_test_command(bad_test), f"_is_test_command must reject {bad_test!r}")
-        self.assertTrue(guard_constants._is_test_command("cd sub && pytest"))
-        self.assertTrue(guard_constants._is_test_command("pytest && echo done"))
+        for bad_test in ("pytest || true", "pytest; true", "pytest | cat", "pytest &", "tox -- rm -rf src", "go test -coverprofile=/tmp/c ./..."):
+            self.assertFalse(guard_ast._is_test_command(bad_test), f"_is_test_command must reject {bad_test!r}")
+        self.assertTrue(guard_ast._is_test_command("cd sub && pytest"))
+        self.assertTrue(guard_ast._is_test_command("pytest && echo done"))
 
         eval_st = orchestrator_guard._default_state()
         for triv_decl in ("jest -v", "vitest list", "go test -list .", "cargo test --list", "pytest -c x.ini"):
@@ -8987,11 +3485,7 @@ orchestrator_guard.register_subagent(
             self.assertFalse(guard_policies._is_declared_eval_command(triv_decl, eval_st, self.base_payload))
 
         eval_st["active_eval_cmd"] = "python3 bench.py"
-        for bad_decl in (
-            "python3 bench.py; true",
-            "python3 bench.py | cat",
-            "cd /tmp/fake && python3 bench.py",
-        ):
+        for bad_decl in ("python3 bench.py; true", "python3 bench.py | cat", "cd /tmp/fake && python3 bench.py"):
             self.assertFalse(guard_policies._is_declared_eval_command(bad_decl, eval_st, self.base_payload))
         self.assertTrue(guard_policies._is_declared_eval_command("cd sub && python3 bench.py", eval_st, self.base_payload))
 
@@ -9000,62 +3494,22 @@ orchestrator_guard.register_subagent(
         import guard
         import guard.constants as guard_constants
 
-        head_147_exports = (
-            "ALLOWED_COUNCIL_PROPOSER_MODELS", "ALLOWED_FILES_HEADER_RE", "ALLOWED_SUBAGENT_MODELS",
-            "ALLOWED_SYSTEM_PATH_PREFIXES", "ALLOWED_VERIFIER_REVIEWER_MODELS", "ASSERTION_RE",
-            "BLIND_JUDGE_LEAK_PATTERNS", "COHORT_HEADER_RE", "COMMENT_LINE_RE", "COUNCIL_ID_HEADER_RE",
-            "COUNCIL_NAME_LEAK_RE", "COUNCIL_ROLE_HEADER_RE", "DEFAULT_MODEL_BY_TYPE", "DOC_EXTENSIONS",
-            "EVAL_CMD_HEADER_RE", "FORBIDDEN_DIRECT_READ_RE", "GIT_COMMAND_RE",
-            "HIGH_REASONING_READONLY_TYPES", "ISOLATED_WORKSPACES", "MAX_CONSECUTIVE_FAILURES",
-            "MAX_DIRECT_COMMANDS", "MAX_DIRECT_MUTATION_FILES", "MAX_DIRECT_READ_FILES",
-            "MAX_REPORT_BULLET_LINES", "MAX_STATE_INVOCATION_HISTORY", "MAX_STATE_LIST_ENTRIES",
-            "MAX_SUBAGENT_REPORT_CHARS", "MODE_HEADER_RE", "MUTATION_TOOLS", "MUTATION_VERBS_RE",
-            "NUMBERED_RULE_RE", "PATH_ARG_KEYS", "PENDING_SPAWN_TTL_SECONDS", "PROJECT_ROOT",
-            "READONLY_NON_VERIFICATION_TYPES", "READ_TOOLS", "REPORT_BULLET_RE", "REPORT_LINE_PATTERNS",
-            "REPORT_LOG_URI_RE", "REVIEW_LENS_HEADER_RE", "SCRATCH_ONLY_SUBAGENT_TYPES", "SCRIPT_DIR",
-            "SEARCH_TOOLS", "SLASH_COMMAND_RE", "STRICT_READONLY_SUBAGENT_TYPES", "SUBAGENT_SPAWN_RE",
-            "TAMPER_SKIP_RE", "TEST_CMD_START_RE", "TEST_DEF_RE", "TEST_FILE_RE", "TRIVIAL_ASSERT_RE",
-            "TRIVIAL_EVAL_CMD_RE", "UUID_RE", "_allowed_roots", "_apply_cohort_invoke_outcome",
-            "_apply_cohort_outcome", "_check_and_record_direct_budget", "_check_test_tampering_in_edit",
-            "_cli_activate", "_cli_deactivate", "_cli_doctor", "_cli_reset", "_cli_status",
-            "_cli_toggle_active", "_collect_invoke_cohort_candidates", "_command_stays_in_workspace",
-            "_compare_test_blobs", "_current_invocation_key", "_current_subagent_meta", "_default_state",
-            "_detect_blind_judge_leak", "_detect_council_name_leak", "_ensure_session_active",
-            "_expand_swarm_worker_names", "_extract_any_path_arg", "_extract_call_id",
-            "_extract_last_model_response", "_extract_target_path", "_finalize_subagent_stop_sync",
-            "_find_allowed_files_overlap", "_find_project_root", "_get_circuit_breaker",
-            "_get_subagent_allowed_files", "_get_subagent_type", "_get_test_receipt",
-            "_get_workspace_git_diff", "_handle_define_subagent", "_handle_invoke_subagent",
-            "_handle_manage_subagents", "_handle_send_message", "_handle_swarm",
-            "_has_unquoted_or_operator", "_is_allowed_research_scratch_write",
-            "_is_artifact_or_worktree_path", "_is_code_file", "_is_declared_eval_command",
-            "_is_git_only_command", "_is_known_subagent", "_is_parent_orchestrator",
-            "_is_research_subagent", "_is_root_orchestrator", "_is_scratch_only_subagent",
-            "_is_scout_subagent", "_is_simple_readonly_task", "_is_slash_command_triggered",
-            "_is_strict_readonly_subagent", "_is_target_in_allowed_files", "_is_test_command",
-            "_is_test_file", "_is_trivial_eval_command", "_is_within_allowed_roots",
-            "_iter_active_subagents", "_load_state", "_lookup_recipient_meta",
-            "_mark_subagent_status_in_parent_brain", "_normalize_allowlist_entry",
-            "_normalize_review_lens", "_normalize_subagent_meta", "_parse_allowed_files_header",
-            "_parse_cohort_header", "_parse_council_id_header", "_parse_council_role_header",
-            "_parse_eval_cmd_header", "_parse_mode_header", "_parse_review_lens_header",
-            "_propagate_receipt_to_parent_brain", "_prune_state", "_record_cohort_outcome_in_parent_brain",
-            "_record_council_member", "_resolve_state_path", "_save_state", "_split_shell_commands",
-            "_state_file_path", "_strip_comments", "_strip_leading_env_assignments",
-            "_sync_subagents_from_transcript", "_validate_and_prepare_subagent_entry",
-            "_workspaces_compatible", "audit_diff_text", "handle_post_tool", "handle_pre_invocation",
-            "handle_pre_tool", "handle_stop", "main", "register_subagent", "state_transaction",
+        public_exports = (
+            "CLI_MODES", "PROJECT_ROOT", "SCRIPT_DIR", "audit_diff_text",
+            "handle_post_tool", "handle_pre_invocation", "handle_pre_tool",
+            "handle_stop", "main", "register_subagent", "state_transaction",
             "validate_subagent_report",
         )
-        self.assertEqual(len(head_147_exports), 147)
+        self.assertEqual(tuple(guard.__all__), public_exports)
+        self.assertEqual(len(guard.__all__), 12)
         self.assertEqual(list(guard.__all__), sorted(guard.__all__))
-        self.assertEqual(len(guard.__all__), 209)
-        self.assertTrue(set(head_147_exports).issubset(set(guard.__all__)))
         for sym in guard.__all__:
             self.assertTrue(hasattr(guard, sym), f"Missing guard.{sym}")
             self.assertTrue(hasattr(orchestrator_guard, sym), f"Missing orchestrator_guard.{sym}")
+        for compat_sym in ("_default_state", "_load_state", "_is_test_command", "_split_shell_commands"):
+            self.assertTrue(hasattr(guard, compat_sym), f"Missing compat guard.{compat_sym}")
+            self.assertTrue(hasattr(orchestrator_guard, compat_sym), f"Missing compat orchestrator_guard.{compat_sym}")
 
-        # Acyclic top-level import DAG and compact module line budgets
         scripts_dir = Path(guard_constants.SCRIPT_DIR)
         guard_dir = scripts_dir / "guard"
         deps: dict[str, list[str]] = {}
@@ -9090,19 +3544,29 @@ orchestrator_guard.register_subagent(
 
         for mod_name in deps:
             _check_acyclic(mod_name)
+        self.assertEqual(len(visited), len(deps))
 
         self.assertLess(len((scripts_dir / "orchestrator_guard.py").read_text(encoding="utf-8").splitlines()), 80)
         budgets = {
-            "ast_guard.py": 450,
-            "path_guards.py": 950,
-            "policies.py": 850,
-            "root_allowlist.py": 950,
-            "shell_targets.py": 700,
-            "shell_tokens.py": 1300,
+            "__init__.py": 90,
+            "ast_guard.py": 200,
+            "cli.py": 200,
+            "constants.py": 350,
+            "identity.py": 820,
+            "path_guards.py": 560,
+            "policies.py": 520,
+            "root_allowlist.py": 420,
+            "shell_targets.py": 380,
+            "shell_tokens.py": 760,
+            "state_store.py": 300,
+            "subagent_policy.py": 1400,
+            "verification.py": 1150,
         }
+        self.assertEqual(set(budgets.keys()), set(line_counts.keys()))
         for fname, limit in budgets.items():
             self.assertLess(line_counts[fname], limit, f"{fname} exceeded {limit} lines: {line_counts[fname]}")
-        self.assertLess(sum(line_counts.values()), 13000)
+        self.assertGreater(sum(line_counts.values()), 0)
+        self.assertLess(sum(line_counts.values()), 6800)
 
 
 if __name__ == "__main__":

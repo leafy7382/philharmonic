@@ -17,6 +17,9 @@ if __name__ != "__main__":
     for _sym in _guard_all:
         globals()[_sym] = getattr(_guard_pkg, _sym)
 
+    def __getattr__(name: str):
+        return getattr(_guard_pkg, name)
+
 
 def _safe_entrypoint() -> None:
     try:

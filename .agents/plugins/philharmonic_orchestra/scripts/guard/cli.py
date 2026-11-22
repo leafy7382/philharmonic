@@ -3,28 +3,15 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import select
 import sys
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 from guard.constants import PROJECT_ROOT
 from guard.identity import handle_pre_invocation
 from guard.policies import handle_pre_tool
-from guard.state_store import (
-    _current_invocation_key,
-    _default_state,
-    _load_state,
-    _save_state,
-    _state_file_path,
-    state_transaction,
-)
-from guard.verification import (
-    _get_circuit_breaker,
-    _get_test_receipt,
-    handle_post_tool,
-    handle_stop,
-)
+from guard.state_store import _current_invocation_key, _default_state, _load_state, _save_state, _state_file_path, state_transaction
+from guard.verification import _get_circuit_breaker, _get_test_receipt, handle_post_tool, handle_stop
 
 
 def _cli_status(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -68,11 +55,7 @@ def _cli_toggle_active(payload: Dict[str, Any], active: bool) -> Dict[str, Any]:
         state["active"] = active
         state["session_evaluated"] = True
         _save_state(state_path, state)
-        return {
-            "status": "activated" if active else "deactivated",
-            "active": active,
-            "state_path": str(state_path),
-        }
+        return {"status": "activated" if active else "deactivated", "active": active, "state_path": str(state_path)}
 
 
 def _cli_activate(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -85,56 +68,49 @@ def _cli_deactivate(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _cli_reset(payload: Dict[str, Any]) -> Dict[str, Any]:
     with state_transaction(payload):
-        fresh = _default_state()
-        _save_state(payload, fresh)
+        _save_state(payload, _default_state())
         return {"status": "reset", "stateFile": str(_state_file_path(payload))}
 
 
 def _cli_doctor() -> Dict[str, Any]:
-    plugin_hooks = (
-        PROJECT_ROOT / ".agents" / "plugins" / "philharmonic_orchestra" / "hooks.json"
-    )
-    workspace_hooks = PROJECT_ROOT / ".agents" / "hooks.json"
-    skill_file = (
-        PROJECT_ROOT
-        / ".agents"
-        / "plugins"
-        / "philharmonic_orchestra"
-        / "skills"
-        / "philharmonic"
-        / "SKILL.md"
-    )
+    plugin_dir = PROJECT_ROOT / ".agents" / "plugins" / "philharmonic_orchestra"
+    plugin_hooks, workspace_hooks = plugin_dir / "hooks.json", PROJECT_ROOT / ".agents" / "hooks.json"
+    skill_file = plugin_dir / "skills" / "philharmonic" / "SKILL.md"
     issues: List[str] = []
     if workspace_hooks.exists():
         try:
             wh_data = json.loads(workspace_hooks.read_text(encoding="utf-8"))
             if wh_data.get("philharmonic_orchestra-guard", {}).get("enabled", True) is not False:
-                issues.append(
-                    "Duplicate .agents/hooks.json is enabled alongside plugin hooks.json."
-                )
+                issues.append("Duplicate .agents/hooks.json is enabled alongside plugin hooks.json.")
         except (OSError, json.JSONDecodeError):
             issues.append("Unreadable .agents/hooks.json.")
     if not skill_file.exists():
-        issues.append(
-            "Missing .agents/plugins/philharmonic_orchestra/skills/philharmonic/SKILL.md."
-        )
+        issues.append("Missing .agents/plugins/philharmonic_orchestra/skills/philharmonic/SKILL.md.")
     else:
         try:
-            skill_content = skill_file.read_text(encoding="utf-8")
-            if "name: philharmonic" not in skill_content:
-                issues.append(
-                    "Skill SKILL.md does not contain 'name: philharmonic'."
-                )
+            if "name: philharmonic" not in skill_file.read_text(encoding="utf-8"):
+                issues.append("Skill SKILL.md does not contain 'name: philharmonic'.")
         except OSError:
             issues.append("Unable to read SKILL.md.")
     return {
-        "healthy": len(issues) == 0 and plugin_hooks.exists() and skill_file.exists(),
+        "healthy": not issues and plugin_hooks.exists() and skill_file.exists(),
         "pluginHooksPresent": plugin_hooks.exists(),
         "issues": issues,
     }
 
 
 CLI_MODES = {"status", "reset", "activate", "deactivate"}
+_CLI_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
+    "status": _cli_status,
+    "reset": _cli_reset,
+    "activate": _cli_activate,
+    "deactivate": _cli_deactivate,
+}
+_HOOK_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
+    "pre-invocation": handle_pre_invocation,
+    "post-tool": handle_post_tool,
+    "stop": handle_stop,
+}
 
 
 def _read_stdin_payload(is_cli_mode: bool) -> Dict[str, Any]:
@@ -145,20 +121,13 @@ def _read_stdin_payload(is_cli_mode: bool) -> Dict[str, Any]:
             return {}
     except (AttributeError, OSError, ValueError):
         pass
-
     if is_cli_mode:
         try:
             fd = sys.stdin.fileno()
+            if isinstance(fd, int) and fd >= 0 and os.name != "nt" and not select.select([fd], [], [], 0.05)[0]:
+                return {}
         except (AttributeError, OSError, ValueError):
-            fd = -1
-        if isinstance(fd, int) and fd >= 0 and os.name != "nt":
-            try:
-                ready, _, _ = select.select([fd], [], [], 0.05)
-                if not ready:
-                    return {}
-            except (OSError, ValueError):
-                pass
-
+            pass
     try:
         parsed = json.load(sys.stdin)
     except (json.JSONDecodeError, OSError, ValueError):
@@ -172,33 +141,9 @@ def main() -> None:
         json.dump(_cli_doctor(), sys.stdout, indent=2)
         sys.stdout.write("\n")
         return
-
     payload = _read_stdin_payload(is_cli_mode=(mode in CLI_MODES))
-
-    if mode == "status":
-        json.dump(_cli_status(payload), sys.stdout, indent=2)
+    if mode in _CLI_HANDLERS:
+        json.dump(_CLI_HANDLERS[mode](payload), sys.stdout, indent=2)
         sys.stdout.write("\n")
         return
-    if mode == "reset":
-        json.dump(_cli_reset(payload), sys.stdout, indent=2)
-        sys.stdout.write("\n")
-        return
-    if mode == "activate":
-        json.dump(_cli_activate(payload), sys.stdout, indent=2)
-        sys.stdout.write("\n")
-        return
-    if mode == "deactivate":
-        json.dump(_cli_deactivate(payload), sys.stdout, indent=2)
-        sys.stdout.write("\n")
-        return
-
-    if mode == "pre-invocation":
-        result = handle_pre_invocation(payload)
-    elif mode == "post-tool":
-        result = handle_post_tool(payload)
-    elif mode == "stop":
-        result = handle_stop(payload)
-    else:
-        result = handle_pre_tool(payload)
-
-    json.dump(result, sys.stdout)
+    json.dump(_HOOK_HANDLERS.get(mode, handle_pre_tool)(payload), sys.stdout)
