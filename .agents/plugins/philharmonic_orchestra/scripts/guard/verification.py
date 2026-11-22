@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from guard.constants import (
     ASSERTION_RE,
-    COMMENT_LINE_RE,
     DOC_EXTENSIONS,
     ISOLATED_WORKSPACES,
     MAX_CONSECUTIVE_FAILURES,
@@ -29,6 +28,7 @@ from guard.constants import (
     TEST_FILE_RE,
     TRIVIAL_ASSERT_RE,
     UUID_RE,
+    _count_early_test_returns,
     _extract_call_id,
     _is_git_only_command,
     _is_sandbox_boundary_error,
@@ -36,12 +36,16 @@ from guard.constants import (
     _strip_comments,
 )
 from guard.identity import (
+    _apply_cohort_outcome,
     _ensure_session_active,
+    _get_subagent_type,
     _is_known_subagent,
     _is_root_orchestrator,
     _is_scout_subagent,
     _mark_subagent_status_in_parent_brain,
     _normalize_subagent_meta,
+    _preclaim_subagent_meta,
+    _read_sibling_snapshot,
     _record_cohort_outcome_in_parent_brain,
     _sync_subagents_from_transcript,
     _workspaces_compatible,
@@ -50,13 +54,14 @@ from guard.policies import (
     _compute_prompt_hash,
     _expand_swarm_worker_names,
     _extract_target_path,
-    _is_artifact_or_worktree_path,
+    _is_artifact_path,
     _is_declared_eval_command,
     _parse_cohort_header,
     _parse_mode_header,
 )
 from guard.state_store import (
     _current_invocation_key,
+    _has_other_locked_path,
     _load_state,
     _save_state,
     _state_file_path,
@@ -82,7 +87,11 @@ def _compare_test_blobs(
     old_text: str, new_text: str, file_name: str, is_diff: bool = False
 ) -> Optional[str]:
     """Compare old and new test content for tampering (skip markers, trivial asserts, or net removals)."""
-    if len(TAMPER_SKIP_RE.findall(new_text)) > len(TAMPER_SKIP_RE.findall(old_text)):
+    old_skip_text = _strip_comments(old_text, file_name=file_name, preserve_ignore=True)
+    new_skip_text = _strip_comments(new_text, file_name=file_name, preserve_ignore=True)
+    if len(TAMPER_SKIP_RE.findall(new_skip_text)) > len(
+        TAMPER_SKIP_RE.findall(old_skip_text)
+    ):
         if is_diff:
             return f"[ORCHESTRATOR GUARD] Diff audit detected test skip/xfail marker added in '{file_name}'."
         return (
@@ -90,8 +99,10 @@ def _compare_test_blobs(
             "adding skip/xfail decorators or disabling tests is prohibited."
         )
 
-    if len(TRIVIAL_ASSERT_RE.findall(new_text)) > len(
-        TRIVIAL_ASSERT_RE.findall(old_text)
+    old_clean = _strip_comments(old_text, file_name=file_name)
+    new_clean = _strip_comments(new_text, file_name=file_name)
+    if len(TRIVIAL_ASSERT_RE.findall(new_clean)) > len(
+        TRIVIAL_ASSERT_RE.findall(old_clean)
     ):
         if is_diff:
             return f"[ORCHESTRATOR GUARD] Diff audit detected trivial 'assert True' added in '{file_name}'."
@@ -100,9 +111,17 @@ def _compare_test_blobs(
             "replacing checks with trivial 'assert True' is prohibited."
         )
 
+    if _count_early_test_returns(new_text, file_name=file_name) > _count_early_test_returns(
+        old_text, file_name=file_name
+    ):
+        if is_diff:
+            return f"[ORCHESTRATOR GUARD] Diff audit detected early bare 'return' added in '{file_name}'."
+        return (
+            f"[ORCHESTRATOR GUARD] Test tampering blocked in '{file_name}': "
+            "adding early bare 'return' inside a test function is prohibited."
+        )
+
     if is_diff or old_text:
-        old_clean = _strip_comments(old_text)
-        new_clean = _strip_comments(new_text)
         old_tests = len(TEST_DEF_RE.findall(old_clean))
         new_tests = len(TEST_DEF_RE.findall(new_clean))
         if new_tests < old_tests:
@@ -137,19 +156,48 @@ def _check_test_tampering_in_edit(
 ) -> Optional[Dict[str, Any]]:
     """Block edits to test files that delete/comment-out tests/assertions or add skip markers."""
     target = _extract_target_path(tool_name, args)
-    if not target or _is_artifact_or_worktree_path(target, payload):
+    if not target or _is_artifact_path(target, payload):
         return None
     if not _is_test_file(target):
         return None
 
+    file_name = Path(target).name
+    try:
+        raw_target_path = Path(os.path.expanduser(target))
+        resolved_target = (
+            raw_target_path if raw_target_path.is_absolute() else (PROJECT_ROOT / raw_target_path)
+        ).resolve()
+    except (OSError, ValueError):
+        return {"decision": "deny", "reason": "[ORCHESTRATOR GUARD] Invalid test path."}
+
     chunks: List[Tuple[str, str]] = []
     if tool_name in {"edit_file", "replace_file_content"}:
+        for key in ("Target", "TargetContent", "Replacement", "ReplacementContent"):
+            val = args.get(key)
+            if val is not None and not isinstance(val, str):
+                return {
+                    "decision": "deny",
+                    "reason": f"[ORCHESTRATOR GUARD] Invalid non-string '{key}' argument in test edit.",
+                }
         old_chunk = args.get("Target") or args.get("TargetContent") or ""
         new_chunk = args.get("Replacement") or args.get("ReplacementContent") or ""
         chunks.append((old_chunk, new_chunk))
     elif tool_name == "multi_replace_file_content":
-        for chunk in (args.get("ReplacementChunks") or []):
+        raw_chunks = args.get("ReplacementChunks")
+        if raw_chunks is not None and not isinstance(raw_chunks, list):
+            return {
+                "decision": "deny",
+                "reason": "[ORCHESTRATOR GUARD] Invalid non-list 'ReplacementChunks' argument in test edit.",
+            }
+        for chunk in (raw_chunks or []):
             if isinstance(chunk, dict):
+                for key in ("TargetContent", "ReplacementContent"):
+                    val = chunk.get(key)
+                    if val is not None and not isinstance(val, str):
+                        return {
+                            "decision": "deny",
+                            "reason": f"[ORCHESTRATOR GUARD] Invalid non-string '{key}' in ReplacementChunks.",
+                        }
                 chunks.append(
                     (
                         chunk.get("TargetContent") or "",
@@ -157,20 +205,49 @@ def _check_test_tampering_in_edit(
                     )
                 )
     elif tool_name in {"write_file", "write_to_file"}:
+        for key in ("Content", "CodeContent"):
+            val = args.get(key)
+            if val is not None and not isinstance(val, str):
+                return {
+                    "decision": "deny",
+                    "reason": f"[ORCHESTRATOR GUARD] Invalid non-string '{key}' argument in test write.",
+                }
         new_code = args.get("Content") or args.get("CodeContent") or ""
         old_code = ""
         try:
-            resolved = Path(os.path.expanduser(target)).resolve()
-            if resolved.exists():
-                old_code = resolved.read_text(encoding="utf-8")
-        except OSError:
+            if resolved_target.exists():
+                old_code = resolved_target.read_text(encoding="utf-8")
+        except (OSError, ValueError):
             old_code = ""
         if args.get("Append") is True and old_code:
             chunks.append((old_code, old_code + "\n" + new_code))
         else:
             chunks.append((old_code, new_code))
 
-    file_name = Path(target).name
+    if tool_name in {"edit_file", "replace_file_content", "multi_replace_file_content"} and chunks:
+        try:
+            if resolved_target.is_file():
+                before_text = resolved_target.read_text(encoding="utf-8")
+                after_text = before_text
+                all_applied = True
+                for old_chunk, new_chunk in chunks:
+                    if not old_chunk or old_chunk not in after_text:
+                        all_applied = False
+                        break
+                    if tool_name == "edit_file" or args.get("AllowMultiple") is True:
+                        after_text = after_text.replace(old_chunk, new_chunk)
+                    else:
+                        after_text = after_text.replace(old_chunk, new_chunk, 1)
+                if all_applied:
+                    reason = _compare_test_blobs(
+                        before_text, after_text, file_name, is_diff=False
+                    )
+                    if reason:
+                        return {"decision": "deny", "reason": reason}
+                    return None
+        except (OSError, ValueError):
+            pass
+
     for old_text, new_text in chunks:
         reason = _compare_test_blobs(old_text, new_text, file_name, is_diff=False)
         if reason:
@@ -188,15 +265,76 @@ def audit_diff_text(diff_text: str) -> Optional[str]:
     pending_old_file: Optional[str] = None
     removed_lines: List[str] = []
     added_lines: List[str] = []
+    in_test_hunk = False
+    test_def_indent: Optional[int] = None
+    nested_def_indent: Optional[int] = None
+    hunk_body_indent: Optional[int] = None
+    hunk_added_returns = 0
+    hunk_removed_returns = 0
 
     def _check_accumulated(
         fname: Optional[str], rem: List[str], add: List[str]
     ) -> Optional[str]:
         if not fname or not _is_test_file(fname):
             return None
+        if hunk_added_returns > hunk_removed_returns:
+            return (
+                f"[ORCHESTRATOR GUARD] Diff audit detected early bare 'return' "
+                f"added in '{Path(fname).name}'."
+            )
         return _compare_test_blobs(
             "\n".join(rem), "\n".join(add), Path(fname).name, is_diff=True
         )
+
+    def _update_hunk_def_state(line_body: str) -> None:
+        nonlocal in_test_hunk, test_def_indent, nested_def_indent, hunk_body_indent
+        stripped = line_body.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("//"):
+            return
+        line_indent = len(line_body) - len(line_body.lstrip(" \t"))
+        if re.match(r"^(?:async\s+)?def\s+test_[A-Za-z0-9_]+\s*\(", stripped):
+            in_test_hunk = True
+            test_def_indent = line_indent
+            nested_def_indent = None
+            hunk_body_indent = None
+            return
+        if in_test_hunk:
+            if (
+                test_def_indent is not None
+                and line_indent <= test_def_indent
+                and not stripped.startswith("@")
+                and not stripped.startswith(")")
+            ):
+                in_test_hunk = False
+                test_def_indent = None
+                nested_def_indent = None
+                hunk_body_indent = None
+                return
+            if nested_def_indent is not None and line_indent <= nested_def_indent:
+                nested_def_indent = None
+            if nested_def_indent is None and re.match(r"^(?:async\s+)?def\s+", stripped):
+                if test_def_indent is not None and line_indent > test_def_indent:
+                    nested_def_indent = line_indent
+                elif (
+                    test_def_indent is None
+                    and re.match(r"^(?:async\s+)?def\s+(?!test_)[A-Za-z0-9_]*", stripped)
+                    and line_indent > 0
+                    and (hunk_body_indent is None or line_indent >= hunk_body_indent)
+                ):
+                    nested_def_indent = line_indent
+                else:
+                    in_test_hunk = False
+                    test_def_indent = None
+                    nested_def_indent = None
+                    hunk_body_indent = None
+            elif (
+                test_def_indent is None
+                and nested_def_indent is None
+                and hunk_body_indent is None
+                and not stripped.startswith("@")
+                and not stripped.startswith(")")
+            ):
+                hunk_body_indent = line_indent
 
     for raw_line in diff_text.splitlines():
         if raw_line.startswith("--- a/"):
@@ -215,16 +353,57 @@ def audit_diff_text(diff_text: str) -> Optional[str]:
             pending_old_file = None
             removed_lines = []
             added_lines = []
-        elif (
-            raw_line.startswith("---")
-            or raw_line.startswith("@@")
-            or raw_line.startswith("diff --git")
-        ):
+            in_test_hunk = False
+            test_def_indent = None
+            nested_def_indent = None
+            hunk_body_indent = None
+            hunk_added_returns = 0
+            hunk_removed_returns = 0
+        elif raw_line.startswith("@@"):
+            if (
+                hunk_added_returns > hunk_removed_returns
+                and current_file
+                and _is_test_file(current_file)
+            ):
+                return (
+                    f"[ORCHESTRATOR GUARD] Diff audit detected early bare 'return' "
+                    f"added in '{Path(current_file).name}'."
+                )
+            in_test_hunk = bool(
+                re.search(r"@@.*?\b(?:async\s+)?def\s+test_[A-Za-z0-9_]+", raw_line)
+            )
+            test_def_indent = None
+            nested_def_indent = None
+            hunk_body_indent = None
+            hunk_added_returns = 0
+            hunk_removed_returns = 0
+        elif raw_line.startswith("---") or raw_line.startswith("diff --git"):
             continue
+        elif raw_line.startswith(" "):
+            _update_hunk_def_state(raw_line[1:])
         elif raw_line.startswith("-"):
-            removed_lines.append(raw_line[1:])
+            line_body = raw_line[1:]
+            removed_lines.append(line_body)
+            if in_test_hunk and nested_def_indent is None:
+                cleaned_line = _strip_comments(
+                    line_body, file_name=current_file or ""
+                ).strip()
+                if cleaned_line and re.search(
+                    r"(?:^|[;:]\s*)return(?:\b|$)", cleaned_line
+                ):
+                    hunk_removed_returns += 1
         elif raw_line.startswith("+"):
-            added_lines.append(raw_line[1:])
+            line_body = raw_line[1:]
+            added_lines.append(line_body)
+            _update_hunk_def_state(line_body)
+            if in_test_hunk and nested_def_indent is None:
+                cleaned_line = _strip_comments(
+                    line_body, file_name=current_file or ""
+                ).strip()
+                if cleaned_line and re.search(
+                    r"(?:^|[;:]\s*)return(?:\b|$)", cleaned_line
+                ):
+                    hunk_added_returns += 1
 
     return _check_accumulated(current_file, removed_lines, added_lines)
 
@@ -232,7 +411,10 @@ def audit_diff_text(diff_text: str) -> Optional[str]:
 def _get_circuit_breaker(
     state: Dict[str, Any], payload: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
-    cb_root = state.setdefault("circuit_breaker", {})
+    cb_root = state.get("circuit_breaker")
+    if not isinstance(cb_root, dict):
+        cb_root = {}
+        state["circuit_breaker"] = cb_root
     if "failure_streak" not in cb_root:
         cb_root.clear()
         cb_root.update(
@@ -244,6 +426,8 @@ def _get_circuit_breaker(
                 "replan_count": 0,
             }
         )
+    if not isinstance(cb_root.get("seen_failures"), list):
+        cb_root["seen_failures"] = []
     cb_root.setdefault("replan_count", 0)
     return cb_root
 
@@ -251,7 +435,10 @@ def _get_circuit_breaker(
 def _get_test_receipt(
     state: Dict[str, Any], payload: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
-    receipt_root = state.setdefault("test_receipt", {})
+    receipt_root = state.get("test_receipt")
+    if not isinstance(receipt_root, dict):
+        receipt_root = {}
+        state["test_receipt"] = receipt_root
     if "dirty" not in receipt_root:
         prev_epoch = receipt_root.get("mutation_epoch", 0)
         receipt_root.clear()
@@ -275,8 +462,9 @@ def _current_subagent_meta(
     meta = state.get("self_subagent_meta")
     if isinstance(meta, dict) and meta:
         return meta
-    cid = (payload.get("conversationId") or "").strip().lower()
-    sub_info = (state.get("subagents") or {}).get(cid)
+    cid = str(payload.get("conversationId") or "").strip().lower()
+    subagents = state.get("subagents")
+    sub_info = subagents.get(cid) if isinstance(subagents, dict) else None
     if isinstance(sub_info, dict) and sub_info:
         return sub_info
     artifact_dir = payload.get("artifactDirectoryPath")
@@ -289,12 +477,17 @@ def _current_subagent_meta(
                 ):
                     if sibling_state_path.parent == resolved_art:
                         continue
-                    try:
-                        sib_data = _load_state(sibling_state_path)
-                    except (OSError, json.JSONDecodeError):
+                    sib_data = _read_sibling_snapshot(sibling_state_path)
+                    if not isinstance(sib_data, dict) or not _workspaces_compatible(
+                        payload, sib_data
+                    ):
                         continue
-                    sib_subagents = sib_data.get("subagents") or {}
-                    if cid in sib_subagents and isinstance(sib_subagents[cid], dict):
+                    sib_subagents = sib_data.get("subagents")
+                    if (
+                        isinstance(sib_subagents, dict)
+                        and cid in sib_subagents
+                        and isinstance(sib_subagents[cid], dict)
+                    ):
                         resolved_meta = _normalize_subagent_meta(sib_subagents[cid])
                         if "parent_conversation_id" not in resolved_meta:
                             resolved_meta["parent_conversation_id"] = (
@@ -304,7 +497,7 @@ def _current_subagent_meta(
                         state["self_subagent_meta"] = resolved_meta
                         _save_state(payload, state)
                         return resolved_meta
-        except OSError:
+        except (OSError, ValueError):
             pass
     return {}
 
@@ -326,7 +519,9 @@ def _extract_expected_cohort_specs(
         prompt_text = str(item.get("Prompt") or "")
         _ = _parse_mode_header(prompt_text)
         c_id = _parse_cohort_header(prompt_text)
-        role_val = (item.get("Role") or item.get("TypeName") or "").strip().lower() or None
+        role_val = (
+            str(item.get("Role") or item.get("TypeName") or "").strip().lower() or None
+        )
         prompt_hash = _compute_prompt_hash(prompt_text)
         specs.append((c_id, role_val, prompt_hash))
     return entries, specs
@@ -580,45 +775,17 @@ def _apply_cohort_invoke_outcome(
     outcome: str,
     error_summary: str = "",
 ) -> None:
-    """Update cohort succeeded/failed tracking and trip global breaker only if 0/N (N>=2) survive."""
-    cohorts = state.setdefault("cohorts", {})
+    """Update cohort succeeded/failed tracking and trip global breaker on 0/N (N>=2) or N<=1 failure."""
     for cohort_id, cand_key in cohort_candidates:
-        cohort_entry = cohorts.get(cohort_id)
-        if not isinstance(cohort_entry, dict):
-            cohort_entry = {
-                "total_spawned": 0,
-                "succeeded": [],
-                "failed": [],
-                "created_at": time.time(),
-            }
-            cohorts[cohort_id] = cohort_entry
-        succeeded = cohort_entry.setdefault("succeeded", [])
-        failed = cohort_entry.setdefault("failed", [])
-        if outcome == "failed":
-            key = cand_key or f"fail:{len(failed)}"
-            if key not in succeeded and key not in failed:
-                failed.append(key)
-            total_spawned = int(cohort_entry.get("total_spawned", 0) or 0)
-            if (
-                total_spawned >= 2
-                and len(failed) >= total_spawned
-                and len(succeeded) == 0
-            ):
-                cb["failure_streak"] = max(
-                    MAX_CONSECUTIVE_FAILURES, int(cb.get("failure_streak", 0) or 0) + 1
-                )
-                cb["tripped"] = True
-                cb["last_error"] = (
-                    error_summary or "All Best-of-N cohort candidates failed"
-                )
-        else:
-            key = cand_key or f"ok:{len(succeeded)}"
-            if key not in succeeded:
-                succeeded.append(key)
-            if key in failed:
-                failed.remove(key)
-            cb["failure_streak"] = 0
-            cb["tripped"] = False
+        _apply_cohort_outcome(
+            state,
+            cand_key,
+            cohort_id,
+            outcome,
+            error_summary=error_summary,
+            create_if_missing=True,
+            cb=cb,
+        )
 
 
 def _propagate_receipt_to_parent_brain(
@@ -627,6 +794,8 @@ def _propagate_receipt_to_parent_brain(
     verified: bool,
     last_mutated_file: Optional[str] = None,
     last_test_cmd: Optional[str] = None,
+    *,
+    bump_epoch: bool = True,
 ) -> None:
     """Propagate subagent workspace code mutation / test verification receipts to parent brain state."""
     artifact_dir = payload.get("artifactDirectoryPath")
@@ -642,9 +811,11 @@ def _propagate_receipt_to_parent_brain(
         meta = current_state.get("self_subagent_meta") or {}
         parent_cid = str(meta.get("parent_conversation_id") or "").strip().lower()
 
-        cid = (payload.get("conversationId") or "").strip().lower()
+        cid = str(payload.get("conversationId") or "").strip().lower()
         for sibling_state_path in resolved_art.parent.glob("*/orchestrator_state.json"):
             if sibling_state_path.parent == resolved_art:
+                continue
+            if _has_other_locked_path(sibling_state_path):
                 continue
 
             with state_transaction(sibling_state_path):
@@ -660,9 +831,13 @@ def _propagate_receipt_to_parent_brain(
                     payload, sib_data
                 ):
                     parent_receipt = _get_test_receipt(sib_data)
-                    parent_receipt["dirty"] = dirty
-                    parent_receipt["verified"] = verified
-                    if dirty:
+                    if verified:
+                        parent_receipt["dirty"] = False
+                        parent_receipt["verified"] = True
+                    else:
+                        parent_receipt["dirty"] = bool(parent_receipt.get("dirty", False)) or bool(dirty)
+                        parent_receipt["verified"] = False
+                    if dirty and bump_epoch:
                         parent_receipt["mutation_epoch"] = (
                             parent_receipt.get("mutation_epoch", 0) + 1
                         )
@@ -671,19 +846,38 @@ def _propagate_receipt_to_parent_brain(
                     if last_test_cmd is not None:
                         parent_receipt["last_test_cmd"] = last_test_cmd
                     _save_state(sibling_state_path, sib_data)
-    except OSError:
+    except (OSError, ValueError):
         pass
 
 
+def _sig_matches_call_id(sig: Any, call_id: str) -> bool:
+    """Return True if a JSON-encoded spawn call signature matches call_id at index 3."""
+    if not isinstance(sig, str) or not call_id:
+        return False
+    try:
+        parsed = json.loads(sig)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(parsed, list) or len(parsed) <= 3:
+        return False
+    sig_cid = str(parsed[3] or "")
+    return sig_cid == call_id or sig_cid.startswith(f"{call_id}:")
+
+
 def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
+    _preclaim_subagent_meta(payload)
+    deferred_propagations: List[Dict[str, Any]] = []
     with state_transaction(payload):
         state_path = _state_file_path(payload)
         state = _load_state(payload)
         if not _ensure_session_active(payload, state, state_path):
             return {}
-        tool_call = payload.get("toolCall", {})
-        tool_name = tool_call.get("name", "")
-        args = tool_call.get("args") or {}
+        raw_tc = payload.get("toolCall")
+        tool_call = raw_tc if isinstance(raw_tc, dict) else {}
+        raw_name = tool_call.get("name")
+        tool_name = raw_name if isinstance(raw_name, str) else ""
+        raw_args = tool_call.get("args")
+        args = raw_args if isinstance(raw_args, dict) else {}
         call_id = _extract_call_id(payload)
 
         if tool_name == "exit_plan_mode" and payload.get("error"):
@@ -696,9 +890,13 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         failed_cohort_entries: List[Dict[str, Any]] = []
         if tool_name == "invoke_subagent" and payload.get("error"):
-            pending = state.get("pending_spawns", [])
+            raw_pending = state.get("pending_spawns")
+            pending = raw_pending if isinstance(raw_pending, list) else []
             recorded = state.get("recorded_spawn_calls", [])
-            if call_id and any(p.get("call_id") == call_id for p in pending):
+            if call_id and any(
+                isinstance(p, dict) and p.get("call_id") == call_id
+                for p in pending
+            ):
                 failed_cohort_entries = [
                     dict(p)
                     for p in pending
@@ -707,11 +905,13 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                     and p.get("mode") == "best_of_n"
                     and p.get("cohort")
                 ]
-                state["pending_spawns"] = [p for p in pending if p.get("call_id") != call_id]
+                state["pending_spawns"] = [
+                    p for p in pending if isinstance(p, dict) and p.get("call_id") != call_id
+                ]
                 if isinstance(recorded, list):
                     state["recorded_spawn_calls"] = [
                         sig for sig in recorded
-                        if not (isinstance(sig, str) and call_id in sig)
+                        if not _sig_matches_call_id(sig, call_id)
                     ]
             else:
                 entries, expected_specs = _extract_expected_cohort_specs(args)
@@ -740,7 +940,8 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
         error_text = str(payload.get("error") or "").strip()
 
         if tool_name in {"run_command", "invoke_subagent", "run_workflow", "swarm"}:
-            cmd = (args.get("CommandLine") or "").strip()
+            raw_cmd = args.get("CommandLine")
+            cmd = raw_cmd.strip() if isinstance(raw_cmd, str) else ""
             is_test_cmd = tool_name == "run_command" and _is_test_command(cmd)
             is_eval_cmd = tool_name == "run_command" and _is_declared_eval_command(
                 cmd, state, payload
@@ -784,6 +985,7 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                 ):
                     swarm_workers = state.get("swarm_workers")
                     rolled_back_names: List[str] = []
+                    rolled_back_models: Dict[str, List[str]] = {}
                     if isinstance(swarm_workers, dict):
                         if call_id:
                             to_remove = [
@@ -799,21 +1001,63 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                                 if wname in swarm_workers
                             ]
                         for wname in to_remove:
-                            swarm_workers.pop(wname, None)
-                            rolled_back_names.append(wname)
-                    if rolled_back_names:
+                            removed_meta = swarm_workers.pop(wname, None)
+                            prev_worker = (
+                                removed_meta.get("_prev_worker")
+                                if isinstance(removed_meta, dict)
+                                else None
+                            )
+                            if isinstance(prev_worker, dict):
+                                restored = dict(prev_worker)
+                                restored.pop("_prev_worker", None)
+                                swarm_workers[wname] = restored
+                            else:
+                                rolled_back_names.append(wname)
+                            if (
+                                isinstance(removed_meta, dict)
+                                and removed_meta.get("council_id")
+                                and removed_meta.get("model")
+                            ):
+                                rolled_back_models.setdefault(
+                                    str(removed_meta["council_id"]), []
+                                ).append(str(removed_meta["model"]))
+                    if rolled_back_names or rolled_back_models:
                         councils = state.get("councils")
                         if isinstance(councils, dict):
-                            for c_entry in councils.values():
+                            for c_id, c_entry in councils.items():
                                 if not isinstance(c_entry, dict):
                                     continue
-                                for role_list_key in ("proposers", "judges"):
-                                    role_list = c_entry.get(role_list_key)
-                                    if isinstance(role_list, list):
-                                        c_entry[role_list_key] = [
-                                            item
-                                            for item in role_list
-                                            if item not in rolled_back_names
+                                if rolled_back_names:
+                                    for role_list_key in ("proposers", "judges", "synthesizers"):
+                                        role_list = c_entry.get(role_list_key)
+                                        if isinstance(role_list, list):
+                                            c_entry[role_list_key] = [
+                                                item
+                                                for item in role_list
+                                                if item not in rolled_back_names
+                                            ]
+                                if c_id in rolled_back_models and isinstance(
+                                    c_entry.get("models"), list
+                                ):
+                                    still_used = {
+                                        str(w.get("model"))
+                                        for w in (swarm_workers or {}).values()
+                                        if isinstance(w, dict)
+                                        and w.get("council_id") == c_id
+                                        and w.get("model")
+                                    } | {
+                                        str(s.get("model"))
+                                        for s in (state.get("subagents") or {}).values()
+                                        if isinstance(s, dict)
+                                        and s.get("council_id") == c_id
+                                        and s.get("model")
+                                    }
+                                    to_drop = set(rolled_back_models[c_id]) - still_used
+                                    if to_drop:
+                                        c_entry["models"] = [
+                                            m
+                                            for m in c_entry["models"]
+                                            if m not in to_drop
                                         ]
                 elif (
                     tool_name == "swarm"
@@ -828,11 +1072,15 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                         and isinstance(swarm_workers[wname], dict)
                     ):
                         meta = swarm_workers[wname]
-                        meta["status"] = "active"
-                        meta["active_worktree"] = (
-                            str(meta.get("workspace") or "inherit").strip().lower()
-                            in ISOLATED_WORKSPACES
-                        )
+                        if meta.pop("pre_kill_active", True):
+                            meta["status"] = "active"
+                            meta["active_worktree"] = (
+                                str(meta.get("workspace") or "inherit").strip().lower()
+                                in ISOLATED_WORKSPACES
+                            )
+                        else:
+                            meta["status"] = "killed"
+                            meta["active_worktree"] = False
                 cohort_candidates = (
                     _collect_invoke_cohort_candidates(
                         payload,
@@ -875,13 +1123,33 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                         not _is_root_orchestrator(payload, state)
                         and caller_mode != "best_of_n"
                     ):
-                        _propagate_receipt_to_parent_brain(
-                            payload,
-                            dirty=bool(receipt.get("dirty", True)),
-                            verified=False,
-                            last_test_cmd=cmd,
+                        deferred_propagations.append(
+                            {
+                                "dirty": bool(receipt.get("dirty", False)),
+                                "verified": False,
+                                "last_test_cmd": cmd,
+                                "bump_epoch": False,
+                            }
                         )
             else:
+                if (
+                    tool_name == "swarm"
+                    and str(args.get("action") or "").strip().lower() == "add"
+                ):
+                    swarm_workers = state.get("swarm_workers")
+                    if isinstance(swarm_workers, dict):
+                        target_names = (
+                            [
+                                wname
+                                for wname, meta in swarm_workers.items()
+                                if isinstance(meta, dict) and meta.get("call_id") == call_id
+                            ]
+                            if call_id
+                            else _expand_swarm_worker_names(args)
+                        )
+                        for wname in target_names:
+                            if isinstance(swarm_workers.get(wname), dict):
+                                swarm_workers[wname].pop("_prev_worker", None)
                 subagent_failed_status = bool(
                     tool_name == "invoke_subagent"
                     and re.search(
@@ -934,11 +1202,18 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                         state, cb, cohort_candidates, "succeeded"
                     )
                 elif (
-                    (tool_name == "invoke_subagent" and not subagent_failed_status)
+                    (
+                        tool_name == "invoke_subagent"
+                        and not subagent_non_final
+                        and not is_async_spawn_ack
+                    )
                     or is_verification_cmd
                     or (tool_name == "run_command" and not _is_git_only_command(cmd))
                     or tool_name == "run_workflow"
-                    or tool_name == "swarm"
+                    or (
+                        tool_name == "swarm"
+                        and str(args.get("action") or "").strip().lower() == "add"
+                    )
                 ):
                     cb["failure_streak"] = 0
                     cb["tripped"] = False
@@ -957,9 +1232,20 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                         if sub_cid.lower() in matched_cids or (
                             call_id and sub_meta.get("call_id") == call_id
                         ):
-                            sub_meta["status"] = "completed"
+                            if subagent_failed_status:
+                                sub_meta["status"] = "failed"
+                            elif subagent_non_final:
+                                if re.search(
+                                    r"(?m)^\s*STATUS:\s*NEEDS_REPLAN\b", output_text
+                                ):
+                                    sub_meta["status"] = "needs_replan"
+                                else:
+                                    sub_meta["status"] = "checkpoint"
+                            else:
+                                sub_meta["status"] = "completed"
 
                     pending_list = state.get("pending_spawns") or []
+                    matched_pending_ids: set = set()
                     if call_id:
                         for pending_entry in pending_list:
                             if (
@@ -967,7 +1253,7 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                                 and pending_entry.get("status", "active") == "active"
                                 and pending_entry.get("call_id") == call_id
                             ):
-                                pending_entry["status"] = "completed"
+                                matched_pending_ids.add(id(pending_entry))
                     else:
                         _, expected_specs = _extract_expected_cohort_specs(args)
                         matched_completions = _match_pending_spawns_two_pass(
@@ -976,8 +1262,23 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                             expected_specs,
                             allow_type_fallback=True,
                         )
-                        for chosen_entry in matched_completions:
-                            chosen_entry["status"] = "completed"
+                        matched_pending_ids = {
+                            id(chosen_entry) for chosen_entry in matched_completions
+                        }
+                    if matched_pending_ids:
+                        updated_pending: List[Any] = []
+                        for pending_entry in pending_list:
+                            if id(pending_entry) in matched_pending_ids and isinstance(
+                                pending_entry, dict
+                            ):
+                                if pending_entry.get("active_worktree") or pending_entry.get(
+                                    "active_branch"
+                                ):
+                                    pending_entry["status"] = "completed"
+                                    updated_pending.append(pending_entry)
+                            else:
+                                updated_pending.append(pending_entry)
+                        state["pending_spawns"] = updated_pending
 
                 is_verification_subagent = (
                     tool_name == "invoke_subagent"
@@ -997,18 +1298,24 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                         and not _is_root_orchestrator(payload, state)
                         and caller_mode != "best_of_n"
                     ):
-                        _propagate_receipt_to_parent_brain(
-                            payload,
-                            dirty=False,
-                            verified=True,
-                            last_test_cmd=cmd,
+                        deferred_propagations.append(
+                            {
+                                "dirty": False,
+                                "verified": True,
+                                "last_test_cmd": cmd,
+                            }
                         )
 
         _save_state(payload, state)
-        return {}
+
+    for prop_kwargs in deferred_propagations:
+        _propagate_receipt_to_parent_brain(payload, **prop_kwargs)
+    return {}
 
 
-def validate_subagent_report(text: str, is_scout: bool = False) -> Optional[str]:
+def validate_subagent_report(
+    text: str, is_scout: bool = False, is_readonly_or_scratch: bool = False
+) -> Optional[str]:
     """Validate that a subagent's final output matches the REPORT FORMAT."""
     stripped = (text or "").strip()
     if not stripped:
@@ -1083,13 +1390,18 @@ def validate_subagent_report(text: str, is_scout: bool = False) -> Optional[str]
                 "(at least 3 words)."
             )
     elif status_val in {"BLOCKED", "FAILED"}:
-        if not REPORT_LOG_URI_RE.search(combined_notes):
+        if not is_readonly_or_scratch and not REPORT_LOG_URI_RE.search(combined_notes):
             return f"When STATUS is {status_val}, NOTES must include a 'file://.../*.log' scratch log URI."
         non_uri_text = REPORT_LOG_URI_RE.sub("", combined_notes).strip(" -—:,.;()")
         if len(non_uri_text.split()) < 3:
+            suffix = (
+                "."
+                if is_readonly_or_scratch
+                else " in addition to the file:// scratch log URI."
+            )
             return (
                 f"When STATUS is {status_val}, NOTES must include an inline error summary "
-                "(at least 3 words) in addition to the file:// scratch log URI."
+                f"(at least 3 words){suffix}"
             )
 
     return None
@@ -1107,10 +1419,12 @@ def _extract_last_model_response(payload_or_path: Any) -> Optional[str]:
     else:
         transcript_path = str(payload_or_path)
 
-    if not transcript_path or not os.path.exists(transcript_path):
+    if not isinstance(transcript_path, str) or not transcript_path:
         return None
 
     try:
+        if not os.path.exists(transcript_path):
+            return None
         file_size = os.path.getsize(transcript_path)
         tail_size = 65536
         offset = max(0, file_size - tail_size)
@@ -1129,11 +1443,13 @@ def _extract_last_model_response(payload_or_path: Any) -> Optional[str]:
                 step = json.loads(raw_line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(step, dict):
+                continue
             if step.get("type") == "PLANNER_RESPONSE" and not step.get("tool_calls"):
                 content = step.get("content")
                 if isinstance(content, str) and content.strip():
                     return content
-    except OSError:
+    except (OSError, ValueError):
         return None
     return None
 
@@ -1159,27 +1475,111 @@ def _get_workspace_git_diff(payload: Dict[str, Any]) -> str:
     return ""
 
 
-def _finalize_subagent_stop_sync(
-    payload: Dict[str, Any], state: Dict[str, Any], cb_tripped: bool = False
-) -> None:
-    """Sync subagent completion and Best-of-N cohort outcome into parent brain state."""
-    cid = (payload.get("conversationId") or "").strip().lower()
+def _apply_local_subagent_stop_update(
+    payload: Dict[str, Any],
+    state: Dict[str, Any],
+    cb_tripped: bool = False,
+    *,
+    force_failed: bool = False,
+    abnormal_reason: str = "",
+) -> Tuple[Optional[str], bool]:
+    """Apply local subagent Stop updates inside the state lock. Returns (candidate_key_or_none, skipped_non_final)."""
+    cid = str(payload.get("conversationId") or "").strip().lower()
     if not cid:
-        return
-    _mark_subagent_status_in_parent_brain(payload, state, cid, "completed")
+        return None, False
+
+    last_msg = _extract_last_model_response(payload) or ""
+    status_m = re.search(r"(?m)^\s*STATUS:\s*([A-Za-z_]+)\b", last_msg)
+    report_status = status_m.group(1).upper() if status_m else ""
+    if not force_failed and not cb_tripped and report_status in {"CHECKPOINT", "NEEDS_REPLAN"}:
+        return None, True
+
     sub_meta = _current_subagent_meta(payload, state)
+    local_changed = False
+    subagents = state.get("subagents")
+    if isinstance(subagents, dict) and isinstance(subagents.get(cid), dict):
+        if subagents[cid].get("status") != "completed":
+            subagents[cid]["status"] = "completed"
+            local_changed = True
+    self_meta = state.get("self_subagent_meta")
+    if isinstance(self_meta, dict) and self_meta.get("status") != "completed":
+        self_meta["status"] = "completed"
+        local_changed = True
+
+    candidate_key: Optional[str] = None
     if sub_meta.get("mode") == "best_of_n" and sub_meta.get("cohort"):
-        last_msg = _extract_last_model_response(payload) or ""
-        status_m = re.search(r"(?m)^\s*STATUS:\s*([A-Za-z_]+)\b", last_msg)
-        report_status = status_m.group(1).upper() if status_m else ""
-        if report_status in {"FAILED", "BLOCKED"} or (
-            cb_tripped and report_status != "COMPLETED"
+        if (
+            force_failed
+            or report_status in {"FAILED", "BLOCKED"}
+            or (cb_tripped and report_status != "COMPLETED")
         ):
             outcome = "failed"
             cb_root = _get_circuit_breaker(state, payload)
             err_summary = (
                 str(cb_root.get("last_error") or "").strip()
-                or f"Subagent {cid} finished with STATUS: {report_status or 'BLOCKED'}"
+                or (
+                    f"Subagent {cid} terminated abnormally ({abnormal_reason})"
+                    if force_failed and abnormal_reason
+                    else f"Subagent {cid} finished with STATUS: {report_status or 'BLOCKED'}"
+                )
+            )
+        else:
+            outcome = "succeeded"
+            err_summary = ""
+        sub_reg = (state.get("subagents") or {}).get(cid)
+        candidate_key = str(
+            sub_meta.get("candidate_id")
+            or (sub_reg.get("candidate_id") if isinstance(sub_reg, dict) else None)
+            or cid
+        )
+        if _apply_cohort_outcome(
+            state, candidate_key, str(sub_meta["cohort"]), outcome, err_summary
+        ):
+            local_changed = True
+
+    if local_changed:
+        _save_state(payload, state)
+    return candidate_key, False
+
+
+def _finalize_subagent_stop_sync(
+    payload: Dict[str, Any],
+    state: Dict[str, Any],
+    cb_tripped: bool = False,
+    *,
+    force_failed: bool = False,
+    abnormal_reason: str = "",
+    update_local: bool = True,
+) -> None:
+    """Sync subagent completion and Best-of-N cohort outcome into parent brain state."""
+    cid = str(payload.get("conversationId") or "").strip().lower()
+    if not cid:
+        return
+    last_msg = _extract_last_model_response(payload) or ""
+    status_m = re.search(r"(?m)^\s*STATUS:\s*([A-Za-z_]+)\b", last_msg)
+    report_status = status_m.group(1).upper() if status_m else ""
+    if not force_failed and not cb_tripped and report_status in {"CHECKPOINT", "NEEDS_REPLAN"}:
+        return
+
+    _mark_subagent_status_in_parent_brain(
+        payload, state, cid, "completed", update_local=update_local
+    )
+    sub_meta = _current_subagent_meta(payload, state)
+    if sub_meta.get("mode") == "best_of_n" and sub_meta.get("cohort"):
+        if (
+            force_failed
+            or report_status in {"FAILED", "BLOCKED"}
+            or (cb_tripped and report_status != "COMPLETED")
+        ):
+            outcome = "failed"
+            cb_root = _get_circuit_breaker(state, payload)
+            err_summary = (
+                str(cb_root.get("last_error") or "").strip()
+                or (
+                    f"Subagent {cid} terminated abnormally ({abnormal_reason})"
+                    if force_failed and abnormal_reason
+                    else f"Subagent {cid} finished with STATUS: {report_status or 'BLOCKED'}"
+                )
             )
         else:
             outcome = "succeeded"
@@ -1197,17 +1597,23 @@ def _finalize_subagent_stop_sync(
             str(sub_meta["cohort"]),
             outcome,
             error_summary=err_summary,
+            update_local=update_local,
         )
 
 
 def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
+    _preclaim_subagent_meta(payload)
+    deferred_stop_params: Optional[Dict[str, Any]] = None
+    state_snapshot: Dict[str, Any] = {}
+
     with state_transaction(payload):
         state_path = _state_file_path(payload)
         state = _load_state(payload)
         if not _ensure_session_active(payload, state, state_path):
             return {}
 
-        termination_reason = payload.get("terminationReason", "")
+        raw_term = payload.get("terminationReason")
+        termination_reason = raw_term if isinstance(raw_term, str) else ""
         if termination_reason in {
             "USER_CANCELED",
             "ERROR",
@@ -1215,135 +1621,203 @@ def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
             "MAX_FORCED_INVOCATIONS",
             "MAX_TOKEN_BUDGET_EXCEEDED",
         }:
-            return {"decision": "allow"}
-
-        if not payload.get("fullyIdle", True):
-            return {"decision": "allow"}
-
-        _sync_subagents_from_transcript(payload, state)
-
-        active_branches = [
-            cid
-            for cid, meta in state.get("subagents", {}).items()
-            if isinstance(meta, dict)
-            and (meta.get("active_worktree") or meta.get("active_branch"))
-        ]
-        active_pending = [
-            p.get("role", "implementer")
-            for p in state.get("pending_spawns", [])
-            if isinstance(p, dict)
-            and (p.get("active_worktree") or p.get("active_branch"))
-        ]
-        active_swarm_worktrees = [
-            wname
-            for wname, meta in (state.get("swarm_workers") or {}).items()
-            if isinstance(meta, dict)
-            and meta.get("status") == "active"
-            and meta.get("active_worktree")
-        ]
-
-        if active_branches or active_pending or active_swarm_worktrees:
-            exec_key = f"{payload.get('conversationId', '')}:{payload.get('executionNum', 0)}"
-            reminded = state.setdefault("stop_reminded_executions", [])
-            if exec_key not in reminded:
-                reminded.append(exec_key)
-                _save_state(payload, state)
-                if active_branches or active_pending:
-                    targets = ", ".join(active_branches or active_pending)
-                    return {
-                        "decision": "continue",
-                        "reason": (
-                            f"[ORCHESTRATOR GUARD] Uncleaned branched subagent worktrees remain ({targets}). "
-                            "Verify/merge branch changes and call manage_subagents(Action='kill') before finishing."
-                        ),
-                    }
-                return {
-                    "decision": "continue",
-                    "reason": (
-                        f"[ORCHESTRATOR GUARD] Uncleaned isolated swarm worktrees remain "
-                        f"({', '.join(active_swarm_worktrees)}). "
-                        "Merge/discard changes and call swarm(action='kill') before finishing."
-                    ),
-                }
-
-        if not _is_root_orchestrator(payload, state):
-            sent_key = f"sent:{payload.get('conversationId', '')}:{payload.get('executionNum', 0)}"
-            reminded = state.setdefault("stop_reminded_executions", [])
-            if sent_key not in reminded:
-                last_msg = _extract_last_model_response(payload)
-                if last_msg is not None:
-                    report_err = validate_subagent_report(
-                        last_msg, is_scout=_is_scout_subagent(payload, state)
-                    )
-                    if report_err:
-                        report_key = f"report:{payload.get('conversationId', '')}:{payload.get('executionNum', 0)}"
-                        if report_key not in reminded:
-                            reminded.append(report_key)
-                            _save_state(payload, state)
-                            return {
-                                "decision": "continue",
-                                "reason": (
-                                    f"[ORCHESTRATOR GUARD] Subagent context-separation violation: {report_err} "
-                                    "Return ONLY the exact 4-header REPORT FORMAT (STATUS, FILES_CHANGED, VERIFICATION, NOTES; "
-                                    "allowing up to 10 '-' bullet lines under NOTES and requiring inline error cause plus "
-                                    "file:// .log URI when BLOCKED or FAILED; scouts may use compact 2-header STATUS + NOTES)."
-                                ),
-                            }
-
-        cb = _get_circuit_breaker(state, payload)
-        if cb.get("tripped"):
             if _is_known_subagent(payload, state):
-                _finalize_subagent_stop_sync(payload, state, cb_tripped=True)
+                cid = str(payload.get("conversationId") or "").strip().lower()
+                if cid:
+                    _apply_local_subagent_stop_update(
+                        payload,
+                        state,
+                        cb_tripped=True,
+                        force_failed=True,
+                        abnormal_reason=str(termination_reason),
+                    )
+                    deferred_stop_params = {
+                        "cb_tripped": True,
+                        "force_failed": True,
+                        "abnormal_reason": str(termination_reason),
+                    }
+                    state_snapshot = dict(state)
+            if deferred_stop_params is None:
+                return {"decision": "allow"}
+        elif not payload.get("fullyIdle", True):
             return {"decision": "allow"}
+        else:
+            synced_transcript = _sync_subagents_from_transcript(payload, state)
+            state_saved_after_sync = False
 
-        inv_key = _current_invocation_key(payload, state)
-        mutated_in_turn = bool(
-            state.get("direct_budget", {}).get(inv_key, {}).get("mutated_files")
-        )
-        receipt = _get_test_receipt(state, payload)
-        diff_text = (
-            _get_workspace_git_diff(payload)
-            if (payload.get("gitDiff") or receipt.get("dirty") or mutated_in_turn)
-            else ""
-        )
-        if diff_text:
-            tamper_finding = audit_diff_text(diff_text)
-            if tamper_finding:
-                exec_key = f"tamper:{payload.get('conversationId', '')}:{payload.get('executionNum', 0)}"
+            active_branches = [
+                cid
+                for cid, meta in state.get("subagents", {}).items()
+                if isinstance(meta, dict)
+                and (meta.get("active_worktree") or meta.get("active_branch"))
+            ]
+            active_pending = [
+                p.get("role", "implementer")
+                for p in state.get("pending_spawns", [])
+                if isinstance(p, dict)
+                and (p.get("active_worktree") or p.get("active_branch"))
+            ]
+            active_swarm_worktrees = [
+                wname
+                for wname, meta in (state.get("swarm_workers") or {}).items()
+                if isinstance(meta, dict)
+                and meta.get("status") == "active"
+                and meta.get("active_worktree")
+            ]
+
+            if active_branches or active_pending or active_swarm_worktrees:
+                exec_key = f"{payload.get('conversationId', '')}:{payload.get('executionNum', 0)}"
                 reminded = state.setdefault("stop_reminded_executions", [])
                 if exec_key not in reminded:
                     reminded.append(exec_key)
                     _save_state(payload, state)
-                    return {"decision": "continue", "reason": tamper_finding}
+                    state_saved_after_sync = True
+                    if active_branches or active_pending:
+                        targets = ", ".join(active_branches or active_pending)
+                        return {
+                            "decision": "continue",
+                            "reason": (
+                                f"[ORCHESTRATOR GUARD] Uncleaned branched subagent worktrees remain ({targets}). "
+                                "Verify/merge branch changes and call manage_subagents(Action='kill') before finishing."
+                            ),
+                        }
+                    return {
+                        "decision": "continue",
+                        "reason": (
+                            f"[ORCHESTRATOR GUARD] Uncleaned isolated swarm worktrees remain "
+                            f"({', '.join(active_swarm_worktrees)}). "
+                            "Merge/discard changes and call swarm(action='kill') before finishing."
+                        ),
+                    }
 
-        if receipt.get("dirty") and not receipt.get("verified"):
-            exec_key = f"receipt:{payload.get('conversationId', '')}:{payload.get('executionNum', 0)}"
-            reminded = state.setdefault("stop_reminded_executions", [])
-            if exec_key not in reminded:
-                reminded.append(exec_key)
+            if not _is_root_orchestrator(payload, state):
+                sent_key = f"sent:{payload.get('conversationId', '')}:{payload.get('executionNum', 0)}"
+                reminded = state.setdefault("stop_reminded_executions", [])
+                if sent_key not in reminded:
+                    last_msg = _extract_last_model_response(payload)
+                    if last_msg is not None:
+                        sub_type = _get_subagent_type(payload, state)
+                        report_err = validate_subagent_report(
+                            last_msg,
+                            is_scout=_is_scout_subagent(payload, state),
+                            is_readonly_or_scratch=(
+                                sub_type in READONLY_NON_VERIFICATION_TYPES
+                            ),
+                        )
+                        if report_err:
+                            report_key = f"report:{payload.get('conversationId', '')}:{payload.get('executionNum', 0)}"
+                            if report_key not in reminded:
+                                reminded.append(report_key)
+                                _save_state(payload, state)
+                                state_saved_after_sync = True
+                                return {
+                                    "decision": "continue",
+                                    "reason": (
+                                        f"[ORCHESTRATOR GUARD] Subagent context-separation violation: {report_err} "
+                                        "Return ONLY the exact 4-header REPORT FORMAT (STATUS, FILES_CHANGED, VERIFICATION, NOTES; "
+                                        "allowing up to 10 '-' bullet lines under NOTES and requiring inline error cause plus "
+                                        "file:// .log URI when BLOCKED or FAILED; scouts may use compact 2-header STATUS + NOTES)."
+                                    ),
+                                }
+
+            cb = _get_circuit_breaker(state, payload)
+            if cb.get("tripped"):
+                if _is_known_subagent(payload, state):
+                    _, skipped = _apply_local_subagent_stop_update(
+                        payload, state, cb_tripped=True
+                    )
+                    if not skipped:
+                        state_saved_after_sync = True
+                        deferred_stop_params = {"cb_tripped": True}
+                        state_snapshot = dict(state)
+                else:
+                    if synced_transcript and not state_saved_after_sync:
+                        _save_state(payload, state)
+                    return {"decision": "allow"}
+            else:
+                inv_key = _current_invocation_key(payload, state)
+                mutated_in_turn = bool(
+                    state.get("direct_budget", {}).get(inv_key, {}).get("mutated_files")
+                )
+                receipt = _get_test_receipt(state, payload)
+                cur_epoch = int(receipt.get("mutation_epoch", 0) or 0)
+                audited_epoch = int(receipt.get("audited_epoch", 0) or 0)
+                should_audit_diff = bool(
+                    payload.get("gitDiff")
+                    or receipt.get("dirty")
+                    or mutated_in_turn
+                    or (cur_epoch > audited_epoch)
+                )
+                diff_text = (
+                    _get_workspace_git_diff(payload) if should_audit_diff else ""
+                )
+                if diff_text:
+                    tamper_finding = audit_diff_text(diff_text)
+                    if tamper_finding:
+                        exec_key = f"tamper:{payload.get('conversationId', '')}:{payload.get('executionNum', 0)}"
+                        reminded = state.setdefault("stop_reminded_executions", [])
+                        if exec_key not in reminded:
+                            reminded.append(exec_key)
+                            _save_state(payload, state)
+                            state_saved_after_sync = True
+                            return {"decision": "continue", "reason": tamper_finding}
+                if should_audit_diff and cur_epoch > audited_epoch:
+                    receipt["audited_epoch"] = cur_epoch
+                    _save_state(payload, state)
+                    state_saved_after_sync = True
+
+                if receipt.get("dirty") and not receipt.get("verified"):
+                    exec_key = f"receipt:{payload.get('conversationId', '')}:{payload.get('executionNum', 0)}"
+                    reminded = state.setdefault("stop_reminded_executions", [])
+                    if exec_key not in reminded:
+                        reminded.append(exec_key)
+                        _save_state(payload, state)
+                        state_saved_after_sync = True
+                        last_file = Path(receipt.get("last_mutated_file") or "workspace").name
+                        return {
+                            "decision": "continue",
+                            "reason": (
+                                f"[ORCHESTRATOR GUARD] Empirical test receipt missing: code file "
+                                f"'{last_file}' was modified without a subsequent passing test run "
+                                "recorded in PostToolUse. Run the test suite to verify changes before finishing."
+                            ),
+                        }
+
+                if _is_known_subagent(payload, state):
+                    _, skipped = _apply_local_subagent_stop_update(
+                        payload, state, cb_tripped=False
+                    )
+                    if not skipped:
+                        state_saved_after_sync = True
+                        deferred_stop_params = {"cb_tripped": False}
+                        state_snapshot = dict(state)
+                elif payload.get("fullyIdle") is True and state.get("plan_execute_phase"):
+                    has_active_subagents = (
+                        any(
+                            isinstance(p, dict) and p.get("status", "active") == "active"
+                            for p in (state.get("pending_spawns") or [])
+                        )
+                        or any(
+                            isinstance(s, dict) and s.get("status") == "active"
+                            for s in (state.get("subagents") or {}).values()
+                        )
+                        or any(
+                            isinstance(w, dict)
+                            and w.get("status") == "active"
+                            and w.get("active_worktree")
+                            for w in (state.get("swarm_workers") or {}).values()
+                        )
+                    )
+                    if not has_active_subagents:
+                        state["plan_execute_turn_finished"] = True
+                        _save_state(payload, state)
+                        state_saved_after_sync = True
+
+            if synced_transcript and not state_saved_after_sync:
                 _save_state(payload, state)
-                last_file = Path(receipt.get("last_mutated_file") or "workspace").name
-                return {
-                    "decision": "continue",
-                    "reason": (
-                        f"[ORCHESTRATOR GUARD] Empirical test receipt missing: code file "
-                        f"'{last_file}' was modified without a subsequent passing test run "
-                        "recorded in PostToolUse. Run the test suite to verify changes before finishing."
-                    ),
-                }
 
-        if _is_known_subagent(payload, state):
-            _finalize_subagent_stop_sync(payload, state, cb_tripped=False)
-        elif payload.get("fullyIdle") is True and state.get("plan_execute_phase"):
-            has_active_subagents = any(
-                isinstance(p, dict) and p.get("status", "active") == "active"
-                for p in (state.get("pending_spawns") or [])
-            ) or any(
-                isinstance(s, dict) and s.get("status") == "active"
-                for s in (state.get("subagents") or {}).values()
-            )
-            if not has_active_subagents:
-                state["plan_execute_turn_finished"] = True
-                _save_state(payload, state)
-
-        return {"decision": "allow"}
+    if deferred_stop_params is not None:
+        _finalize_subagent_stop_sync(
+            payload, state_snapshot, update_local=False, **deferred_stop_params
+        )
+    return {"decision": "allow"}

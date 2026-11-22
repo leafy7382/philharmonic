@@ -12,6 +12,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from guard.constants import (
+    MAX_REPLAN_ATTEMPTS,
     MAX_STATE_INVOCATION_HISTORY,
     MAX_STATE_LIST_ENTRIES,
     PENDING_SPAWN_TTL_SECONDS,
@@ -148,7 +149,7 @@ def _prune_state(state: Dict[str, Any]) -> None:
         for council_entry in councils.values():
             if not isinstance(council_entry, dict):
                 continue
-            for list_key in ("proposers", "judges", "models"):
+            for list_key in ("proposers", "judges", "synthesizers", "models"):
                 items = council_entry.get(list_key)
                 if isinstance(items, list) and len(items) > MAX_STATE_LIST_ENTRIES:
                     council_entry[list_key] = items[-MAX_STATE_LIST_ENTRIES:]
@@ -226,6 +227,14 @@ def state_transaction(payload_or_path: Any):
                     _LOCK_REGISTRY.pop(canon_key, None)
 
 
+def _has_other_locked_path(payload_or_path: Any) -> bool:
+    """Return True if a state_transaction lock is currently held for a different state file."""
+    path = _resolve_state_path(payload_or_path)
+    canon_key = str(path.with_suffix(".lock").resolve())
+    with _LOCK_REGISTRY_LOCK:
+        return any(k != canon_key for k in _LOCK_REGISTRY)
+
+
 def _load_state(payload_or_path: Any) -> Dict[str, Any]:
     path = _resolve_state_path(payload_or_path)
     if not path.exists():
@@ -250,19 +259,67 @@ def _load_state(payload_or_path: Any) -> Dict[str, Any]:
                 defaults = _default_state()
                 for k, v in defaults.items():
                     data.setdefault(k, v)
-                data["isolation_reminded_invocations"] = (
-                    data.get("isolation_reminded_invocations") or []
-                )
-                if not isinstance(data.get("cohorts"), dict):
-                    data["cohorts"] = {}
-                if not isinstance(data.get("councils"), dict):
-                    data["councils"] = {}
-                if not isinstance(data.get("swarm_workers"), dict):
-                    data["swarm_workers"] = {}
-                if isinstance(data.get("circuit_breaker"), dict):
-                    data["circuit_breaker"].setdefault("replan_count", 0)
-                if isinstance(data.get("test_receipt"), dict):
-                    data["test_receipt"].setdefault("mutation_epoch", 0)
+                for dict_key in (
+                    "subagents",
+                    "direct_budget",
+                    "cohorts",
+                    "councils",
+                    "swarm_workers",
+                ):
+                    if not isinstance(data.get(dict_key), dict):
+                        data[dict_key] = {}
+                for list_key in (
+                    "pending_spawns",
+                    "recorded_spawn_calls",
+                    "isolation_reminded_invocations",
+                    "stop_reminded_executions",
+                ):
+                    if not isinstance(data.get(list_key), list):
+                        data[list_key] = []
+                if not isinstance(data.get("circuit_breaker"), dict):
+                    data["circuit_breaker"] = {
+                        "failure_streak": 0,
+                        "tripped": False,
+                        "last_error": "",
+                        "replan_attempts": 0,
+                        "replan_budget": MAX_REPLAN_ATTEMPTS,
+                        "pending_replan": False,
+                        "seen_failures": [],
+                        "replan_count": 0,
+                    }
+                else:
+                    cb_dict = data["circuit_breaker"]
+                    for cb_int_key, cb_default in (
+                        ("failure_streak", 0),
+                        ("replan_attempts", 0),
+                        ("replan_budget", MAX_REPLAN_ATTEMPTS),
+                        ("replan_count", 0),
+                    ):
+                        if cb_int_key in cb_dict or cb_int_key in ("failure_streak", "replan_count"):
+                            val = cb_dict.get(cb_int_key)
+                            if not isinstance(val, int) or isinstance(val, bool):
+                                cb_dict[cb_int_key] = cb_default
+                    if not isinstance(cb_dict.get("seen_failures"), list):
+                        cb_dict["seen_failures"] = []
+                if "replan_count" in data:
+                    rc_val = data.get("replan_count")
+                    if not isinstance(rc_val, int) or isinstance(rc_val, bool):
+                        data["replan_count"] = 0
+                if not isinstance(data.get("test_receipt"), dict):
+                    data["test_receipt"] = {
+                        "dirty": False,
+                        "dirty_files": [],
+                        "verified": False,
+                        "last_test_cmd": "",
+                        "mutation_epoch": 0,
+                    }
+                else:
+                    tr_dict = data["test_receipt"]
+                    for tr_int_key in ("mutation_epoch", "audited_epoch"):
+                        if tr_int_key in tr_dict or tr_int_key == "mutation_epoch":
+                            val = tr_dict.get(tr_int_key)
+                            if not isinstance(val, int) or isinstance(val, bool):
+                                tr_dict[tr_int_key] = 0
                 return data
         return _default_state()
 

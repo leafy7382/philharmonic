@@ -60,7 +60,7 @@ ln -s "$(pwd)/.agents/plugins/philharmonic_orchestra" ~/.gemini/config/plugins/p
   mkdir -p ~/.gemini/config/plugins
   cp -r .agents/plugins/philharmonic_orchestra ~/.gemini/config/plugins/
   ```
-- **Remote VM Dual-Schema**: Supports both local `agy` CLI and Remote VM schemas (`Subagents: [...]` with `Model: "inherit"`, `Workspace: "inherit"`, and `snake_case` `define_subagent`).
+- **Remote VM Dual-Schema**: Supports local `agy` CLI and Remote VM schemas (`Subagents: [...]` with `Model: "inherit"`, `Workspace: "inherit"`, `snake_case` `define_subagent`). Since `MODE: BEST_OF_N` requires `"branch"`/`"share"` worktrees, use local worktrees or `run_workflow` with `EVAL_CMD:` instead of `Workspace: "inherit"`.
 
 ---
 
@@ -71,9 +71,9 @@ Custom subagents (`scout`, `implementer`, `verifier`, `reviewer`, `judge`, `coun
 | Subagent Type | Model Tier | Write Access | Workspace Mode | Purpose |
 | :--- | :--- | :--- | :--- | :--- |
 | `scout` | `flash_lite` | Disabled | `inherit` | Single-hop lookups, symbol extraction, log slicing (<= 3 rules) |
-| `research` | `flash` (`flash_lite` if <= 3 read-only rules; `pro`/`inherit` in `MODE: COUNCIL`) | Scratch-only (`scratch/*.md`) | `inherit` | Multi-file analysis, doc lookups, council proposals |
+| `research` | `flash` (`flash_lite` if <= 3 read-only rules; `pro`/`inherit` with explicit `MODE: COUNCIL`) | Scratch-only (`scratch/*.md`) | `inherit` | Multi-file analysis, doc lookups, council proposals |
 | `council` | `flash` (`pro`/`inherit` allowed; no `flash_lite` downgrade) | Scratch-only (`scratch/*.md`) | `inherit` | Non-`swarm` Council of Models proposal drafting |
-| `implementer` | `flash` (`pro` allowed in `MODE: BEST_OF_N`) | Enabled | `branch` / `share` / `inherit` | Bounded edits/tests (disjoint `ALLOWED_FILES:` on `inherit`; isolated worktrees for Best-of-N) |
+| `implementer` | `flash` (`pro` allowed strictly in `MODE: BEST_OF_N`) | Enabled | `branch` / `share` / `inherit` | Bounded edits/tests (disjoint `ALLOWED_FILES:` on `inherit`; isolated worktrees for Best-of-N) |
 | `verifier` | `flash` default (`pro`/`inherit` allowed; never `flash_lite`) | Disabled (strict read-only) | `inherit` | Fresh post-build verification (`VERDICT: PASS \| FAIL`) |
 | `reviewer` | `flash` default (`pro`/`inherit` allowed; never `flash_lite`) | Disabled (strict read-only) | `inherit` | Specialized review with distinct `REVIEW_LENS:` (`VERDICT: APPROVE \| REQUEST_CHANGES`) |
 | `judge` | `flash` default (`pro`/`inherit` allowed; never `flash_lite`) | Disabled (strict read-only) | `inherit` | Blind Council of Models voting on anonymized drafts (`VERDICT: <winner>`) |
@@ -115,10 +115,10 @@ NOTES: <summary (VERDICT: PASS|FAIL, APPROVE|REQUEST_CHANGES, or <winner>; SCORE
 ### Report Validation Rules
 
 - **`ALLOWED_FILES:` & Disjoint Lanes**: Blocks edits outside `ALLOWED_FILES:` (allowing `scratch/*.log`). Concurrent `implementer`s on `Workspace: "inherit"` cannot overlap files or ancestor/descendant paths (`"branch"`/`"share"` may overlap).
-- **Best of N (`MODE: BEST_OF_N`, `COHORT:`, `EVAL_CMD:`)**: Requires `"branch"`/`"share"`, allows `"pro"`, auto-generates `best-of-n-<inv_key>`, and reports `SCORE:` under `NOTES:`. `EVAL_CMD:` rejects trivial commands (`true`, `:`, `echo`, etc.) and `||` / `$(...)` / backticks.
-- **Council of Models (`MODE: COUNCIL`, `COUNCIL_ID:`, `COUNCIL_ROLE:`) & Blind Judging**: Infers `COUNCIL` when `COUNCIL_ID:`/`COUNCIL_ROLE:` is set; `judge` prompts, `swarm` judge briefs, and `swarm` council roster names cannot leak model identities (`proposer-a`/`b`/`c`, `judge-1` allowed). `council`/`research` proposers allow `"pro"`/`"inherit"` in `MODE: COUNCIL` with scratch-only `.md` writes.
+- **Best of N (`MODE: BEST_OF_N`, `COHORT:`, `EVAL_CMD:`)**: Restricted strictly to `implementer`; requires `"branch"`/`"share"` (cannot use `"inherit"` on Remote VMs — use local worktrees or `run_workflow` with `EVAL_CMD:`), allows `"pro"`, auto-generates `best-of-n-<inv_key>`, and reports `SCORE:` under `NOTES:`. `EVAL_CMD:` rejects trivial commands (`true`, `:`, `echo`, etc.) and `||` / `$(...)` / backticks.
+- **Council of Models (`MODE: COUNCIL`, `COUNCIL_ID:`, `COUNCIL_ROLE:`) & Blind Judging**: Denied on `implementer`; `judge` prompts, `swarm` judge briefs, and `swarm` council roster names cannot leak model identities (`proposer-a`/`b`/`c`, `judge-1` allowed). Explicit `MODE: COUNCIL` unlocks `"pro"`/`"inherit"` on `research`/`council` proposers (alongside `judge`) with scratch-only `.md` writes.
 - **Mandatory `REVIEW_LENS:` & Verdicts**: `reviewer` requires distinct normalized `REVIEW_LENS:` across active reviewers. `verifier`/`reviewer`/`judge`/`council` require the full 4-header report (2-header shorthand is `scout`-only).
-- **Checkpoints, Spec Relay & Limits**: `CHECKPOINT` skips premature receipt checks; `SPEC_FILE:` requires `SIGNATURES`, `PITFALLS`/`INVARIANTS`, `VERIFICATION`; `REPLAN:` resets a tripped breaker once/turn; `NOTES:` allows <= 10 bullets within 1,600 chars (`BLOCKED`/`FAILED` needs >= 3 words + `file://.../*.log`).
+- **Checkpoints, Spec Relay & Limits**: `CHECKPOINT` skips premature receipt checks; `SPEC_FILE:` requires `SIGNATURES`, `PITFALLS`/`INVARIANTS`, `VERIFICATION`; `REPLAN:` resets a tripped breaker once/turn; `NOTES:` allows <= 10 bullets within 1,600 chars (`BLOCKED`/`FAILED` needs >= 3 words; `implementer` also requires `file://.../*.log`, whereas read-only/scratch subagents `scout`, `research`, `council`, `verifier`, `reviewer`, `judge` do not).
 
 ---
 
@@ -131,7 +131,7 @@ Configured in [hooks.json](.agents/plugins/philharmonic_orchestra/hooks.json) an
    - Supports local `agy` CLI, Remote VM schemas (`Subagents`, `snake_case`/`PascalCase` `define_subagent`), `run_workflow` (`Cwd`/`ScriptPath` root checks, `Description` `EVAL_CMD:`/`REPLAN:`), and `swarm` (`models`/`status`/`kill`/`title` always allowed; `add` gated on breaker + `EVAL_CMD:` + council anonymity + blind judging).
    - Enforces root read/edit/command budgets, exempts git inspection, handles `exit_plan_mode`/`enter_plan_mode`, and blocks root access to `.log`/`transcript*.jsonl`.
    - Enforces strict read-only tools on `scout`, `verifier`, `reviewer`, `judge` (`define_subagent` strips write/MCP/subagent tools; `MUTATION_TOOLS` and mutating shell commands blocked), scratch-only `.md` on `research`/`council`, and `ALLOWED_FILES:` on `implementer`.
-   - Enforces per-role model policy: `verifier`/`reviewer`/`judge` and `MODE: COUNCIL` proposers allow `"flash"`/`"pro"`/`"inherit"` (no `flash_lite` downgrade); `MODE: BEST_OF_N` allows `"flash"`/`"pro"`; standard workers block `"pro"` and rewrite `"inherit"`.
+   - Enforces per-role model policy: `verifier`/`reviewer`/`judge` and explicit `MODE: COUNCIL` proposers (`research`/`council`) allow `"flash"`/`"pro"`/`"inherit"` (no `flash_lite` downgrade); `MODE: BEST_OF_N` `"pro"` applies strictly to `implementer`; standard workers block `"pro"` and rewrite `"inherit"`.
    - Validates `SPEC_FILE:`, `STAGE:`/`REPLAN:`, `REVIEW_LENS:`, disjoint `inherit` lanes, `"branch"`/`"share"` Best-of-N isolation, blind judging (`BLIND_JUDGE_LEAK_PATTERNS`, `COUNCIL_NAME_LEAK_RE`), and `mutation_epoch` freshness (`verifier`/`reviewer`/`judge`).
    - Increments `mutation_epoch` on code edits (isolating `best_of_n` candidates), tracks `active_worktree`/`swarm_workers`, blocks test tampering, and halts retries when tripped.
 3. **`post-tool`**:

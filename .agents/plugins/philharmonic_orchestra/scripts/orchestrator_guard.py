@@ -24,8 +24,25 @@ def _safe_entrypoint() -> None:
         if main_fn is None:
             from guard import main as main_fn
         main_fn()
+    except (MemoryError, RecursionError) as exc:
+        mode = sys.argv[1].lower() if len(sys.argv) > 1 else "pre-tool"
+        if mode in {"doctor", "status", "reset", "activate", "deactivate"}:
+            sys.stderr.write(f"Guard error: {exc}\n")
+            sys.exit(1)
+        if mode in ("pre-tool", "stop"):
+            fallback = {
+                "decision": "deny",
+                "reason": f"[ORCHESTRATOR GUARD] Guard resource limit exceeded ({type(exc).__name__}); failing closed.",
+            }
+        else:
+            fallback = {}
+        sys.stdout.write(json.dumps(fallback) + "\n")
+        sys.exit(0)
     except Exception as exc:
         mode = sys.argv[1].lower() if len(sys.argv) > 1 else "pre-tool"
+        if mode in {"doctor", "status", "reset", "activate", "deactivate"}:
+            sys.stderr.write(f"Guard error: {exc}\n")
+            sys.exit(1)
         if mode in ("pre-tool", "stop"):
             fallback = {"decision": "allow", "reason": f"Guard fail-safe: {exc}"}
         else:
