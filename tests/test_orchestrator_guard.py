@@ -3568,6 +3568,132 @@ class TestOrchestratorGuard(unittest.TestCase):
         self.assertGreater(sum(line_counts.values()), 0)
         self.assertLess(sum(line_counts.values()), 6800)
 
+    def test_root_safe_git_push_allowlist(self) -> None:
+        root_p = self._brain_payload("root-git-push", lastUserInput="/philharmonic safe git push")
+        orchestrator_guard._cli_activate(root_p)
+
+        allowed_pushes = (
+            "git push",
+            "git push origin",
+            "git push origin master",
+            "git push -u origin feature/foo",
+            "git push --dry-run origin HEAD:main",
+            "git push origin v1.0.0 --tags",
+            'git add -u && git commit -m "msg" && git push origin master',
+            "git push -nvqu origin main",
+            "git push -- origin master",
+        )
+        for idx, cmd in enumerate(allowed_pushes, start=1):
+            res = self._pre("run_command", {"CommandLine": cmd}, base=root_p, invocationNum=idx)
+            self.assertEqual(res["decision"], "allow", f"Root should allow {cmd!r}: {res}")
+
+        denied_pushes = (
+            "git push -f",
+            "git push --force",
+            "git push --force-with-lease",
+            "git push --force-if-includes",
+            "git push origin +master",
+            "git push origin :master",
+            "git push origin main:+main",
+            "git push origin main:",
+            "git push --delete origin master",
+            "git push -d origin master",
+            "git push --prune origin",
+            "git push --mirror origin",
+            "git push --all origin",
+            "git push --no-verify origin master",
+            "git push -o foo origin master",
+            "git push --receive-pack=sh origin master",
+            "git push --exec=sh origin master",
+            "git push --repo=https://example.com/repo.git master",
+            "git push --recurse-submodules=on-demand origin master",
+            "git push ext::sh origin master",
+            "git push /tmp/repo master",
+            "git push https://example.com/repo.git master",
+            "git push user@host:repo.git master",
+            "git push origin 'refs/heads/*'",
+            "git push origin a..b",
+            "git push origin HEAD//main",
+            "git push origin main@{1}",
+            "git push -- -origin master",
+            "./git push",
+            "/tmp/git push",
+            "./git status",
+            "/tmp/git status",
+            "SSLKEYLOGFILE=.agents/hooks.json git push",
+            "HTTPS_PROXY=http://evil git push",
+            "https_proxy=http://evil git push",
+            "GIT_SSL_NO_VERIFY=1 git push",
+            "GIT_ALLOW_PROTOCOL=ext git push",
+            "GNUPGHOME=/tmp/g git push",
+            "CURL_CA_BUNDLE=/tmp/ca git push origin main",
+            "git --bare -C . push origin main",
+            "git --git-dir=/tmp/repo push",
+            "git --git-dir=. push",
+            "git --work-tree=. push",
+            "git --git-dir=. add README.md",
+            'git --work-tree=. commit -m "msg"',
+            "git -C../out=1 push",
+            "git push evil_repo main",
+        )
+        for cmd in denied_pushes:
+            res = self._pre("run_command", {"CommandLine": cmd}, base=root_p)
+            self.assertEqual(res["decision"], "deny", f"Root must deny {cmd!r}: {res}")
+
+        res_c_status = self._pre("run_command", {"CommandLine": "git -C../out=1 status"}, base=root_p)
+        self.assertIn(res_c_status["decision"], ("deny", "ask"), f"Root must block -C../out=1 status: {res_c_status}")
+        self.assertFalse(orchestrator_guard._command_stays_in_workspace("git -C/etc/evil=/tmp status", str(orchestrator_guard.PROJECT_ROOT), [orchestrator_guard.PROJECT_ROOT]))
+        self.assertEqual(self._pre("run_command", {"CommandLine": "git push evil_repo main", "Cwd": "tests"}, base=root_p)["decision"], "deny")
+        self.assertEqual(self._pre("run_command", {"CommandLine": "git push origin main", "Cwd": "tests"}, base=root_p, invocationNum=22)["decision"], "allow")
+
+        with tempfile.TemporaryDirectory() as repo_td:
+            td_p = Path(repo_td)
+            td_base = dict(root_p, workspacePaths=[str(td_p)])
+            (td_p / "evil_repo").mkdir()
+            self.assertEqual(
+                self._pre("run_command", {"CommandLine": "git push evil_repo main", "Cwd": str(td_p)}, base=td_base)["decision"],
+                "deny",
+            )
+            (td_p / "evil_repo").rmdir()
+            (td_p / "evil_repo.git").mkdir()
+            self.assertEqual(
+                self._pre("run_command", {"CommandLine": "git push evil_repo main", "Cwd": str(td_p)}, base=td_base)["decision"],
+                "deny",
+            )
+            (td_p / "evil_repo.git").rmdir()
+            (td_p / ".git").mkdir()
+            (td_p / ".git" / "config").write_text('[remote "origin"]\n\turl = https://example.com/repo.git\n', encoding="utf-8")
+            self.assertEqual(
+                self._pre("run_command", {"CommandLine": "git push evil_repo main", "Cwd": str(td_p)}, base=td_base)["decision"],
+                "deny",
+            )
+            self.assertEqual(
+                self._pre("run_command", {"CommandLine": "git push origin main", "Cwd": str(td_p)}, base=td_base, invocationNum=20)["decision"],
+                "allow",
+            )
+
+        self._seed_state(root_p, test_receipt={"dirty": False, "verified": True, "last_test_cmd": "pytest -v", "mutation_epoch": 5})
+        res_push = self._pre("run_command", {"CommandLine": "git push origin master"}, base=root_p, invocationNum=21)
+        self.assertEqual(res_push["decision"], "allow")
+        rec_after = self._load_st(root_p)["test_receipt"]
+        self.assertFalse(rec_after["dirty"])
+        self.assertTrue(rec_after["verified"])
+        self.assertEqual(rec_after["mutation_epoch"], 5)
+
+        subagents = (
+            ("push-scout", "scout", "flash_lite"),
+            ("push-verifier", "verifier", "pro"),
+            ("push-reviewer", "reviewer", "pro"),
+            ("push-judge", "judge", "pro"),
+            ("push-research", "research", "flash"),
+            ("push-council", "council", "pro"),
+        )
+        for cid, tname, model in subagents:
+            self._reg_sub(tname, cid, model, payload=root_p)
+            for push_cmd in ("git push", "git push origin master", "git push --dry-run origin HEAD:main"):
+                res_sub = self._pre("run_command", {"CommandLine": push_cmd}, cid=cid, base=root_p)
+                self.assertEqual(res_sub["decision"], "deny", f"{tname} must deny {push_cmd!r}: {res_sub}")
+
 
 if __name__ == "__main__":
     unittest.main()

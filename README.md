@@ -61,7 +61,7 @@ Once `/philharmonic` is active, the main agent picks a workflow based on the siz
 1. Start with `/philharmonic` and ask for what you want to build or fix.
 2. Let the main agent gather context (`scout`/`research`) and write a spec under `scratch/`.
 3. Let scoped `implementer` workers make the edits and run tests, followed by a fresh `verifier` or parallel `reviewer`s.
-4. Clean up any temporary `"branch"`/`"share"` worktrees, then let the main agent stage and commit directly with `git add <files> && git commit -m "..."`.
+4. Clean up any temporary `"branch"`/`"share"` worktrees, then let the main agent stage, commit, and run safe non-force `git push` directly with `git add <files> && git commit -m "..."`.
 
 ---
 
@@ -83,7 +83,7 @@ Custom agents (`scout`, `implementer`, `verifier`, `reviewer`, `judge`, `council
 
 Instead of playing catch-up with shell blacklists, shell and script checks are allowlist-based:
 
-- **Main agent (`run_command`)**: Can run declarative read-only inspection verbs, `git` read commands, non-interactive `git add <paths>` / `git commit -m/-F` (explicit workspace files only, never `.agents/.state`), real test/lint commands, `orchestrator_guard.py doctor|status`, and `scratch/` file commands. Inline `python3 -c`, shell wrappers (`bash -c`, `sh -c`, `eval`), `tar`/`unzip`/`find`/`xargs`, `awk`/`sed`, heredocs/`$()`/backticks, and mutating shell tools (`rm`, `mv`, `cp`, `rsync`, `patch`, `dd`) are denied and must be delegated to an `implementer`.
+- **Main agent (`run_command`)**: Can run declarative read-only inspection verbs, `git` read commands, non-interactive `git add <paths>` / `git commit -m/-F` (explicit workspace files only, never `.agents/.state`), safe non-force `git push` (force, delete, mirror, custom-URL, and `--no-verify` pushes remain blocked), real test/lint commands, `orchestrator_guard.py doctor|status`, and `scratch/` file commands. Inline `python3 -c`, shell wrappers (`bash -c`, `sh -c`, `eval`), `tar`/`unzip`/`find`/`xargs`, `awk`/`sed`, heredocs/`$()`/backticks, and mutating shell tools (`rm`, `mv`, `cp`, `rsync`, `patch`, `dd`) are denied and must be delegated to an `implementer`.
 - **Read-only & scratch subagents**: Locked to the same read-only shell allowlist (plus `scratch/*.md` writes for `research` and `council`). Raw `.log` and `transcript*.jsonl` reads are blocked for the main agent and routed through `scout`.
 - **Implementers**: Can edit files and run simple file-targeting shell commands (`sed -i`, `touch`, `cp`, `rm`, `mv`, `chmod`, `dd`) only inside their single-line `ALLOWED_FILES:` list (exact paths, directory prefixes, or simple globs; brace expansion `{a,b}` and POSIX classes `[:...:]` fail closed). Editing plugin files requires listing the exact file paths in `ALLOWED_FILES:`.
 - **Workflow boundaries & paths**: `run_workflow` enforces role/scope gates (`scout`/`verifier`/`reviewer`/`judge`/`research`/`council`, `ALLOWED_FILES:`, plan scope), `EVAL_CMD:` safety, and `Cwd`/`ScriptPath` boundaries against allowed roots and guard files rather than AST-emulating script bodies. Lightweight workspace root checks (`..` escapes or outside paths) pair with OS sandbox confinement to prompt or deny out-of-workspace access.
@@ -139,7 +139,7 @@ python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py act
 python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py deactivate
 python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py reset
 
-# Run the unit test suite (107 tests)
+# Run the unit test suite
 python3 -m unittest discover -s tests
 ```
 

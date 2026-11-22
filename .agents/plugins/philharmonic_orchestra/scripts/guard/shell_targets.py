@@ -85,13 +85,14 @@ def _extract_positional_args(
     return pos, opt_vals
 
 
-def _parse_git_tokens(arg_tokens: List[str], cur_dir: str, payload: Dict[str, Any], *, require_allowed_roots: bool = False) -> Optional[Tuple[str, List[str], str]]:
+def _parse_git_tokens(arg_tokens: List[str], cur_dir: str, payload: Dict[str, Any], *, require_allowed_roots: bool = False, allow_git_dir: bool = True) -> Optional[Tuple[str, List[str], str]]:
     """Parse git global options and return (subcmd, sub_args, eff_dir) or None if unsafe."""
     subcmd, sub_args, eff_dir, skip_opt = "", [], cur_dir, ""
     _bad_opt = lambda t: t in _BAD_GIT_OPTS or t.startswith(_BAD_GIT_PREFIXES) or (t.startswith("-c") and not t.startswith("--") and len(t) > 2)
 
     def _safe_val(opt_name: str, val: str) -> bool:
         nonlocal eff_dir
+        if not allow_git_dir and opt_name in {"--git-dir", "--work-tree"}: return False
         if _has_shell_path_expansion(val) or _is_guard_plugin_target(val, eff_dir) or _is_guard_state_target(val, payload=payload, cwd=eff_dir) or _is_staging_or_tmp_path(_resolve_cmd_target(val, eff_dir), payload):
             return False
         if require_allowed_roots and opt_name in {"-C", "--git-dir", "--work-tree"}:
@@ -108,8 +109,8 @@ def _parse_git_tokens(arg_tokens: List[str], cur_dir: str, payload: Dict[str, An
         elif _bad_opt(tok): return None
         elif tok in _GIT_GLOBAL_VAL_OPTS: skip_opt = tok
         elif tok.startswith(("--git-dir=", "--work-tree=", "--namespace=", "--super-prefix=", "--list-cmds=")) or (tok.startswith("-C") and len(tok) > 2):
-            if not _safe_val(*((tok.split("=", 1)) if "=" in tok else ("-C", tok[2:]))): return None
-        elif tok not in _GIT_GLOBAL_BOOL_OPTS:
+            if not _safe_val(*(tok.split("=", 1) if tok.startswith("--") else ("-C", tok[2:]))): return None
+        elif tok not in _GIT_GLOBAL_BOOL_OPTS or (not allow_git_dir and tok == "--bare"):
             if tok.startswith("-"): return None
             subcmd, sub_args = tok.lower(), arg_tokens[idx + 1 :]
             break

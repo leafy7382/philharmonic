@@ -44,6 +44,7 @@ from guard.path_guards import (
     _resolve_cmd_target,
 )
 from guard.root_allowlist import (
+    _CANONICAL_GIT_BINS,
     _has_unsafe_ansi_c_literal,
     _is_readonly_subagent_allowlisted_command,
     _is_root_allowlisted_command,
@@ -165,8 +166,8 @@ def _is_root_safe_git_stage_commit_chain(
             return False
         toks, uq = _strip_redir_tokens_with_meta(raw_meta)
         um: Dict[str, bool] = {}
-        verb, _, arg_tokens, unwrap_unv = _unwrap_shell_command_tokens_with_raw(toks, uq, out_meta=um)
-        if unwrap_unv or um.get("opaque") or verb != "git":
+        verb, raw_tok, arg_tokens, unwrap_unv = _unwrap_shell_command_tokens_with_raw(toks, uq, out_meta=um)
+        if unwrap_unv or um.get("opaque") or verb != "git" or raw_tok not in _CANONICAL_GIT_BINS:
             return False
         if not (_is_safe_git_stage_or_commit(arg_tokens, cwd, payload) or _is_safe_readonly_git_tokens(arg_tokens, cwd, payload)):
             return False

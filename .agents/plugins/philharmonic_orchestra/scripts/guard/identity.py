@@ -108,7 +108,9 @@ def _command_stays_in_workspace(command_line: str, cwd: str, roots: List[Path]) 
         return (allow_sys and (norm == "/tmp" or norm.startswith(ALLOWED_SYSTEM_PATH_PREFIXES))) or _is_within_allowed_roots(norm, roots)
 
     def _tok_ok(tok: str, cur_dir: Path, cmd_verb: str) -> bool:
-        if "=" in tok and not tok.startswith("=") and (tok.startswith("-") or tok.split("=", 1)[1].startswith(("/", "~", "$")) or ".." in tok.split("=", 1)[1]):
+        if tok.startswith("-C") and len(tok) > 2:
+            tok = tok[2:]
+        elif "=" in tok and not tok.startswith("=") and (tok.startswith("--") or tok.split("=", 1)[1].startswith(("/", "~", "$")) or ".." in tok.split("=", 1)[1]):
             tok = tok.split("=", 1)[1]
         if "://" in tok:
             scheme, rest = tok.split("://", 1)

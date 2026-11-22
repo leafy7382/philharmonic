@@ -49,6 +49,10 @@ _SIMPLE_PARAM_RE = re.compile(r"\$\{[#!]?[A-Za-z_][A-Za-z0-9_]*\}|\{\}")
 _BAD_VERB_CHARS = set("$`{}*?[]<>()")
 _VERSION_HELP_FLAGS = frozenset({"--version", "-V", "--help", "-h"})
 _GIT_COMMIT_BOOL_LONG = frozenset({"--no-verify", "--signoff", "--amend", "--no-edit", "--allow-empty", "--quiet", "--verbose", "--all"})
+_GIT_PUSH_BOOL_LONG = frozenset({"--set-upstream", "--dry-run", "--verbose", "--quiet", "--tags", "--follow-tags", "--atomic", "--porcelain", "--progress", "--no-progress"})
+_GIT_PUSH_REMOTE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
+_GIT_PUSH_REF_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]*$")
+_CANONICAL_GIT_BINS = frozenset({"git", "/usr/bin/git", "/bin/git", "/usr/local/bin/git"})
 _READONLY_VERB_BLOCKED_FLAGS: Dict[str, Tuple[frozenset[str], str]] = {
     "printf": (frozenset({"-v"}), "v"),
     "sort": (frozenset({"-o", "--output", "--compress-program"}), "o"),
@@ -121,8 +125,8 @@ def _is_safe_git_path(tok: str, eff_dir: str, payload: Dict[str, Any], *, allow_
 
 
 def _is_safe_git_stage_or_commit(arg_tokens: List[str], cur_dir: str, payload: Dict[str, Any]) -> bool:
-    """Closed-world check for non-interactive git add / git commit on Root."""
-    parsed = _parse_git_tokens(arg_tokens, cur_dir, payload, require_allowed_roots=True) if arg_tokens else None
+    """Closed-world check for non-interactive git add / commit / non-force push on Root."""
+    parsed = _parse_git_tokens(arg_tokens, cur_dir, payload, require_allowed_roots=True, allow_git_dir=False) if arg_tokens else None
     if parsed is None:
         return False
     subcmd, sub_args, eff_dir = parsed
@@ -192,6 +196,45 @@ def _is_safe_git_stage_or_commit(arg_tokens: List[str], cur_dir: str, payload: D
             elif not _is_safe_git_path(tok, eff_dir, payload):
                 return False
         return not expect_val and (has_msg or has_file or has_no_edit)
+    if subcmd == "push":
+        after_dd = False
+        pos: List[str] = []
+        for tok in sub_args:
+            if not after_dd and tok == "--":
+                after_dd = True
+            elif not after_dd and tok.startswith("-"):
+                if tok in _GIT_PUSH_BOOL_LONG or (not tok.startswith("--") and len(tok) > 1 and all(c in "unvq" for c in tok[1:])):
+                    continue
+                return False
+            else:
+                pos.append(tok)
+        if not pos:
+            return True
+        if not _GIT_PUSH_REMOTE_RE.fullmatch(pos[0]) or ".." in pos[0]:
+            return False
+        try:
+            eff_p = Path(eff_dir).resolve()
+        except (OSError, ValueError):
+            return False
+        if (eff_p / pos[0]).exists() or (eff_p / f"{pos[0]}.git").exists():
+            return False
+        git_cfg = eff_p / ".git" / "config"
+        if not git_cfg.is_file() and (eff_p == PROJECT_ROOT or PROJECT_ROOT in eff_p.parents):
+            git_cfg = PROJECT_ROOT / ".git" / "config"
+        if git_cfg.is_file():
+            try:
+                cfg_txt = git_cfg.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return False
+            if not re.search(rf'(?m)^\s*\[remote\s+"{re.escape(pos[0])}"\]', cfg_txt):
+                return False
+        for ref in pos[1:]:
+            if ".." in ref or "//" in ref or "@{" in ref or _has_shell_path_expansion(ref):
+                return False
+            parts = ref.split(":")
+            if len(parts) > 2 or any(not p or not _GIT_PUSH_REF_RE.fullmatch(p) for p in parts):
+                return False
+        return True
     return False
 
 
@@ -313,7 +356,7 @@ def _is_root_allowlisted_command(
 
         if not allowed_sc and allow_scratch_writes and not cwd_unknown:
             allowed_sc = _is_safe_scratch_shell_subcmd(sc, cur_dir, payload, state, require_doc_ext=require_doc_ext)
-        if not allowed_sc and verb == "git" and not has_input_redir:
+        if not allowed_sc and verb == "git" and raw_tok in _CANONICAL_GIT_BINS and not has_input_redir:
             allowed_sc = _is_safe_readonly_git_tokens(arg_tokens, cur_dir, payload) or (
                 allow_git_commit and not cwd_unknown and _is_safe_git_stage_or_commit(arg_tokens, cur_dir, payload)
             )
