@@ -3,29 +3,50 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict
+
+from guard.model_tiers import (
+    ALLOWED_BEST_OF_N_TIERS,
+    ALLOWED_COUNCIL_PROPOSER_TIERS,
+    ALLOWED_HIGH_REASONING_TIERS,
+    ALLOWED_STANDARD_SUBAGENT_TIERS,
+    BLIND_JUDGE_LEAK_PATTERNS,
+    CLAUDE_MODEL_CODENAMES,
+    COUNCIL_NAME_LEAK_RE,
+    DEFAULT_MODEL_ALIASES,
+    DEFAULT_TIER_BY_TYPE,
+    DEFAULT_TIER_TO_MODEL,
+    GOOGLE_MODEL_CODENAMES,
+    MODELS_CONFIG_PATH,
+    MODEL_TIERS,
+    MODEL_TIERS_SET,
+    PROVIDER_BRAND_TOKENS,
+    TIER_ENV_VARS,
+    get_blind_judge_leak_patterns,
+    get_council_name_leak_re,
+    get_model_alias_map,
+    get_model_for_tier,
+    get_model_tier_map,
+    infer_subagent_tier,
+    resolve_model_tiers,
+    select_target_tier,
+    validate_model_config,
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 
-ALLOWED_SUBAGENT_MODELS = {"flash", "flash_lite"}
+ALLOWED_SUBAGENT_MODELS = {DEFAULT_TIER_TO_MODEL["standard"], DEFAULT_TIER_TO_MODEL["lite"]}
 STRICT_READONLY_SUBAGENT_TYPES = {"scout", "verifier", "reviewer", "judge"}
 HIGH_REASONING_READONLY_TYPES = {"verifier", "reviewer", "judge"}
 SCRATCH_ONLY_SUBAGENT_TYPES = {"research", "researcher", "council"}
 READONLY_NON_VERIFICATION_TYPES = {
     "scout", "research", "researcher", "council", "verifier", "reviewer", "judge",
 }
-ALLOWED_VERIFIER_REVIEWER_MODELS = {"flash", "pro", "inherit"}
-ALLOWED_COUNCIL_PROPOSER_MODELS = {"flash", "pro", "inherit"}
+ALLOWED_VERIFIER_REVIEWER_MODELS = {DEFAULT_TIER_TO_MODEL[t] for t in ALLOWED_HIGH_REASONING_TIERS}
+ALLOWED_COUNCIL_PROPOSER_MODELS = {DEFAULT_TIER_TO_MODEL[t] for t in ALLOWED_COUNCIL_PROPOSER_TIERS}
 ISOLATED_WORKSPACES = {"branch", "share"}
 DEFAULT_MODEL_BY_TYPE = {
-    "scout": "flash_lite",
-    "research": "flash",
-    "researcher": "flash",
-    "council": "flash",
-    "implementer": "flash",
-    "verifier": "flash",
-    "reviewer": "flash",
-    "judge": "flash",
+    sub_type: DEFAULT_TIER_TO_MODEL[tier] for sub_type, tier in DEFAULT_TIER_BY_TYPE.items()
 }
 
 MUTATION_VERBS_RE = re.compile(
@@ -44,59 +65,6 @@ COHORT_HEADER_RE = re.compile(r"(?m)^[ \t]*COHORT:[ \t]*([^\r\n]+)$", re.I)
 COUNCIL_ID_HEADER_RE = re.compile(r"(?m)^[ \t]*COUNCIL_ID:[ \t]*([^\r\n]+)$", re.I)
 COUNCIL_ROLE_HEADER_RE = re.compile(r"(?m)^[ \t]*COUNCIL_ROLE:[ \t]*([^\r\n]+)$", re.I)
 EVAL_CMD_HEADER_RE = re.compile(r"(?m)^[ \t]*EVAL_CMD:[ \t]*([^\r\n]+)$", re.I)
-
-_MODEL_BRAND_PATTERN = (
-    r"(?:gemini(?:\s+[0-9]+(?:\.[0-9]+)?)?(?:\s+(?:pro|flash(?:_lite)?|carbon|neon|argon|hydrogen))?"
-    r"|claude(?:\s+[0-9]+(?:\.[0-9]+)?)?(?:\s+(?:opus|sonnet|haiku|fable)(?:\s+[0-9]+(?:\.[0-9]+)?)?)?"
-    r"|opus(?:\s+[0-9]+(?:\.[0-9]+)?)?|sonnet(?:\s+[0-9]+(?:\.[0-9]+)?)?"
-    r"|haiku(?:\s+[0-9]+(?:\.[0-9]+)?)?|fable(?:\s+[0-9]+(?:\.[0-9]+)?)?"
-    r"|gpt-[0-9][a-z0-9.\-]*|o[134](?:[- ](?:mini|preview|pro))?"
-    r"|grok(?:[- ][0-9]+(?:\.[0-9]+)?)?"
-    r"|chatgpt|geminipro|claudesonnet|claudeopus"
-    r"|openai|anthropic|deepseek|llama|qwen|mistral)"
-)
-COUNCIL_NAME_LEAK_RE = re.compile(
-    r"(?:^|[^a-z])(?:gemini|claude|opus|sonnet|haiku|gpt|chatgpt|grok|o[134]|openai|anthropic|deepseek|llama|qwen|mistral|carbon|neon|argon|hydrogen|fable)(?:$|[^a-z])",
-    re.I,
-)
-BLIND_JUDGE_LEAK_PATTERNS = (
-    re.compile(
-        rf"\b(?:proposal|draft|option|candidate|design|submission|response|answer)\s+[a-z0-9#_-]{{1,20}}[^\r\n]{{0,80}}(?:\(\s*|:\s*|—\s*|-\s*|\bby\s+|\bfrom\s+){_MODEL_BRAND_PATTERN}\b",
-        re.I,
-    ),
-    re.compile(
-        rf"\b(?:proposal|draft|option|candidate|design|submission|response|answer)\s+[a-z0-9#_-]{{1,20}}.{{0,60}}?(?:\(\s*|:\s*|—\s*|-\s*|\bby\s+|\bfrom\s+|\r?\n[ \t]*)\b{_MODEL_BRAND_PATTERN}\b",
-        re.I | re.S,
-    ),
-    re.compile(
-        rf"\b{_MODEL_BRAND_PATTERN}\b[^\r\n]{{0,60}}\b(?:wrote|authored|proposed|generated|created|produced|submitted)\b[^\r\n]{{0,60}}\b(?:proposal|draft|option|candidate|design|submission|response|answer)\b",
-        re.I,
-    ),
-    re.compile(
-        rf"\b{_MODEL_BRAND_PATTERN}(?:'s|s')\s+(?:proposal|draft|option|candidate|design|submission|response|answer)\b",
-        re.I,
-    ),
-    re.compile(
-        rf"(?m)(?:^[ \t]*(?:[-*#]+[ \t]*)?|(?:^|[{{,])[ \t]*)[\"']?(?:model|author|authored[ \t]+by|written[ \t]+by|generated[ \t]+by|proposed[ \t]+by|submitted[ \t]+by|source[ \t]+model|provider|llm)[\"']?[ \t]*:[ \t]*[^\r\n]*\b{_MODEL_BRAND_PATTERN}\b",
-        re.I,
-    ),
-    re.compile(
-        rf"\[\s*(?:{_MODEL_BRAND_PATTERN}|flash(?:_lite)?(?:\s+[0-9]+(?:\.[0-9]+)?)?|gpt)\s*\]",
-        re.I,
-    ),
-    re.compile(
-        r"\b(?:(?:proposal|draft|option|candidate|design|solution|submission|response|answer|report|output|plan)[a-z0-9._/\-]*?(?:gemini|claude|opus|sonnet|haiku|fable|flash|gpt(?:-[0-9a-z.]*)?|openai|anthropic|deepseek|llama|qwen|mistral)|(?:gemini|claude|opus|sonnet|haiku|fable|flash|gpt(?:-[0-9a-z.]*)?|openai|anthropic|deepseek|llama|qwen|mistral)[a-z0-9._/\-]*?(?:proposal|draft|option|candidate|design|solution|submission|response|answer|report|output|plan))[a-z0-9._/\-]*\.(?:md|txt|json)\b",
-        re.I,
-    ),
-    re.compile(
-        r"(?:^|[/\\\s`'\"(,:])(?:gemini|claude|opus|sonnet|haiku|fable|flash(?:_lite)?|gpt(?:-[0-9a-z.]*|[0-9]+[a-z0-9._-]*)?|o[134]|grok|chatgpt|openai|anthropic|deepseek|llama|qwen|mistral)(?:[_-][a-z0-9._-]*)?\.(?:md|txt|json)\b",
-        re.I,
-    ),
-    re.compile(
-        r"(?:^|[\s`'\"(,:])(?:[A-Za-z0-9._/\-]*/)?scratch/(?![A-Za-z0-9._\-]+\.(?:md|txt|json)\b)",
-        re.I,
-    ),
-)
 TRIVIAL_EVAL_CMD_RE = re.compile(
     r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*\+?=\S+\s+)*(?:(?:(?:/(?:usr/)?bin/)?(?:true|echo|printf|pwd|ls|cat|sleep)|exit)\b|:(?=$|\s))",
     re.I,

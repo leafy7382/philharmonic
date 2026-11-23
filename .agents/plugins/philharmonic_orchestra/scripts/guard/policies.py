@@ -13,6 +13,7 @@ from guard.constants import (
     PROJECT_ROOT,
     REPLAN_HEADER_RE,
     SEARCH_TOOLS,
+    get_model_for_tier,
 )
 from guard.identity import (
     _allowed_roots,
@@ -89,12 +90,12 @@ from guard.subagent_policy import (
     _parse_allowed_files_header,
 )
 
-_GUARD_MOD_RE = re.compile(r"\b(?:guard|orchestrator_guard|state_store|identity|policies|verification|constants|cli)\b")
+_GUARD_MOD_RE = re.compile(r"\b(?:guard|orchestrator_guard|state_store|identity|policies|verification|constants|model_tiers|cli)\b")
 _GUARD_IMPORT_RE = re.compile(
     r"(?:\borchestrator_guard\b"
-    r"|\b(?:from\s+[A-Za-z0-9_.]*\b(?:guard|orchestrator_guard|state_store|identity|policies|verification|constants|cli)\b"
-    r"|import\s+(?:\\\r?\n|[^;\n])*\b(?:guard|orchestrator_guard|state_store|identity|policies|verification|constants|cli)\b)"
-    r"|(?:^|\s)-[A-Za-z]*m\s*(?:guard|orchestrator_guard|state_store|cli)\b)"
+    r"|\b(?:from\s+[A-Za-z0-9_.]*\b(?:guard|orchestrator_guard|state_store|identity|policies|verification|constants|model_tiers|cli)\b"
+    r"|import\s+(?:\\\r?\n|[^;\n])*\b(?:guard|orchestrator_guard|state_store|identity|policies|verification|constants|model_tiers|cli)\b)"
+    r"|(?:^|\s)-[A-Za-z]*m\s*(?:guard|orchestrator_guard|state_store|model_tiers|cli)\b)"
 )
 _AGENTS_STATE_REF_RE = re.compile(r"(?:^|[\s'\"/(=])\.agents(?:/(?:\.state|\*|\.\S*)|(?=$|[\s'\"/;)|&]))")
 _UNQUOTED_REDIR_OUT_RE = re.compile(r"(?:^|[^<])(?:[0-9]*>(?!&\d|\s*/dev/null(?=$|[\s;|&)]))|&>|>>|>\|)")
@@ -262,7 +263,7 @@ def _readonly_denial(payload: Dict[str, Any], state: Dict[str, Any], *, is_scrat
         role_word = "Council" if sub_type == "council" else "Research"
         return {"decision": "deny", "reason": f"[ORCHESTRATOR GUARD] {role_word} subagents may only write markdown reports to <artifactDirectoryPath>/scratch/*.md. Workspace mutations are prohibited."}
     kind = "Shell file mutations" if shell else "File mutations"
-    reason = f"[ORCHESTRATOR GUARD] Scout subagents (Model='flash_lite') are strictly read-only. {kind} are prohibited." if sub_type == "scout" else f"[ORCHESTRATOR GUARD] {sub_type.capitalize()} subagents are strictly read-only. {kind} are prohibited."
+    reason = f"[ORCHESTRATOR GUARD] Scout subagents (Model='{get_model_for_tier('lite')}') are strictly read-only. {kind} are prohibited." if sub_type == "scout" else f"[ORCHESTRATOR GUARD] {sub_type.capitalize()} subagents are strictly read-only. {kind} are prohibited."
     return {"decision": "deny", "reason": reason}
 
 

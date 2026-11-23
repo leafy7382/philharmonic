@@ -69,15 +69,34 @@ Once `/philharmonic` is active, the main agent picks a workflow based on the siz
 
 Custom agents (`scout`, `implementer`, `verifier`, `reviewer`, `judge`, `council`) are defined lazily as needed; `research` is built in.
 
-| Role | Model Tier | File Access | Workspace | Job |
+| Role | Capability Tier (Default Wire Model) | File Access | Workspace | Job |
 | :--- | :--- | :--- | :--- | :--- |
-| `scout` | `flash_lite` | Read-only | `inherit` | Quick symbol lookups, file slices, and reading `.log`/transcript files |
-| `research` | `flash` (`pro`/`inherit` in `MODE: COUNCIL`) | Scratch (`scratch/*.md`) | `inherit` | Multi-file investigation and Council proposals |
-| `council` | `flash` / `pro` / `inherit` | Scratch (`scratch/*.md`) | `inherit` | Council draft writing outside `swarm` |
-| `implementer` | `flash` (`pro` only in `MODE: BEST_OF_N`) | Scoped by `ALLOWED_FILES:` | `inherit`, `branch`, or `share` | Editing code and running tests |
-| `verifier` | `flash` / `pro` / `inherit` | Strict read-only | `inherit` | Independent pass/fail verification after edits |
-| `reviewer` | `flash` / `pro` / `inherit` | Strict read-only | `inherit` | Focused review with a unique `REVIEW_LENS:` |
-| `judge` | `flash` / `pro` / `inherit` | Strict read-only | `inherit` | Blind voting across anonymized Council drafts |
+| `scout` | `lite` (`flash_lite`) | Read-only | `inherit` | Quick symbol lookups, file slices, and reading `.log`/transcript files |
+| `research` | `standard` (`flash`; `frontier`/`inherit` in `MODE: COUNCIL`) | Scratch (`scratch/*.md`) | `inherit` | Multi-file investigation and Council proposals |
+| `council` | `standard` / `frontier` / `inherit` (`flash` / `pro` / `inherit`) | Scratch (`scratch/*.md`) | `inherit` | Council draft writing outside `swarm` |
+| `implementer` | `standard` (`flash`; `frontier` only in `MODE: BEST_OF_N`) | Scoped by `ALLOWED_FILES:` | `inherit`, `branch`, or `share` | Editing code and running tests |
+| `verifier` | `standard` / `frontier` / `inherit` (`flash` / `pro` / `inherit`) | Strict read-only | `inherit` | Independent pass/fail verification after edits |
+| `reviewer` | `standard` / `frontier` / `inherit` (`flash` / `pro` / `inherit`) | Strict read-only | `inherit` | Focused review with a unique `REVIEW_LENS:` |
+| `judge` | `standard` / `frontier` / `inherit` (`flash` / `pro` / `inherit`) | Strict read-only | `inherit` | Blind voting across anonymized Council drafts |
+
+### Remapping model tiers (e.g., `flash` / `flash_lite` → `hydrogen` or future renames)
+
+Internally, the guard enforces stable capability tiers (`lite`, `standard`, `frontier`, `inherit`) and resolves them to runtime wire model names at the `invoke_subagent` boundary via `.agents/plugins/philharmonic_orchestra/models.json` and optional `PHILHARMONIC_MODEL_*` environment variables (highest precedence):
+
+```bash
+# Example: collapse both lite and standard tiers to "hydrogen" once agy exposes it
+export PHILHARMONIC_MODEL_LITE=hydrogen
+export PHILHARMONIC_MODEL_STANDARD=hydrogen
+# Optional: remap frontier or supply bulk JSON overrides
+# export PHILHARMONIC_MODEL_FRONTIER=carbon
+# export PHILHARMONIC_MODEL_TIERS='{"lite":"hydrogen","standard":"hydrogen"}'
+# export PHILHARMONIC_MODEL_ALIASES='{"legacy_fast":"lite"}'
+# export PHILHARMONIC_MODEL_BRAND_TOKENS='helium,quartz'
+```
+
+- **Many-to-one collapse safe**: Each subagent persists both its wire `model` and canonical `model_tier` in state, so collapsing `lite` and `standard` onto the same wire model (e.g., `"hydrogen"`) still blocks sending code edits or `> 3`-rule tasks to `lite`-tier workers (`scout` and downgraded read-only `research`).
+- **Automatic blind-judge protection**: Configured custom wire model names and `brand_tokens` are automatically folded into Council worker-name and blind-judge leak detection.
+- **Runtime enum note**: Wire model values must match what your `agy` build accepts in the `invoke_subagent` `Model` enum (`orchestrator_guard.py status` and `doctor` display and validate the active `modelTiers`).
 
 ### What the guard actually blocks and allows
 
@@ -124,7 +143,7 @@ NOTES: <summary (VERDICT: ... or SCORE: ...; <= 10 `- ` bullets), or error + fil
 Quick rules that trip people up:
 - **`ALLOWED_FILES:` must be on one comma-separated line** — multi-line YAML bullet lists are ignored by the header parser.
 - **`SPEC_FILE:` needs three sections**: `SIGNATURES`, `PITFALLS`/`INVARIANTS`, and `VERIFICATION`.
-- **Anonymous Councils**: Never mention model/provider names (`claude`, `gpt`, `gemini`, `flash`, `pro`) inside `judge` prompts, `swarm` briefs, or council roster names (`proposer-a`, `judge-1` are fine).
+- **Anonymous Councils**: Never mention model/provider names (`claude`, `gpt`, `gemini`, `flash`, `hydrogen`, `carbon`, `neon`, `argon`, or configured custom model names) inside `judge` prompts, `swarm` briefs, or council roster names (`proposer-a`, `judge-1` are fine).
 - **Failure reports**: `implementer` `BLOCKED`/`FAILED` reports require both a reason and a `file://.../*.log` link; read-only and scratch roles only need a short explanation. `scout` can reply with just `STATUS:` and `NOTES:`.
 
 ---
@@ -154,6 +173,7 @@ python3 -m unittest discover -s tests
 │   └── plugins/
 │       └── philharmonic_orchestra/
 │           ├── hooks.json                      # Hook bindings (pre-invocation, pre-tool, post-tool, stop)
+│           ├── models.json                     # Capability-tier -> wire model mappings, aliases & brand tokens
 │           ├── plugin.json
 │           ├── scripts/
 │           │   ├── orchestrator_guard.py       # Hook entrypoint (fail-closed on memory/recursion errors)
@@ -161,6 +181,7 @@ python3 -m unittest discover -s tests
 │           │       ├── __init__.py             # Public guard package exports
 │           │       ├── cli.py                  # status | activate | deactivate | reset | doctor
 │           │       ├── constants.py            # Shared patterns and limits
+│           │       ├── model_tiers.py          # Tier registry, models.json/env overrides & dynamic leak patterns
 │           │       ├── state_store.py          # Locked atomic JSON state persistence and pruning
 │           │       ├── identity.py             # Session/subagent binding and lightweight workspace root checks
 │           │       ├── path_guards.py          # Allowlist, scratch, simple glob, and protected-path checks

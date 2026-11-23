@@ -3553,6 +3553,7 @@ class TestOrchestratorGuard(unittest.TestCase):
             "cli.py": 200,
             "constants.py": 350,
             "identity.py": 820,
+            "model_tiers.py": 340,
             "path_guards.py": 560,
             "policies.py": 520,
             "root_allowlist.py": 420,
@@ -3693,6 +3694,216 @@ class TestOrchestratorGuard(unittest.TestCase):
             for push_cmd in ("git push", "git push origin master", "git push --dry-run origin HEAD:main"):
                 res_sub = self._pre("run_command", {"CommandLine": push_cmd}, cid=cid, base=root_p)
                 self.assertEqual(res_sub["decision"], "deny", f"{tname} must deny {push_cmd!r}: {res_sub}")
+
+    def test_model_tier_mapping_hydrogen_collapse_and_config(self) -> None:
+        import os
+        from unittest import mock
+        import guard.model_tiers as mt
+
+        root_p = self._brain_payload("root-model-tiers", lastUserInput="/philharmonic test model tiers")
+        orchestrator_guard._cli_activate(root_p)
+
+        simple_read_prompt = (
+            "TASK: Read `src/auth/parser.py` constants.\nRULES:\n1. Open `src/auth/parser.py`.\n"
+            "2. Check MAX_LEN.\n3. Do not change any file.\n"
+            "REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: ok\nNOTES: done\n"
+        )
+        complex_read_prompt = (
+            "TASK: Audit auth across four modules.\nRULES:\n1. Open `a.py`.\n2. Open `b.py`.\n"
+            "3. Open `c.py`.\n4. Compare token expiry logic.\n"
+            "REPORT FORMAT:\nSTATUS: COMPLETED\nFILES_CHANGED: NONE\nVERIFICATION: ok\nNOTES: done\n"
+        )
+
+        # 1. Many-to-one collapse: both lite and standard map to "hydrogen", frontier to "carbon"
+        env_collapse = {
+            "PHILHARMONIC_MODEL_LITE": "hydrogen",
+            "PHILHARMONIC_MODEL_STANDARD": "hydrogen",
+            "PHILHARMONIC_MODEL_FRONTIER": "carbon",
+        }
+        with mock.patch.dict(os.environ, env_collapse, clear=False):
+            # Legacy flash_lite / flash rewrite to hydrogen while preserving distinct model_tier
+            r_scout_leg = self._pre("invoke_subagent", self._sub_args("scout", "Legacy Scout", "flash_lite", simple_read_prompt), call_id="mt_1", base=root_p)
+            self.assertEqual(r_scout_leg["decision"], "allow")
+            self.assertEqual(r_scout_leg["overwrite"]["Model"], "hydrogen")
+
+            r_impl_leg = self._pre("invoke_subagent", self._sub_args("implementer", "Legacy Impl", "flash"), call_id="mt_2", base=root_p)
+            self.assertEqual(r_impl_leg["decision"], "allow")
+            self.assertEqual(r_impl_leg["overwrite"]["Model"], "hydrogen")
+
+            # Direct Model="hydrogen" needs no overwrite and assigns role-appropriate model_tier
+            r_scout_h = self._pre("invoke_subagent", self._sub_args("scout", "Hydrogen Scout", "hydrogen", simple_read_prompt), call_id="mt_3", base=root_p)
+            self.assertEqual(r_scout_h, {"decision": "allow"})
+
+            r_impl_h = self._pre("invoke_subagent", self._sub_args("implementer", "Hydrogen Impl", "hydrogen"), call_id="mt_4", base=root_p)
+            self.assertEqual(r_impl_h, {"decision": "allow"})
+
+            # High-reasoning verifier accepts hydrogen (standard) and rewrites pro -> carbon, flash_lite -> hydrogen (standard)
+            r_ver_h = self._pre("invoke_subagent", self._sub_args("verifier", "Ver H", "hydrogen", simple_read_prompt), call_id="mt_5", base=root_p)
+            self.assertEqual(r_ver_h, {"decision": "allow"})
+            r_ver_pro = self._pre("invoke_subagent", self._sub_args("verifier", "Ver Pro", "pro", simple_read_prompt), call_id="mt_6", base=root_p)
+            self.assertEqual(r_ver_pro["decision"], "allow")
+            self.assertEqual(r_ver_pro["overwrite"]["Model"], "carbon")
+            r_ver_lite = self._pre("invoke_subagent", self._sub_args("verifier", "Ver Lite", "flash_lite", simple_read_prompt), call_id="mt_7", base=root_p)
+            self.assertEqual(r_ver_lite["decision"], "allow")
+            self.assertEqual(r_ver_lite["overwrite"]["Model"], "hydrogen")
+
+            # Best-of-N allows frontier (pro -> carbon) and standard (hydrogen)
+            r_bon = self._pre(
+                "invoke_subagent",
+                self._sub_args("implementer", "BoN Cand", "pro", "MODE: BEST_OF_N\n" + VALID_PROMPT, Workspace="branch"),
+                call_id="mt_8",
+                base=root_p,
+            )
+            self.assertEqual(r_bon["decision"], "allow")
+            self.assertEqual(r_bon["overwrite"]["Model"], "carbon")
+
+            # Standard worker requesting frontier (either "pro" or "carbon") is denied with updated wire hint
+            for bad_m in ("pro", "carbon", "frontier"):
+                r_deny = self._pre("invoke_subagent", self._sub_args("implementer", "Bad Frontier", bad_m), call_id=f"mt_deny_{bad_m}", base=root_p)
+                self.assertEqual(r_deny["decision"], "deny")
+                self.assertIn(f"Model='{bad_m}'", r_deny["reason"])
+                self.assertIn("'hydrogen'", r_deny["reason"])
+
+            # Simple readonly research downgrades to model_tier="lite" even when wire model stays "hydrogen"
+            r_res_simple = self._pre("invoke_subagent", self._sub_args("research", "Simple Res", "hydrogen", simple_read_prompt), call_id="mt_9", base=root_p)
+            self.assertEqual(r_res_simple, {"decision": "allow"})
+            r_res_complex = self._pre("invoke_subagent", self._sub_args("research", "Complex Res", "hydrogen", complex_read_prompt), call_id="mt_10", base=root_p)
+            self.assertEqual(r_res_complex, {"decision": "allow"})
+
+            spawns_by_role = {p["role"]: p for p in self._load_st(root_p)["pending_spawns"]}
+            self.assertEqual(spawns_by_role["Legacy Scout"]["model_tier"], "lite")
+            self.assertEqual(spawns_by_role["Legacy Impl"]["model_tier"], "standard")
+            self.assertEqual(spawns_by_role["Hydrogen Scout"]["model_tier"], "lite")
+            self.assertEqual(spawns_by_role["Hydrogen Impl"]["model_tier"], "standard")
+            self.assertEqual(spawns_by_role["Ver Pro"]["model_tier"], "frontier")
+            self.assertEqual(spawns_by_role["Ver Lite"]["model_tier"], "standard")
+            self.assertEqual(spawns_by_role["Simple Res"]["model_tier"], "lite")
+            self.assertEqual(spawns_by_role["Complex Res"]["model_tier"], "standard")
+
+            # send_message enforces lite-tier gate using model_tier even when wire model is identical ("hydrogen")
+            self._reg_sub("scout", "h-scout", "hydrogen", payload=root_p)
+            self._reg_sub("implementer", "h-impl", "hydrogen", payload=root_p)
+            self._reg_sub("research", "h-res-lite", "hydrogen", payload=root_p, model_tier="lite")
+            self._reg_sub("research", "h-res-std", "hydrogen", payload=root_p, model_tier="standard")
+
+            r_msg_scout = self._pre("send_message", {"Recipient": "h-scout", "Message": "Edit src/app.py."}, base=root_p)
+            self.assertEqual(r_msg_scout["decision"], "deny")
+            self.assertIn("lite-tier ('hydrogen'", r_msg_scout["reason"])
+
+            r_msg_res_lite = self._pre("send_message", {"Recipient": "h-res-lite", "Message": "1. A\n2. B\n3. C\n4. D"}, base=root_p)
+            self.assertEqual(r_msg_res_lite["decision"], "deny")
+
+            self.assertEqual(self._pre("send_message", {"Recipient": "h-res-std", "Message": "1. A\n2. B\n3. C\n4. D"}, base=root_p)["decision"], "allow")
+            self.assertEqual(self._pre("send_message", {"Recipient": "h-impl", "Message": "Edit src/app.py."}, base=root_p)["decision"], "allow")
+
+            # CLI status & doctor surface active modelTiers
+            st_out = orchestrator_guard._cli_status(root_p)
+            self.assertEqual(st_out["modelTiers"]["lite"], "hydrogen")
+            self.assertEqual(st_out["modelTiers"]["standard"], "hydrogen")
+            self.assertEqual(st_out["modelTiers"]["frontier"], "carbon")
+            doc_out = orchestrator_guard._cli_doctor()
+            self.assertTrue(doc_out["healthy"])
+            self.assertEqual(doc_out["modelTiers"]["lite"], "hydrogen")
+
+        # 2. Partial one-to-one remap: only lite -> hydrogen (standard stays flash)
+        with mock.patch.dict(os.environ, {"PHILHARMONIC_MODEL_LITE": "hydrogen"}, clear=False):
+            r_ver_partial = self._pre("invoke_subagent", self._sub_args("verifier", "Ver Partial", "hydrogen", simple_read_prompt), call_id="mt_partial", base=root_p)
+            self.assertEqual(r_ver_partial["decision"], "allow")
+            self.assertEqual(r_ver_partial["overwrite"]["Model"], "flash")
+
+        # 3. models.json file overrides + env precedence + doctor validation on malformed config
+        with tempfile.TemporaryDirectory() as td:
+            cfg_file = Path(td) / "models.json"
+            cfg_file.write_text(
+                json.dumps({"tiers": {"lite": "hydrogen_lite", "standard": "hydrogen"}, "aliases": {"fast_legacy": "lite"}}),
+                encoding="utf-8",
+            )
+            with mock.patch.object(mt, "MODELS_CONFIG_PATH", cfg_file):
+                self.assertEqual(mt.get_model_tier_map()["lite"], "hydrogen_lite")
+                self.assertEqual(mt.get_model_tier_map()["standard"], "hydrogen")
+                self.assertEqual(mt.resolve_model_tiers("fast_legacy"), {"lite"})
+                self.assertEqual(mt.validate_model_config(), [])
+                with mock.patch.dict(os.environ, {"PHILHARMONIC_MODEL_STANDARD": "helium"}, clear=False):
+                    self.assertEqual(mt.get_model_tier_map()["standard"], "helium")
+
+            cfg_file.write_text(json.dumps({"tiers": {"bogus": "x"}, "aliases": {"bad": "nope"}}), encoding="utf-8")
+            with mock.patch.object(mt, "MODELS_CONFIG_PATH", cfg_file):
+                doc_bad = orchestrator_guard._cli_doctor()
+                self.assertFalse(doc_bad["healthy"])
+                self.assertTrue(any("Unknown model tier" in iss for iss in doc_bad["issues"]))
+                self.assertTrue(any("Invalid model alias" in iss for iss in doc_bad["issues"]))
+
+    def test_blind_judge_hydrogen_and_dynamic_brand_tokens(self) -> None:
+        import os
+        from unittest import mock
+
+        root_p = self._brain_payload("root-blind-hydrogen", lastUserInput="/philharmonic blind judge tokens")
+        orchestrator_guard._cli_activate(root_p)
+
+        def _judge(prompt: str, cid: str) -> Dict[str, Any]:
+            return self._pre(
+                "invoke_subagent",
+                self._sub_args("judge", "Blind Judge", "inherit", f"MODE: COUNCIL\nCOUNCIL_ID: c-hyd\nCOUNCIL_ROLE: judge\n{prompt}"),
+                call_id=cid,
+                base=root_p,
+            )
+
+        # Standalone hydrogen / carbon / neon / argon leaks must all be caught
+        for idx, leak in enumerate((
+            "Proposal A (Hydrogen) vs Proposal B.",
+            "Draft B by Hydrogen Lite",
+            "Option 1: Carbon",
+            "Hydrogen wrote Proposal A.",
+            "Hydrogen's proposal is cleaner.",
+            "Model: Hydrogen",
+            "Model: flash_lite",
+            "Compare [hydrogen] and [carbon].",
+            "Review scratch/proposal_hydrogen.md and scratch/proposal_b.md.",
+            "Review scratch/hydrogen_lite.md.",
+            "Proposal A\nHydrogen\nUse modular handlers.",
+        )):
+            res = _judge(leak, f"hyd_leak_{idx}")
+            self.assertEqual(res["decision"], "deny", f"Should block leak: {leak!r}")
+            self.assertIn("Blind judging violation", res["reason"])
+
+        # Swarm council roster names leaking hydrogen or flash must be denied
+        for bad_name in ("proposer-hydrogen", "judge-hydrogen-lite", "proposer-flash"):
+            res_sw = self._pre(
+                "swarm",
+                {"action": "add", "name": bad_name, "brief": "MODE: COUNCIL\nCOUNCIL_ID: c-hyd\nCOUNCIL_ROLE: proposer\nDraft."},
+                call_id=f"sw_{bad_name}",
+                base=root_p,
+            )
+            self.assertEqual(res_sw["decision"], "deny", f"Should block swarm name {bad_name!r}")
+            self.assertIn("Blind council violation", res_sw["reason"])
+
+        # Benign domain prose mentioning carbon / hydrogen remains allowed
+        for idx, ok_text in enumerate((
+            "# Proposal B\nCarbon accounting with the Gemini API client.",
+            "# Proposal B\nHydrogen fuel cell routing design.",
+            "Proposal A: use carbon theme for the dashboard.",
+        )):
+            res_ok = _judge(ok_text, f"hyd_ok_{idx}")
+            self.assertEqual(res_ok["decision"], "allow", f"Should allow benign text: {ok_text!r}")
+
+        # Future unknown codename configured via env var is automatically protected
+        with mock.patch.dict(os.environ, {"PHILHARMONIC_MODEL_STANDARD": "gemini-5-helium", "PHILHARMONIC_MODEL_BRAND_TOKENS": "quartz"}, clear=False):
+            for idx, dyn_leak in enumerate((
+                "Proposal A (Helium) vs Proposal B.",
+                "Model: Quartz",
+                "Compare [helium] vs [quartz].",
+                "Review scratch/proposal_helium.md.",
+                "Review scratch/quartz.md.",
+            )):
+                res_dyn = _judge(dyn_leak, f"dyn_leak_{idx}")
+                self.assertEqual(res_dyn["decision"], "deny", f"Should block dynamic leak: {dyn_leak!r}")
+            res_sw_dyn = self._pre(
+                "swarm",
+                {"action": "add", "name": "proposer-helium", "brief": "MODE: COUNCIL\nCOUNCIL_ID: c-hyd\nCOUNCIL_ROLE: proposer\nDraft."},
+                call_id="sw_helium",
+                base=root_p,
+            )
+            self.assertEqual(res_sw_dyn["decision"], "deny")
 
 
 if __name__ == "__main__":

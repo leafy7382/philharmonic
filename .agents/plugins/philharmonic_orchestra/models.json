@@ -1,0 +1,22 @@
+{
+  "tiers": {
+    "lite": "flash_lite",
+    "standard": "flash",
+    "frontier": "pro",
+    "inherit": "inherit"
+  },
+  "aliases": {
+    "flash_lite": "lite",
+    "flash-lite": "lite",
+    "flash": "standard",
+    "pro": "frontier",
+    "hydrogen": "standard",
+    "hydrogen_lite": "lite",
+    "hydrogen-lite": "lite",
+    "carbon": "frontier",
+    "neon": "frontier",
+    "argon": "frontier",
+    "inherit": "inherit"
+  },
+  "brand_tokens": []
+}

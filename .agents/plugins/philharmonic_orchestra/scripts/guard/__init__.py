@@ -44,6 +44,7 @@ _SUBMODULES = (
     "path_guards",
     "state_store",
     "constants",
+    "model_tiers",
 )
 
 

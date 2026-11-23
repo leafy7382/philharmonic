@@ -7,7 +7,7 @@ import select
 import sys
 from typing import Any, Callable, Dict, List
 
-from guard.constants import PROJECT_ROOT
+from guard.constants import PROJECT_ROOT, get_model_tier_map, validate_model_config
 from guard.identity import handle_pre_invocation
 from guard.policies import handle_pre_tool
 from guard.state_store import _current_invocation_key, _default_state, _load_state, _save_state, _state_file_path, state_transaction
@@ -36,6 +36,7 @@ def _cli_status(payload: Dict[str, Any]) -> Dict[str, Any]:
         "planExecutePhase": bool(state.get("plan_execute_phase", False)),
         "rootConversationId": state.get("root_conversation_id"),
         "currentInvocation": inv_key,
+        "modelTiers": get_model_tier_map(),
         "activeSubagents": subagents_summary,
         "pendingSpawns": state.get("pending_spawns", []),
         "cohorts": state.get("cohorts", {}),
@@ -92,9 +93,11 @@ def _cli_doctor() -> Dict[str, Any]:
                 issues.append("Skill SKILL.md does not contain 'name: philharmonic'.")
         except OSError:
             issues.append("Unable to read SKILL.md.")
+    issues.extend(validate_model_config())
     return {
         "healthy": not issues and plugin_hooks.exists() and skill_file.exists(),
         "pluginHooksPresent": plugin_hooks.exists(),
+        "modelTiers": get_model_tier_map(),
         "issues": issues,
     }
 

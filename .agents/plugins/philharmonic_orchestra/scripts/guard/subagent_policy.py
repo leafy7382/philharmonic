@@ -11,15 +11,14 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from guard.ast_guard import _is_test_command
 from guard.constants import (
-    ALLOWED_COUNCIL_PROPOSER_MODELS,
-    ALLOWED_SUBAGENT_MODELS,
-    ALLOWED_VERIFIER_REVIEWER_MODELS,
-    BLIND_JUDGE_LEAK_PATTERNS,
+    ALLOWED_BEST_OF_N_TIERS,
+    ALLOWED_COUNCIL_PROPOSER_TIERS,
+    ALLOWED_HIGH_REASONING_TIERS,
+    ALLOWED_STANDARD_SUBAGENT_TIERS,
     COHORT_HEADER_RE,
     COUNCIL_ID_HEADER_RE,
-    COUNCIL_NAME_LEAK_RE,
     COUNCIL_ROLE_HEADER_RE,
-    DEFAULT_MODEL_BY_TYPE,
+    DEFAULT_TIER_BY_TYPE,
     DEFAULT_UNBOUNDED_READ_BYTES,
     DEFAULT_UNBOUNDED_READ_LINES,
     DIR_LIST_TOOLS,
@@ -49,6 +48,14 @@ from guard.constants import (
     STAGE_HEADER_RE,
     STRICT_READONLY_SUBAGENT_TYPES,
     _extract_call_id,
+    get_blind_judge_leak_patterns,
+    get_council_name_leak_re,
+    get_model_alias_map,
+    get_model_for_tier,
+    get_model_tier_map,
+    infer_subagent_tier,
+    resolve_model_tiers,
+    select_target_tier,
 )
 from guard.identity import (
     _get_subagent_type,
@@ -225,12 +232,13 @@ def _resolve_scratch_doc_candidates(text: str, artifact_dir: str) -> List[Path]:
 
 
 def _match_blind_judge_patterns(text: str) -> Optional[str]:
-    """Check raw and markdown-stripped text against BLIND_JUDGE_LEAK_PATTERNS."""
+    """Check raw and markdown-stripped text against active blind-judge leak patterns."""
     if not text:
         return None
     normalized = re.sub(r"[*_`]+", "", text)
+    patterns = get_blind_judge_leak_patterns()
     for candidate_text in ([text] if normalized == text else [text, normalized]):
-        for pattern in BLIND_JUDGE_LEAK_PATTERNS:
+        for pattern in patterns:
             if m := pattern.search(candidate_text):
                 return m.group(0)
     return None
@@ -257,7 +265,7 @@ def _detect_blind_judge_leak(text: str, payload: Optional[Dict[str, Any]] = None
 
 def _detect_council_name_leak(name: str) -> Optional[str]:
     """Return the matched token if a council worker name reveals model identity, else None."""
-    m = COUNCIL_NAME_LEAK_RE.search(name) if name else None
+    m = get_council_name_leak_re().search(name) if name else None
     return m.group(0) if m else None
 
 
@@ -479,20 +487,26 @@ def _validate_and_prepare_subagent_entry(
             f"Workspace='share' for candidate '{role_label}' (got '{workspace_mode}')."
         )
 
-    default_model = DEFAULT_MODEL_BY_TYPE.get(norm_type, "flash")
+    tier_map, alias_map = get_model_tier_map(), get_model_alias_map()
+    default_tier = DEFAULT_TIER_BY_TYPE.get(norm_type, "standard")
+    matched_tiers = resolve_model_tiers(raw_model, tier_map=tier_map, alias_map=alias_map)
     if norm_type in HIGH_REASONING_READONLY_TYPES:
-        target_model = raw_model if raw_model in ALLOWED_VERIFIER_REVIEWER_MODELS else default_model
+        target_tier = select_target_tier(matched_tiers, ALLOWED_HIGH_REASONING_TIERS, default_tier)
     elif mode == "best_of_n":
-        target_model = raw_model if raw_model in {"pro", "flash"} else default_model
+        target_tier = select_target_tier(matched_tiers, ALLOWED_BEST_OF_N_TIERS, default_tier)
     elif (parsed_mode == "council" and norm_type in SCRATCH_ONLY_SUBAGENT_TYPES) or norm_type == "council":
-        target_model = raw_model if raw_model in ALLOWED_COUNCIL_PROPOSER_MODELS else default_model
+        target_tier = select_target_tier(matched_tiers, ALLOWED_COUNCIL_PROPOSER_TIERS, default_tier)
     else:
-        requested_model = raw_model or "inherit"
-        if requested_model == "pro":
-            return _entry_deny(f"Subagent '{role_label}' requested Model='pro'. Subagents must use 'flash' or 'flash_lite'.")
-        target_model = requested_model if requested_model in ALLOWED_SUBAGENT_MODELS else default_model
-        if target_model == "flash" and _is_simple_readonly_task(norm_type, prompt_text):
-            target_model = "flash_lite"
+        if "frontier" in matched_tiers and not (matched_tiers & ALLOWED_STANDARD_SUBAGENT_TIERS):
+            std_wire, lite_wire = get_model_for_tier("standard", tier_map), get_model_for_tier("lite", tier_map)
+            allowed_desc = f"'{std_wire}'" if std_wire == lite_wire else f"'{std_wire}' or '{lite_wire}'"
+            return _entry_deny(
+                f"Subagent '{role_label}' requested Model='{raw_model}' (frontier tier). Subagents must use {allowed_desc}."
+            )
+        target_tier = select_target_tier(matched_tiers, ALLOWED_STANDARD_SUBAGENT_TIERS, default_tier)
+        if target_tier == "standard" and _is_simple_readonly_task(norm_type, prompt_text):
+            target_tier = "lite"
+    target_model = get_model_for_tier(target_tier, tier_map)
 
     allowed_files = _parse_allowed_files_header(prompt_text)
     normalized_lens: Optional[str] = None
@@ -537,6 +551,7 @@ def _validate_and_prepare_subagent_entry(
         "type": type_name,
         "type_name": type_name,
         "model": target_model,
+        "model_tier": target_tier,
         "workspace": workspace_mode,
         "active_branch": workspace_mode.lower() == "branch",
         "active_worktree": workspace_mode.lower() in ISOLATED_WORKSPACES,
@@ -838,12 +853,21 @@ def _handle_send_message(
         subagent_info.setdefault("stage_history", []).append(stage_val)
         local_dirty = True
 
-    if subagent_info and subagent_info.get("model") == "flash_lite":
-        if MUTATION_VERBS_RE.search(message) or len(NUMBERED_RULE_RE.findall(message)) > 3:
-            return _deny(
-                f"Recipient '{recipient}' is a 'flash_lite' ({subagent_info.get('type', 'scout')}) subagent. "
-                "Do not send code mutation or multi-step (>3 rules) tasks to 'flash_lite'. Invoke a 'flash' subagent ('research' or 'implementer') instead."
-            )
+    target_meta = subagent_info if isinstance(subagent_info, dict) else (recipient_meta if recipient_type else None)
+    if isinstance(target_meta, dict):
+        target_tier = str(target_meta.get("model_tier") or "").strip().lower()
+        if not target_tier:
+            target_tier = infer_subagent_tier(target_meta.get("model"), recipient_type or target_meta.get("type"))
+        if target_tier == "lite":
+            if MUTATION_VERBS_RE.search(message) or len(NUMBERED_RULE_RE.findall(message)) > 3:
+                tier_map = get_model_tier_map()
+                lite_model = str(target_meta.get("model") or get_model_for_tier("lite", tier_map))
+                std_model = get_model_for_tier("standard", tier_map)
+                return _deny(
+                    f"Recipient '{recipient}' is a lite-tier ('{lite_model}', {target_meta.get('type', 'scout')}) subagent. "
+                    f"Do not send code mutation or multi-step (>3 rules) tasks to lite-tier ('{lite_model}') workers. "
+                    f"Invoke a standard-tier ('{std_model}') subagent ('research' or 'implementer') instead."
+                )
 
     parsed_allowed = _parse_allowed_files_header(message)
     if recipient_type == "implementer" and recipient_meta:
@@ -1072,7 +1096,7 @@ def _check_forbidden_direct_read(tool_name: str, args: Dict[str, Any]) -> Option
         action_desc = "list or read log or transcript directory/file" if tool_name in DIR_LIST_TOOLS else "read raw log or transcript file"
         return _deny(
             f"[ORCHESTRATOR GUARD] Context separation violation: root orchestrator cannot "
-            f"directly {action_desc} '{Path(target).name}'. Delegate log slicing to a 'scout' subagent (Model='flash_lite')."
+            f"directly {action_desc} '{Path(target).name}'. Delegate log slicing to a 'scout' subagent (Model='{get_model_for_tier('lite')}')."
         )
     return None
 
@@ -1169,10 +1193,11 @@ def _check_and_record_direct_budget(
         current_lines, current_bytes = budget.setdefault("read_lines", 0), budget.setdefault("read_bytes", 0)
         file_is_new = norm_target not in read_files
         if current_lines + lines_cost > MAX_DIRECT_READ_LINES or current_bytes + bytes_cost > MAX_DIRECT_READ_BYTES or (file_is_new and len(read_files) >= MAX_DIRECT_READ_FILES):
+            tier_map = get_model_tier_map()
             return _deny(
                 f"[ORCHESTRATOR GUARD] Direct execution fast-path read budget "
                 f"({MAX_DIRECT_READ_LINES} lines / {MAX_DIRECT_READ_BYTES} bytes / {MAX_DIRECT_READ_FILES} workspace files) exceeded when reading '{Path(norm_target).name}'. "
-                "Pass StartLine/EndLine for targeted inspection or delegate to a 'scout' (Model='flash_lite') or 'research' (Model='flash') subagent."
+                f"Pass StartLine/EndLine for targeted inspection or delegate to a 'scout' (Model='{get_model_for_tier('lite', tier_map)}') or 'research' (Model='{get_model_for_tier('standard', tier_map)}') subagent."
             )
         read_ranges.append(range_key)
         if file_is_new:
@@ -1190,13 +1215,13 @@ def _check_and_record_direct_budget(
         except (OSError, ValueError):
             return None
         if budget.get("test_runs_after_edit", 0) >= 1:
-            return _deny("[ORCHESTRATOR GUARD] Iterative edit-and-test loop detected in the orchestrator. Delegate multi-step code and test execution loops to an 'implementer' subagent (Model='flash').")
+            return _deny(f"[ORCHESTRATOR GUARD] Iterative edit-and-test loop detected in the orchestrator. Delegate multi-step code and test execution loops to an 'implementer' subagent (Model='{get_model_for_tier('standard')}').")
         mutated_files: List[str] = budget.setdefault("mutated_files", [])
         if norm_target not in mutated_files:
             if len(mutated_files) >= MAX_DIRECT_MUTATION_FILES:
                 return _deny(
                     f"[ORCHESTRATOR GUARD] Direct execution fast-path limit ({MAX_DIRECT_MUTATION_FILES} workspace files) exceeded "
-                    f"when editing '{Path(norm_target).name}'. Delegate multi-file changes to an 'implementer' subagent (Model='flash')."
+                    f"when editing '{Path(norm_target).name}'. Delegate multi-file changes to an 'implementer' subagent (Model='{get_model_for_tier('standard')}')."
                 )
             mutated_files.append(norm_target)
             _save_state(payload, state)
@@ -1213,7 +1238,7 @@ def _check_and_record_direct_budget(
             return None
         if budget.get("mutated_files", []) and (_is_test_command(cmd) or _is_declared_eval_command(cmd, state, payload)):
             if budget.get("test_runs_after_edit", 0) >= 1:
-                return _deny("[ORCHESTRATOR GUARD] Direct workspace edit followed by iterative test execution detected in the orchestrator. Delegate code and test execution loops to an 'implementer' subagent (Model='flash').")
+                return _deny(f"[ORCHESTRATOR GUARD] Direct workspace edit followed by iterative test execution detected in the orchestrator. Delegate code and test execution loops to an 'implementer' subagent (Model='{get_model_for_tier('standard')}').")
             budget["test_runs_after_edit"] = budget.get("test_runs_after_edit", 0) + 1
         commands: List[str] = budget.setdefault("commands", [])
         if len(commands) >= MAX_DIRECT_COMMANDS:

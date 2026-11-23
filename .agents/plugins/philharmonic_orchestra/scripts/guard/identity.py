@@ -20,6 +20,7 @@ from guard.constants import (
     STRICT_READONLY_SUBAGENT_TYPES,
     SUBAGENT_SPAWN_RE,
     UUID_RE,
+    infer_subagent_tier,
 )
 from guard.state_store import (
     _current_invocation_key,
@@ -182,12 +183,16 @@ def _is_parent_orchestrator(cid: str, state: Dict[str, Any]) -> bool:
 
 
 def _normalize_subagent_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize type/type_name, optional cohort/council fields, and active_worktree flag."""
+    """Normalize type/type_name, model_tier, optional cohort/council fields, and active_worktree flag."""
     normalized = dict(meta)
     if "type" in normalized and "type_name" not in normalized:
         normalized["type_name"] = normalized["type"]
     elif "type_name" in normalized and "type" not in normalized:
         normalized["type"] = normalized["type_name"]
+    if raw_tier := str(normalized.get("model_tier") or "").strip().lower():
+        normalized["model_tier"] = raw_tier
+    elif inferred := infer_subagent_tier(normalized.get("model"), normalized.get("type_name") or normalized.get("type")):
+        normalized["model_tier"] = inferred
     for field_name in ("candidate_id", "council_id", "council_role"):
         if meta.get(field_name) is not None:
             if val := str(meta[field_name]).strip():
@@ -724,6 +729,7 @@ def register_subagent(
     review_lens: Optional[str] = None, active_worktree: Optional[bool] = None,
     mode: Optional[str] = None, cohort: Optional[str] = None, eval_cmd: Optional[str] = None,
     candidate_id: Optional[str] = None, council_id: Optional[str] = None, council_role: Optional[str] = None,
+    model_tier: Optional[str] = None,
 ) -> None:
     """Helper for explicitly registering a subagent conversationId -> tier mapping."""
     with state_transaction(payload):
@@ -740,6 +746,7 @@ def register_subagent(
             ("review_lens", review_lens), ("mode", mode), ("cohort", cohort),
             ("eval_cmd", eval_cmd), ("candidate_id", candidate_id),
             ("council_id", council_id), ("council_role", council_role),
+            ("model_tier", model_tier),
         ):
             if val is not None:
                 record[key] = val
