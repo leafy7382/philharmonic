@@ -1,7 +1,6 @@
 """Subagent dispatch/messaging/swarm policies, direct execution fast-path budget, and workflow validation."""
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,7 +8,6 @@ import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from guard.ast_guard import _is_test_command
 from guard.constants import (
     ALLOWED_BEST_OF_N_TIERS,
     ALLOWED_COUNCIL_PROPOSER_TIERS,
@@ -79,14 +77,6 @@ from guard.path_guards import (
     _is_target_in_allowed_files,
     _parse_allowed_files_header,
     _resolve_cmd_target,
-)
-from guard.shell_targets import _validate_shell_allowlist
-from guard.shell_tokens import (
-    _is_declared_eval_command,
-    _is_safe_git_inspection_command,
-    _is_trivial_eval_command,
-    _is_unsafe_eval_command,
-    _split_shell_commands,
 )
 from guard.state_store import _current_invocation_key, _has_other_locked_path, _load_state, _save_state, state_transaction
 
@@ -316,6 +306,8 @@ def _compute_prompt_hash(prompt_text: str) -> str:
     """Return a short deterministic SHA-256 prefix for non-empty subagent prompts."""
     if not prompt_text:
         return ""
+    import hashlib
+
     return hashlib.sha256(str(prompt_text or "").encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
 
 
@@ -476,8 +468,11 @@ def _validate_and_prepare_subagent_entry(
         return _entry_deny(f"[ORCHESTRATOR GUARD] Blind judging violation: judge prompt leaks model identity ('{leak}'). Anonymize proposals before invoking judge.")
 
     eval_cmd = _parse_eval_cmd_header(prompt_text)
-    if eval_cmd is not None and _is_trivial_eval_command(eval_cmd):
-        return _entry_deny(f"[ORCHESTRATOR GUARD] Trivial or no-op EVAL_CMD rejected: '{eval_cmd}'. Provide a real test or evaluation script command.")
+    if eval_cmd is not None:
+        from guard.shell_tokens import _is_trivial_eval_command
+
+        if _is_trivial_eval_command(eval_cmd):
+            return _entry_deny(f"[ORCHESTRATOR GUARD] Trivial or no-op EVAL_CMD rejected: '{eval_cmd}'. Provide a real test or evaluation script command.")
 
     raw_model = str(entry.get("Model") or "").strip()
     workspace_mode = str(entry.get("Workspace") or "inherit").strip()
@@ -1009,8 +1004,11 @@ def _handle_swarm(payload: Dict[str, Any], args: Dict[str, Any], state: Dict[str
         workspace = str(args.get("workspace") or "inherit").strip()
 
         eval_cmd = _parse_eval_cmd_header(brief)
-        if eval_cmd is not None and _is_trivial_eval_command(eval_cmd):
-            return _deny(f"[ORCHESTRATOR GUARD] Trivial or no-op EVAL_CMD rejected in swarm: '{eval_cmd}'. Provide a real test or evaluation script command.")
+        if eval_cmd is not None:
+            from guard.shell_tokens import _is_trivial_eval_command
+
+            if _is_trivial_eval_command(eval_cmd):
+                return _deny(f"[ORCHESTRATOR GUARD] Trivial or no-op EVAL_CMD rejected in swarm: '{eval_cmd}'. Provide a real test or evaluation script command.")
 
         mode = _parse_mode_header(brief)
         cohort_id = _parse_cohort_header(brief)
@@ -1138,6 +1136,8 @@ def _check_and_record_direct_budget(
     tool_name: str,
     args: Dict[str, Any],
     state: Optional[Dict[str, Any]] = None,
+    *,
+    parsed: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """Enforce direct execution fast-path limits on the root orchestrator."""
     if state is None:
@@ -1157,10 +1157,13 @@ def _check_and_record_direct_budget(
                     f"'{Path(target).name}', which is outside plan ALLOWED_FILES ({', '.join(plan_allowed) if plan_allowed else 'NONE'})."
                 )
         elif tool_name == "run_command" and plan_allowed is not None:
+            from guard.shell_targets import _validate_shell_allowlist
+            from guard.shell_tokens import parse_shell_command
             raw_cwd = args.get("Cwd")
             cwd = raw_cwd if isinstance(raw_cwd, str) and raw_cwd else str(PROJECT_ROOT)
             cmd = args.get("CommandLine").strip() if isinstance(args.get("CommandLine"), str) else ""
-            return _validate_shell_allowlist(cmd, _split_shell_commands(cmd), cwd, plan_allowed, payload, allowlist_label="plan ALLOWED_FILES")
+            p = parsed if parsed is not None else parse_shell_command(cmd)
+            return _validate_shell_allowlist(cmd, [s.raw for s in p.subcmds], cwd, plan_allowed, payload, allowlist_label="plan ALLOWED_FILES", parsed=p)
         return None
 
     if tool_name in (DIR_LIST_TOOLS | SEARCH_TOOLS):
@@ -1228,18 +1231,22 @@ def _check_and_record_direct_budget(
         return None
 
     if tool_name == "run_command":
+        from guard.shell_tokens import _is_declared_eval_command, _is_safe_git_inspection_command, parse_shell_command
         raw_cmd = args.get("CommandLine")
         cmd = raw_cmd.strip() if isinstance(raw_cmd, str) else ""
-        if _is_safe_git_inspection_command(cmd):
+        p = parsed if parsed is not None else parse_shell_command(cmd)
+        if _is_safe_git_inspection_command(cmd, parsed=p):
             return None
         call_id = _extract_call_id(payload)
         seen_calls: List[str] = budget.setdefault("seen_calls", [])
         if call_id and call_id in seen_calls:
             return None
-        if budget.get("mutated_files", []) and (_is_test_command(cmd) or _is_declared_eval_command(cmd, state, payload)):
-            if budget.get("test_runs_after_edit", 0) >= 1:
-                return _deny(f"[ORCHESTRATOR GUARD] Direct workspace edit followed by iterative test execution detected in the orchestrator. Delegate code and test execution loops to an 'implementer' subagent (Model='{get_model_for_tier('standard')}').")
-            budget["test_runs_after_edit"] = budget.get("test_runs_after_edit", 0) + 1
+        if budget.get("mutated_files", []):
+            from guard.ast_guard import _is_test_command
+            if _is_test_command(cmd, parsed=p) or _is_declared_eval_command(cmd, state, payload, parsed=p):
+                if budget.get("test_runs_after_edit", 0) >= 1:
+                    return _deny(f"[ORCHESTRATOR GUARD] Direct workspace edit followed by iterative test execution detected in the orchestrator. Delegate code and test execution loops to an 'implementer' subagent (Model='{get_model_for_tier('standard')}').")
+                budget["test_runs_after_edit"] = budget.get("test_runs_after_edit", 0) + 1
         commands: List[str] = budget.setdefault("commands", [])
         if len(commands) >= MAX_DIRECT_COMMANDS:
             return _deny(
@@ -1255,6 +1262,8 @@ def _check_and_record_direct_budget(
 
 def _is_unsafe_declared_eval(ev: str) -> bool:
     """Return True if a declared EVAL_CMD contains mutating shell verbs, shell/exec wrappers, or awk/sed."""
+    from guard.shell_tokens import _is_unsafe_eval_command
+
     return _is_unsafe_eval_command(ev)
 
 
@@ -1277,10 +1286,13 @@ def _handle_run_workflow(
     raw_script = str(args.get("Script") or "")
     script_eval = _parse_eval_cmd_header(re.sub(r"(?m)^[ \t]*#+[ \t]*", "", raw_script)) if raw_script else None
     for candidate_eval in (desc_eval, script_eval):
-        if candidate_eval is not None and _is_trivial_eval_command(candidate_eval):
-            return _deny(f"[ORCHESTRATOR GUARD] Trivial or no-op EVAL_CMD rejected in run_workflow: '{candidate_eval}'. Provide a real test or evaluation script command.")
-        if candidate_eval is not None and _is_unsafe_declared_eval(candidate_eval):
-            return _deny(f"[ORCHESTRATOR GUARD] Unsafe mutating or wrapper EVAL_CMD rejected in run_workflow: '{candidate_eval}'.")
+        if candidate_eval is not None:
+            from guard.shell_tokens import _is_trivial_eval_command
+
+            if _is_trivial_eval_command(candidate_eval):
+                return _deny(f"[ORCHESTRATOR GUARD] Trivial or no-op EVAL_CMD rejected in run_workflow: '{candidate_eval}'. Provide a real test or evaluation script command.")
+            if _is_unsafe_declared_eval(candidate_eval):
+                return _deny(f"[ORCHESTRATOR GUARD] Unsafe mutating or wrapper EVAL_CMD rejected in run_workflow: '{candidate_eval}'.")
 
     cwd = args.get("Cwd")
     if cwd:

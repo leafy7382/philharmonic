@@ -3905,6 +3905,488 @@ class TestOrchestratorGuard(unittest.TestCase):
             )
             self.assertEqual(res_sw_dyn["decision"], "deny")
 
+    def test_lazy_import_isolation_fast_paths(self) -> None:
+        import subprocess
+
+        script_path = str(SCRIPT_DIR / "orchestrator_guard.py")
+        probe_code = (
+            "import io, json, pathlib, sys\n"
+            "mode, stdin_text, target = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+            "sys.argv = [target, mode]\n"
+            "sys.stdin = io.StringIO(stdin_text)\n"
+            "buf = io.StringIO()\n"
+            "orig_out = sys.stdout\n"
+            "sys.stdout = buf\n"
+            "try:\n"
+            "    src = pathlib.Path(target).read_text(encoding='utf-8')\n"
+            "    exec(compile(src, target, 'exec'), {'__name__': '__main__', '__file__': target})\n"
+            "finally:\n"
+            "    sys.stdout = orig_out\n"
+            "loaded = sorted(m for m in sys.modules if m == 'guard' or m.startswith('guard.') or m in {'subprocess', 'hashlib', 'tempfile', 'select'})\n"
+            "print(json.dumps({'loaded': loaded, 'output': buf.getvalue()}))\n"
+        )
+
+        def _probe(mode: str, payload_obj: object = None) -> tuple[set[str], dict]:
+            stdin_text = "" if payload_obj is None else json.dumps(payload_obj)
+            proc = subprocess.run(
+                [sys.executable, "-c", probe_code, mode, stdin_text, script_path],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=True,
+            )
+            data = json.loads(proc.stdout)
+            return set(data["loaded"]), json.loads(data["output"])
+
+        inactive_dir = Path(self.artifact_dir) / "lazy_inactive"
+        inactive_dir.mkdir(parents=True, exist_ok=True)
+        (inactive_dir / "orchestrator_state.json").write_text(
+            json.dumps({"active": False, "session_evaluated": True}),
+            encoding="utf-8",
+        )
+        active_dir = Path(self.artifact_dir) / "lazy_active"
+        active_dir.mkdir(parents=True, exist_ok=True)
+        (active_dir / "orchestrator_state.json").write_text(
+            json.dumps({"active": True, "session_evaluated": True, "root_conversation_id": "lazy-root"}),
+            encoding="utf-8",
+        )
+
+        common_forbidden = {"guard.shell_tokens", "guard.verification", "subprocess", "hashlib"}
+
+        loaded_doc, out_doc = _probe("doctor")
+        self.assertTrue(out_doc.get("healthy"))
+        self.assertTrue(loaded_doc.isdisjoint(common_forbidden | {"guard.policies", "guard.identity", "guard.state_store", "tempfile", "select"}))
+
+        loaded_status, out_status = _probe("status", {"artifactDirectoryPath": str(inactive_dir)})
+        self.assertFalse(out_status.get("active"))
+        self.assertTrue(loaded_status.isdisjoint(common_forbidden | {"guard.policies", "guard.identity", "tempfile"}))
+
+        loaded_preinv, out_preinv = _probe("pre-invocation", {"artifactDirectoryPath": str(inactive_dir), "isSubagent": False})
+        self.assertEqual(out_preinv, {})
+        self.assertTrue(loaded_preinv.isdisjoint(common_forbidden | {"guard.policies", "guard.subagent_policy", "guard.path_guards", "tempfile", "select"}))
+
+        loaded_pretool_inactive, out_pretool_inactive = _probe(
+            "pre-tool",
+            {
+                "artifactDirectoryPath": str(inactive_dir),
+                "toolCall": {"name": "run_command", "args": {"CommandLine": "echo hi"}},
+            },
+        )
+        self.assertEqual(out_pretool_inactive.get("decision"), "allow")
+        self.assertTrue(
+            loaded_pretool_inactive.isdisjoint(
+                common_forbidden | {"guard.shell_targets", "guard.root_allowlist", "guard.ast_guard", "guard.subagent_policy", "guard.path_guards", "tempfile", "select"}
+            )
+        )
+
+        loaded_pretool_nonshell, out_pretool_nonshell = _probe(
+            "pre-tool",
+            {
+                "artifactDirectoryPath": str(active_dir),
+                "conversationId": "lazy-root",
+                "workspacePaths": [str(orchestrator_guard.PROJECT_ROOT)],
+                "toolCall": {"name": "list_dir", "args": {"DirectoryPath": str(orchestrator_guard.PROJECT_ROOT)}},
+            },
+        )
+        self.assertEqual(out_pretool_nonshell.get("decision"), "allow")
+        self.assertTrue(
+            loaded_pretool_nonshell.isdisjoint(
+                common_forbidden | {"guard.shell_targets", "guard.root_allowlist", "guard.ast_guard", "select"}
+            )
+        )
+
+    def test_parse_shell_command_ir_and_single_pass_caching(self) -> None:
+        from unittest import mock
+        import guard.shell_tokens as st
+
+        st.parse_shell_command.cache_clear()
+        cmd1 = "FOO=1 git status && pytest -q > out.log | head -n 5"
+        p1 = st.parse_shell_command(cmd1)
+        self.assertIsInstance(p1, st.ParsedCommand)
+        self.assertIs(p1, st.parse_shell_command(cmd1))
+        self.assertEqual(len(p1.subcmds), 3)
+        self.assertIsInstance(p1.subcmds[0], st.ParsedSubcmd)
+        self.assertEqual(p1.redir_targets, ("out.log",))
+        self.assertFalse(p1.has_masking or p1.has_or or p1.has_cmd_subst or p1.has_unclosed or p1.has_nul_surr)
+
+        s0, s1, s2 = p1.subcmds
+        self.assertIsNone(s0.prec_delim)
+        self.assertEqual(s0.next_delim, "&&")
+        self.assertEqual(s0.env_assigns, (("FOO", False, "1"),))
+        self.assertEqual(s0.stripped_env, "git status")
+        self.assertEqual((s0.verb, s0.raw_verb, s0.args, s0.is_piped_in), ("git", "git", ("status",), False))
+        self.assertEqual((s1.prec_delim, s1.next_delim, s1.verb, s1.args, s1.redir_targets, s1.is_piped_in), ("&&", "|", "pytest", ("-q",), ("out.log",), False))
+        self.assertEqual((s2.prec_delim, s2.next_delim, s2.verb, s2.args, s2.is_piped_in), ("|", None, "head", ("-n", "5"), True))
+
+        p_bg = st.parse_shell_command("pytest -q &")
+        self.assertTrue(p_bg.has_masking)
+        self.assertEqual(len(p_bg.subcmds), 1)
+        self.assertEqual(p_bg.subcmds[0].next_delim, "&")
+
+        p_or = st.parse_shell_command("pytest -q || true")
+        self.assertTrue(p_or.has_or and p_or.has_masking)
+        self.assertEqual(p_or.subcmds[1].prec_delim, "||")
+
+        p_subst = st.parse_shell_command('echo "$(whoami)"')
+        self.assertTrue(p_subst.has_cmd_subst)
+        self.assertEqual(p_subst.unquoted, 'echo ""')
+
+        self.assertTrue(st.parse_shell_command("echo 'unterminated").has_unclosed)
+        p_sub = st.parse_shell_command("(cd tests && cat < in.txt)")
+        self.assertEqual((p_sub.subcmds[0].subshell_opens, p_sub.subcmds[1].subshell_closes, p_sub.subcmds[1].has_in_redir), (1, 1, True))
+
+        orchestrator_guard._cli_activate(self.base_payload)
+        st.parse_shell_command.cache_clear()
+        with mock.patch.object(st, "_preprocess_shell_heredocs_and_comments", wraps=st._preprocess_shell_heredocs_and_comments) as spy_pre, mock.patch.object(
+            st, "_split_shell_tokens_raw_with_meta", wraps=st._split_shell_tokens_raw_with_meta
+        ) as spy_tok:
+            res = self._pre("run_command", self._cmd_args("git status && pytest -q"), call_id="ir_single_pass")
+            self.assertEqual(res["decision"], "allow")
+            self.assertEqual(spy_pre.call_count, 1)
+            self.assertEqual(spy_tok.call_count, 2)
+            res_cached = self._pre("run_command", self._cmd_args("git status && pytest -q"), call_id="ir_single_pass")
+            self.assertEqual(res_cached["decision"], "allow")
+            self.assertEqual(spy_pre.call_count, 1)
+            self.assertEqual(spy_tok.call_count, 2)
+
+        st.parse_shell_command.cache_clear()
+        with mock.patch.object(st, "_preprocess_shell_heredocs_and_comments", wraps=st._preprocess_shell_heredocs_and_comments) as spy_pre2, mock.patch.object(
+            st, "_split_shell_tokens_raw_with_meta", wraps=st._split_shell_tokens_raw_with_meta
+        ) as spy_tok2:
+            res2 = self._pre("run_command", self._cmd_args("cd tests && pytest -q | head -n 5"), call_id="ir_pipe_pass")
+            self.assertEqual(res2["decision"], "allow")
+            self.assertEqual(spy_pre2.call_count, 1)
+            self.assertEqual(spy_tok2.call_count, 3)
+
+    def test_walk_cli_flags_and_fail_closed_shell_narrowing(self) -> None:
+        import guard.ast_guard as guard_ast
+        import guard.shell_tokens as st
+        import guard.verification as guard_verification
+
+        # 1. Unified FlagSpec / walk_cli_flags coverage
+        res = st.walk_cli_flags(
+            ["--out=a.txt", "--dir", "sub", "-ftout_dir", "-ft", "dir2", "-t=d", "--", "-literal"],
+            st.FlagSpec(val_opts=frozenset({"--out", "--dir", "-t"}), short_val_chars="t"),
+        )
+        self.assertEqual(res.positionals, ("-literal",))
+        self.assertEqual(res.opt_pairs, (("--out", "a.txt"), ("--dir", "sub"), ("-t", "out_dir"), ("-t", "dir2"), ("-t", "=d")))
+        self.assertFalse(res.bad_hit or res.missing_value)
+
+        r_pos = st.walk_cli_flags(["-n", "5", "pytest", "-q"], st.FlagSpec(val_opts=frozenset({"-n"}), short_val_chars="n", stop_at_first_pos=True))
+        self.assertEqual((r_pos.rest_index, r_pos.positionals, r_pos.opt_pairs), (2, (), (("-n", "5"),)))
+        r_dd = st.walk_cli_flags(["-n", "5", "--", "pytest"], st.FlagSpec(val_opts=frozenset({"-n"}), short_val_chars="n", stop_at_first_pos=True))
+        self.assertEqual((r_dd.rest_index, r_dd.flags_seen), (3, ("-n", "--")))
+
+        bad_spec = st.FlagSpec(bad_opts=frozenset({"--fix"}), bad_short_chars="i")
+        self.assertTrue(st.walk_cli_flags(["--fix", "a.py"], bad_spec).bad_hit)
+        self.assertTrue(st.walk_cli_flags(["-fi", "a.py"], bad_spec).bad_hit)
+        self.assertFalse(st.walk_cli_flags(["--", "-i", "--fix"], bad_spec).bad_hit)
+        self.assertTrue(st.walk_cli_flags(["-o"], st.FlagSpec(val_opts=frozenset({"-o"}), short_val_chars="o")).missing_value)
+        self.assertTrue(st.walk_cli_flags(["-uo"], st.FlagSpec(short_val_chars="o")).missing_value)
+
+        # 2. Fail-closed narrowing: $'...', pushd/popd, (...) subshells, unquoted <<EOF vs quoted <<'EOF'
+        orchestrator_guard._cli_activate(self.base_payload)
+        self._reg_sub("scout", "narrow-scout", "flash_lite")
+        self._reg_sub("implementer", "narrow-impl", "flash", allowed_files=["src/allowed.py"])
+        cwd = str(orchestrator_guard.PROJECT_ROOT)
+        roots = [orchestrator_guard.PROJECT_ROOT]
+
+        # ANSI-C $'...'
+        self.assertTrue(st.parse_shell_command("echo $'hello'").has_ansi_c)
+        self.assertFalse(st.parse_shell_command("echo \"$'literal'\"").has_ansi_c)
+        for cid in (None, "narrow-scout", "narrow-impl"):
+            self.assertEqual(self._pre("run_command", {"CommandLine": "echo $'hello'"}, cid=cid)["decision"], "deny")
+        self.assertFalse(guard_ast._is_test_command("pytest $'-q'"))
+        self.assertFalse(orchestrator_guard._command_stays_in_workspace("echo $'hello'", cwd, roots))
+
+        # pushd / popd
+        for pp_cmd in ("pushd src", "popd", "pushd src && touch src/allowed.py && popd"):
+            self.assertEqual(self._pre("run_command", {"CommandLine": pp_cmd}, cid="narrow-impl")["decision"], "deny")
+            self.assertFalse(orchestrator_guard._command_stays_in_workspace(pp_cmd, cwd, roots))
+        self.assertEqual(self._pre("run_command", {"CommandLine": "pushd tests && pytest"})["decision"], "deny")
+        self.assertTrue(guard_verification._has_unsafe_test_cwd("pushd tests && pytest", cwd, self.base_payload))
+        self.assertTrue(guard_verification._has_unsafe_test_cwd("popd && pytest", cwd, self.base_payload))
+
+        # (...) subshells
+        self.assertTrue(st.parse_shell_command("(ls)").has_subshell)
+        self.assertFalse(st.parse_shell_command('git commit -m "fix (bug)"').has_subshell)
+        p_csub = st.parse_shell_command("echo $(whoami)")
+        self.assertFalse(p_csub.has_subshell)
+        self.assertTrue(p_csub.has_cmd_subst)
+        self.assertEqual(self._pre("run_command", {"CommandLine": "(git status)"})["decision"], "deny")
+        self.assertEqual(self._pre("run_command", {"CommandLine": "(touch src/allowed.py)"}, cid="narrow-impl")["decision"], "deny")
+        self.assertFalse(guard_ast._is_test_command("(pytest -q)"))
+        self.assertFalse(orchestrator_guard._command_stays_in_workspace("(ls)", cwd, roots))
+        self.assertTrue(guard_verification._has_unsafe_test_cwd("(cd tests && pytest)", cwd, self.base_payload))
+
+        # Unquoted <<EOF (denied) vs quoted <<'EOF' (allowed for scoped implementer)
+        unq_hd = "cat <<EOF\nhello\nEOF"
+        q_hd = "cat <<'EOF'\nhello\nEOF"
+        self.assertTrue(st.parse_shell_command(unq_hd).has_heredoc_subst)
+        self.assertFalse(st.parse_shell_command(q_hd).has_heredoc_subst)
+        self.assertEqual(self._pre("run_command", {"CommandLine": unq_hd})["decision"], "deny")
+        self.assertEqual(self._pre("run_command", {"CommandLine": unq_hd}, cid="narrow-impl")["decision"], "deny")
+        self.assertEqual(self._pre("run_command", {"CommandLine": q_hd}, cid="narrow-impl")["decision"], "allow")
+
+    def test_security_review_fixes_and_regressions(self) -> None:
+        import guard.ast_guard as guard_ast
+        import guard.shell_targets as guard_shell_targets
+        import guard.shell_tokens as st
+
+        orchestrator_guard._cli_activate(self.base_payload)
+        self._reg_sub("scout", "sec-scout", "flash_lite")
+        self._reg_sub("implementer", "sec-impl", "flash", allowed_files=["src/allowed.py"])
+
+        # 1. <<< here-string must NOT swallow subsequent lines as a << heredoc
+        hs_cmd = "cat <<< 't'\nrm -rf .\nt"
+        p_hs = st.parse_shell_command(hs_cmd)
+        self.assertIn("rm -rf .", [s.raw for s in p_hs.subcmds])
+        self.assertEqual(self._pre("run_command", {"CommandLine": hs_cmd})["decision"], "deny")
+        self.assertEqual(self._pre("run_command", {"CommandLine": hs_cmd}, cid="sec-impl")["decision"], "deny")
+
+        # 2. -- flag-smuggling desync & unittest -s/tmp/x + jest -- /tmp/t.js
+        for bad_root in (
+            "rg -e -- --pre=sh README.md",
+            "sort -T -- -o x.py README.md",
+            "pylint --msg-template -- --init-hook=x",
+            "ruff check --exclude -- --fix",
+            "go test -run -- -exec sh",
+            "jest -t -- --globalSetup=x",
+            "cargo test --package -- --manifest-path x",
+            "jest -- /tmp/t.js",
+            "python3 -m unittest discover -s/tmp/x",
+        ):
+            self.assertEqual(self._pre("run_command", {"CommandLine": bad_root})["decision"], "deny", f"Root must deny {bad_root!r}")
+        for bad_eval in (
+            "rg -e -- --pre=sh README.md", "sort -T -- -o x.py README.md",
+            "find . -name -- -delete", "find . -name -- -exec sh -c id +",
+            "find -- . -exec sh -c id \\;", "curl -d -- -o x",
+        ):
+            self.assertTrue(st._is_unsafe_eval_command(bad_eval), f"_is_unsafe_eval_command must reject {bad_eval!r}")
+        for bad_find in ("find . -name -- -delete", "find -- . -exec sh -c id \\;"):
+            self.assertEqual(self._pre("run_command", {"CommandLine": bad_find}, cid="sec-impl")["decision"], "deny")
+        for bad_test in ("go test -run -- -exec sh", "jest -t -- --globalSetup=x", "cargo test --package -- --manifest-path x", "jest -- /tmp/t.js", "python3 -m unittest discover -s/tmp/x"):
+            self.assertFalse(guard_ast._is_test_command(bad_test), f"_is_test_command must reject {bad_test!r}")
+
+        # 3. pytest --cov must NOT swallow following flag
+        for bad_cov in ("pytest --cov --junitxml=out.xml", "pytest --cov -o addopts=x", "pytest --cov -c x.ini", "pytest --cov -p no:x"):
+            self.assertFalse(guard_ast._is_test_command(bad_cov), f"_is_test_command must reject {bad_cov!r}")
+            self.assertEqual(self._pre("run_command", {"CommandLine": bad_cov})["decision"], "deny")
+
+        # 4. GNU long-option prefix abbreviations
+        for bad_gnu in ("env --split=sh", "time --out=x true", "sort --out=x README.md"):
+            self.assertEqual(self._pre("run_command", {"CommandLine": bad_gnu})["decision"], "deny", f"Root must deny {bad_gnu!r}")
+            self.assertEqual(self._pre("run_command", {"CommandLine": bad_gnu}, cid="sec-impl")["decision"], "deny", f"Impl must deny {bad_gnu!r}")
+        self.assertEqual(guard_shell_targets._extract_shell_write_targets("cp --target=d a", ["cp --target=d a"])[0], ["d"])
+        self.assertEqual(guard_shell_targets._extract_shell_write_targets("chown --ref=f a", ["chown --ref=f a"])[0], ["a"])
+        for bad_sed in ("sed --in 's/a/b/' src/other.py", "sed --exp '1e id' src/allowed.py"):
+            self.assertEqual(self._pre("run_command", {"CommandLine": bad_sed}, cid="sec-impl")["decision"], "deny", f"Impl must deny {bad_sed!r}")
+
+        # 5. uv/poetry --version preserved & uv run -w=./evil rejected
+        for meta_cmd in ("uv --version", "poetry --version"):
+            pm = st.parse_shell_command(meta_cmd)
+            self.assertEqual((pm.subcmds[0].args, pm.subcmds[0].unwrap_unv), (("--version",), False))
+            self.assertEqual(self._pre("run_command", {"CommandLine": meta_cmd}, cid="sec-impl")["decision"], "allow")
+        self.assertTrue(st.parse_shell_command("uv run -w=./evil echo hi").subcmds[0].unwrap_unv)
+        self.assertEqual(self._pre("run_command", {"CommandLine": "uv run -w=./evil echo hi"})["decision"], "deny")
+        self.assertEqual(self._pre("run_command", {"CommandLine": "uv run -w=./evil echo hi"}, cid="sec-impl")["decision"], "deny")
+
+        # 6. _extract_shell_write_targets eff_p fallback checks IR flags when cmd == ""
+        self.assertTrue(guard_shell_targets._extract_shell_write_targets("", ["echo $'hi'"])[1])
+
+        # 7. git tag -- foo denied vs git tag -l -- 'v*' allowed
+        self.assertEqual(self._pre("run_command", {"CommandLine": "git tag -- foo"})["decision"], "deny")
+        self.assertEqual(self._pre("run_command", {"CommandLine": "git tag -- foo"}, cid="sec-scout")["decision"], "deny")
+        self.assertEqual(self._pre("run_command", {"CommandLine": "git tag -l -- 'v*'"})["decision"], "allow")
+        self.assertEqual(self._pre("run_command", {"CommandLine": "git tag -l -- 'v*'"}, cid="sec-scout")["decision"], "allow")
+
+        # 8. _is_test_command rejects cmd substitution
+        self.assertFalse(guard_ast._is_test_command("pytest $(echo -V)"))
+
+        # 9. git push ENAMETOOLONG fails closed cleanly
+        long_remote = "a" * 300
+        self.assertEqual(self._pre("run_command", {"CommandLine": f"git push {long_remote} main"})["decision"], "deny")
+
+        # 10. Backslash-escaped quoting & trailing } preservation
+        self.assertEqual(st._extract_shell_redir_targets(r"echo hi > \&1"), ["&1"])
+        self.assertEqual(guard_shell_targets._extract_shell_write_targets(r"rm \2>/dev/null", [r"rm \2>/dev/null"])[0], ["2"])
+        self.assertEqual(st._extract_shell_redir_targets("echo x > a.py}"), ["a.py}"])
+        self.assertEqual(self._pre("run_command", {"CommandLine": "echo x > src/allowed.py}"}, cid="sec-impl")["decision"], "deny")
+
+        # 11. Mutating formatters, ANSI-C NUL/surrogate regex, and \\\r\n continuation folding
+        for mut_fmt in ("black foo.py", "isort foo.py", "ruff format foo.py"):
+            self.assertEqual(self._pre("run_command", {"CommandLine": mut_fmt})["decision"], "deny", f"Root must deny {mut_fmt!r}")
+        for idx, ok_fmt in enumerate(("black --check foo.py", "isort --check foo.py", "ruff format --check foo.py"), start=10):
+            self.assertEqual(self._pre("run_command", {"CommandLine": ok_fmt}, invocationNum=idx)["decision"], "allow", f"Root should allow {ok_fmt!r}")
+        for bad_ansi in ("$'\\x0'", "$'\\u0000'", "$'\\Ud800'", "$'\\0007'", "$'\\U0'"):
+            self.assertTrue(st._has_nul_or_surrogate_input(bad_ansi), f"Should detect NUL/surrogate in {bad_ansi!r}")
+        self.assertFalse(st._has_nul_or_surrogate_input("$'\\x01'"))
+        self.assertEqual(st._fold_shell_line_continuations("echo a\\\nb"), "echo ab")
+        self.assertEqual(st._fold_shell_line_continuations('echo "a\\\nb"'), 'echo "ab"')
+        self.assertEqual(st._fold_shell_line_continuations("echo 'a\\\nb'"), "echo 'a\\\nb'")
+        self.assertEqual(len(st.parse_shell_command("echo ok \\\r\nevil").subcmds), 2)
+
+    def test_round2_security_and_precision_fixes(self) -> None:
+        import guard.ast_guard as guard_ast
+        import guard.shell_targets as guard_shell_targets
+        import guard.shell_tokens as st
+
+        orchestrator_guard._cli_activate(self.base_payload)
+        self._reg_sub("scout", "r2-scout", "flash_lite")
+        self._reg_sub("implementer", "r2-impl", "flash", allowed_files=["src/allowed.py", "dir2"])
+
+        # 1. \\\r\n & "...\\\r..." bash parity
+        crlf_cmd = "echo ok \\\r\nevil"
+        self.assertEqual([s.verb for s in st.parse_shell_command(crlf_cmd).subcmds], ["echo", "evil"])
+        self.assertEqual(self._pre("run_command", {"CommandLine": crlf_cmd})["decision"], "deny")
+        hd_cr = 'cat << "a\\\rb"\na\\\rb\nrm -rf .\na\rb'
+        self.assertIn("rm -rf .", [s.raw for s in st.parse_shell_command(hd_cr).subcmds])
+        self.assertEqual(self._pre("run_command", {"CommandLine": hd_cr}, cid="r2-impl")["decision"], "deny")
+
+        # 2. <> read-write redirection operator
+        rw_cmd = "<> /tmp/echo sh -c x"
+        p_rw = st.parse_shell_command(rw_cmd)
+        self.assertEqual(p_rw.redir_targets, ("/tmp/echo",))
+        self.assertEqual(p_rw.subcmds[0].verb, "sh")
+        self.assertEqual(self._pre("run_command", {"CommandLine": rw_cmd})["decision"], "deny")
+        self.assertEqual(self._pre("run_command", {"CommandLine": rw_cmd}, cid="r2-impl")["decision"], "deny")
+
+        # 3. Dangerous config/cache env vars
+        for env_k in ("RIPGREP_CONFIG_PATH=x", "PYLINTRC=x", "TOX_OVERRIDE=x", "MYPY_CACHE_DIR=x", "RUFF_CACHE_DIR=x"):
+            self.assertTrue(st._is_dangerous_env_assignment(env_k), f"Must flag {env_k!r}")
+            self.assertEqual(self._pre("run_command", {"CommandLine": f"{env_k} ls"})["decision"], "deny")
+
+        # 4. Path-qualified verb spoofing (/tmp/ls, /tmp/env ls, find -exec /tmp/ls, xargs /tmp/ls)
+        for spoof in ("/tmp/ls", "/tmp/env ls", "find . -exec /tmp/ls {} +", "xargs /tmp/ls"):
+            self.assertEqual(self._pre("run_command", {"CommandLine": spoof})["decision"], "deny", f"Root must deny {spoof!r}")
+            self.assertEqual(self._pre("run_command", {"CommandLine": spoof}, cid="r2-impl")["decision"], "deny", f"Impl must deny {spoof!r}")
+
+        # 5. git branch/tag optional-arg flags & git grep --open=sh
+        for bad_git in ("git branch --color -D --abbrev main", "git tag -n -d -n v1", "git grep --open=sh foo"):
+            self.assertEqual(self._pre("run_command", {"CommandLine": bad_git})["decision"], "deny", f"Root must deny {bad_git!r}")
+            self.assertEqual(self._pre("run_command", {"CommandLine": bad_git}, cid="r2-scout")["decision"], "deny", f"Scout must deny {bad_git!r}")
+
+        # 6. ast_guard test-runner hardening
+        for bad_test in (
+            "python3 -m unittest discover -k -- -s/tmp/x",
+            "python3 -m unittest discover --start=/tmp/x",
+            "python3 -m unittest discover --start-dir=/tmp/x",
+            "unittest discover -s /tmp/x",
+            "pytest --junitx=x",
+            "pytest /tmp/t*.py",
+            'pytest "$(echo -V)"',
+            "nox -f evil.py",
+        ):
+            self.assertFalse(guard_ast._is_test_command(bad_test), f"_is_test_command must reject {bad_test!r}")
+            self.assertEqual(self._pre("run_command", {"CommandLine": bad_test})["decision"], "deny", f"Root must deny {bad_test!r}")
+        self.assertTrue(st._is_trivial_eval_command("pytest $(echo -V)"))
+
+        # 7. Formatter & linter hardening
+        for bad_lint in (
+            "black --exclude --check foo.py",
+            "ruff format --exclude --check foo.py",
+            "isort --skip --check foo.py",
+            "isort -sc foo.py",
+            "mypy --python-executable ./a.sh foo.py",
+            "ruff check --fix-only foo.py",
+            "ruff --config pyproject.toml format foo.py",
+        ):
+            self.assertEqual(self._pre("run_command", {"CommandLine": bad_lint})["decision"], "deny", f"Root must deny {bad_lint!r}")
+            self.assertEqual(self._pre("run_command", {"CommandLine": bad_lint}, cid="r2-impl")["decision"], "deny", f"Impl must deny {bad_lint!r}")
+
+        # 8. install --strip-program / -d, sed newline in [...], and xargs --process-slot-var
+        self.assertTrue(guard_shell_targets._extract_shell_write_targets("install --strip-program=python3 a b", ["install --strip-program=python3 a b"])[1])
+        self.assertEqual(guard_shell_targets._extract_shell_write_targets("install -d dir1 dir2", ["install -d dir1 dir2"])[0], ["dir1", "dir2"])
+        for bad_impl in (
+            "install --strip-program=python3 src/allowed.py dir2",
+            "install -d dir1 dir2",
+            "sed -i 's/[a[:]/id/e\n# :]]/x/p' src/allowed.py",
+            "xargs --process-slot-var cat sh",
+        ):
+            self.assertEqual(self._pre("run_command", {"CommandLine": bad_impl}, cid="r2-impl")["decision"], "deny", f"Impl must deny {bad_impl!r}")
+
+    def test_round3_final_security_polish(self) -> None:
+        import guard.ast_guard as guard_ast
+        import guard.shell_targets as guard_shell_targets
+        import guard.shell_tokens as st
+
+        orchestrator_guard._cli_activate(self.base_payload)
+        self._reg_sub("scout", "r3-scout", "flash_lite")
+        self._reg_sub("implementer", "r3-impl", "flash", allowed_files=["src/allowed.py"])
+
+        # 1. Raw \r fail-closed
+        cr_hd = "cat <<'a'\r\na\r\nrm -rf .\na"
+        cr_mkdir = f"mkdir {self.artifact_dir}/scratch/d.md\r"
+        self.assertTrue(st.parse_shell_command(cr_hd).has_unclosed)
+        self.assertTrue(st.parse_shell_command(cr_mkdir).has_unclosed)
+        for cr_cmd in (cr_hd, cr_mkdir):
+            self.assertEqual(self._pre("run_command", {"CommandLine": cr_cmd})["decision"], "deny")
+            self.assertEqual(self._pre("run_command", {"CommandLine": cr_cmd}, cid="r3-impl")["decision"], "deny")
+
+        # 2. Complete _is_canonical_cmd_path coverage + git diff --ext-d
+        for spoof in (
+            "/tmp/rg foo",
+            "/tmp/cd .",
+            "/tmp/sed 's/a/b/' src/allowed.py",
+            "/tmp/python3 .agents/plugins/philharmonic_orchestra/scripts/orchestrator_guard.py doctor",
+            "/tmp/git status",
+        ):
+            self.assertEqual(self._pre("run_command", {"CommandLine": spoof})["decision"], "deny", f"Root must deny {spoof!r}")
+            self.assertEqual(self._pre("run_command", {"CommandLine": spoof}, cid="r3-impl")["decision"], "deny", f"Impl must deny {spoof!r}")
+        self.assertTrue(st._advance_effective_cwd("/tmp/cd .", str(orchestrator_guard.PROJECT_ROOT))[2])
+        self.assertTrue(st._is_unsafe_eval_command("/tmp/rg foo"))
+        self.assertFalse(st._is_safe_git_inspection_command("/tmp/git status"))
+        self.assertFalse(st._is_safe_git_inspection_command("git diff --ext-d"))
+        self.assertEqual(self._pre("run_command", {"CommandLine": "git diff --ext-d"})["decision"], "deny")
+
+        # 3. xargs =-only optional-arg flags
+        for bad_xargs in ("xargs --eof rm -rf echo", "xargs --replace gawk -E /tmp/e.awk echo"):
+            self.assertTrue(guard_shell_targets._extract_shell_write_targets(bad_xargs, [bad_xargs])[1])
+            self.assertEqual(self._pre("run_command", {"CommandLine": bad_xargs}, cid="r3-impl")["decision"], "deny")
+
+        # 4. sed a/i/c multiline backslash fail-closed
+        bad_sed_a = "sed -i 'a\\\ne id' src/allowed.py"
+        self.assertTrue(guard_shell_targets._extract_shell_write_targets(bad_sed_a, [bad_sed_a])[1])
+        self.assertEqual(self._pre("run_command", {"CommandLine": bad_sed_a}, cid="r3-impl")["decision"], "deny")
+
+        # 5. git branch/tag mandatory vs optional-arg flags & git fsck --lost
+        for bad_git in (
+            "git branch --contains --unset-upstream",
+            "git branch --merged --set-upstream-to=x",
+            "git fsck --lost",
+            "git branch --format -l evil",
+            "git tag --format -l evil",
+            "git tag --format -l -- evil",
+        ):
+            self.assertEqual(self._pre("run_command", {"CommandLine": bad_git})["decision"], "deny", f"Root must deny {bad_git!r}")
+            self.assertEqual(self._pre("run_command", {"CommandLine": bad_git}, cid="r3-scout")["decision"], "deny", f"Scout must deny {bad_git!r}")
+        for idx, ok_git in enumerate(("git branch --format '%(refname:short)'", "git branch --contains main"), start=20):
+            self.assertEqual(self._pre("run_command", {"CommandLine": ok_git}, invocationNum=idx)["decision"], "allow", f"Root should allow {ok_git!r}")
+            self.assertEqual(self._pre("run_command", {"CommandLine": ok_git}, cid="r3-scout", invocationNum=idx)["decision"], "allow", f"Scout should allow {ok_git!r}")
+
+        # 6. Additional mutating/output linter flags
+        for bad_lint in (
+            "ruff check --add-noqa foo.py",
+            "mypy --junit-xml out.xml foo.py",
+            "mypy --html-report dir foo.py",
+            "mypy --custom-typeshed-dir d foo.py",
+            "pylint -f text:out.txt foo.py",
+            "pylint --output-format=json:out.txt foo.py",
+        ):
+            self.assertEqual(self._pre("run_command", {"CommandLine": bad_lint})["decision"], "deny", f"Root must deny {bad_lint!r}")
+            self.assertEqual(self._pre("run_command", {"CommandLine": bad_lint}, cid="r3-impl")["decision"], "deny", f"Impl must deny {bad_lint!r}")
+
+        # 7. ast_guard globbed /tmp, /dev/shm, tox --root, cargo test --config
+        for bad_test in (
+            "pytest /tm?/t.py",
+            "python3 -m unittest discover -s /tm?",
+            "pytest /dev/shm/t.py",
+            "tox --root /tmp",
+            "cargo test --config x",
+        ):
+            self.assertFalse(guard_ast._is_test_command(bad_test), f"_is_test_command must reject {bad_test!r}")
+            self.assertEqual(self._pre("run_command", {"CommandLine": bad_test})["decision"], "deny", f"Root must deny {bad_test!r}")
+
 
 if __name__ == "__main__":
     unittest.main()

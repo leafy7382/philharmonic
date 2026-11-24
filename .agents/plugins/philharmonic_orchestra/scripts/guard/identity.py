@@ -75,10 +75,13 @@ def _allowed_roots(payload: Dict[str, Any]) -> List[Path]:
 
 def _is_within_allowed_roots(target: Optional[str], roots: List[Path]) -> bool:
     """Return True if target resolves inside any root in roots."""
-    from guard.shell_tokens import _has_nul_or_surrogate_input
-
-    if not isinstance(target, str) or not target or _has_nul_or_surrogate_input(target):
+    if not isinstance(target, str) or not target or "\x00" in target or any(0xD800 <= ord(ch) <= 0xDFFF for ch in target):
         return False
+    if "$" in target and "'" in target:
+        from guard.shell_tokens import _has_nul_or_surrogate_input
+
+        if _has_nul_or_surrogate_input(target):
+            return False
     try:
         resolved = Path(os.path.expanduser(target)).resolve()
     except (OSError, ValueError, TypeError):
@@ -86,17 +89,12 @@ def _is_within_allowed_roots(target: Optional[str], roots: List[Path]) -> bool:
     return any(resolved == r or r in resolved.parents for r in roots)
 
 
-def _command_stays_in_workspace(command_line: str, cwd: str, roots: List[Path]) -> bool:
+def _command_stays_in_workspace(command_line: str, cwd: str, roots: List[Path], *, parsed: Optional[Any] = None) -> bool:
     """Return True unless the command targets obvious paths outside allowed roots."""
-    from guard.shell_tokens import (
-        _advance_effective_cwd,
-        _has_nul_or_surrogate_input,
-        _split_shell_commands,
-        _split_shell_tokens,
-        _unquoted_subshell_opens_closes,
-    )
+    from guard.shell_tokens import _advance_effective_cwd, parse_shell_command
 
-    if _has_nul_or_surrogate_input(command_line):
+    p = parsed if parsed is not None else parse_shell_command(command_line)
+    if p.has_nul_surr or p.has_ansi_c or p.has_subshell:
         return False
 
     try:
@@ -146,17 +144,15 @@ def _command_stays_in_workspace(command_line: str, cwd: str, roots: List[Path]) 
         except (OSError, ValueError):
             return False
 
-    cur_dir, dir_stack, subshell_stack = str(base_dir), [], []
-    for subcmd in _split_shell_commands(command_line) or [command_line]:
-        opens, closes = _unquoted_subshell_opens_closes(subcmd)
-        subshell_stack.extend((cur_dir, list(dir_stack)) for _ in range(opens))
-        new_cwd, is_cd, cd_unv = _advance_effective_cwd(subcmd, cur_dir, dir_stack)
+    cur_dir = str(base_dir)
+    for sub in p.subcmds:
+        new_cwd, is_cd, cd_unv = _advance_effective_cwd(sub.raw, cur_dir, None, parsed_sub=sub)
         if is_cd:
             if cd_unv or not _in_bounds(new_cwd, allow_sys=True):
                 return False
             cur_dir = new_cwd
         else:
-            toks = _split_shell_tokens(subcmd)
+            toks = [tok for tok, _, _ in sub.raw_tokens]
             cmd_verb = next(
                 (posixpath.basename(t).lower() for t in toks
                  if t not in {"(", "{", "!", "if", "then", "elif", "else", "while", "until", "do"}
@@ -165,9 +161,6 @@ def _command_stays_in_workspace(command_line: str, cwd: str, roots: List[Path]) 
             )
             if any(not _tok_ok(tok, Path(cur_dir), cmd_verb) for tok in toks):
                 return False
-        for _ in range(closes):
-            if subshell_stack:
-                cur_dir, dir_stack = subshell_stack.pop()
     return True
 
 
@@ -537,7 +530,7 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
                         if budget_map.pop(bkey, None) is not None:
                             changed = True
                 if inv_num in (1, "1") or (prev_inv is not None and str(prev_inv) != str(inv_num)):
-                    from guard.verification import _get_circuit_breaker
+                    from guard.state_store import _get_circuit_breaker
 
                     cb = _get_circuit_breaker(state, payload)
                     if cb.get("failure_streak") or cb.get("tripped") or cb.get("replan_count"):

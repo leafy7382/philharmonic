@@ -1,7 +1,6 @@
 """Path allowlists, artifact/scratch/tmp checks, and guard/plugin/state protection."""
 from __future__ import annotations
 
-import fnmatch
 import os
 from pathlib import Path
 import re
@@ -308,12 +307,16 @@ def _is_guard_plugin_cwd(cwd_str: str) -> bool:
 
 def _safe_fnmatchcase(name: str, pat: str) -> bool:
     """Match literal name against glob pattern via fnmatchcase, failing closed on POSIX classes or braces."""
-    return False if ("[:" in pat or "{" in pat or "}" in pat) else fnmatch.fnmatchcase(name, pat)
+    if "[:" in pat or "{" in pat or "}" in pat:
+        return False
+    import fnmatch
+
+    return fnmatch.fnmatchcase(name, pat)
 
 
 def _segment_matches_literal(literal_seg: str, user_seg: str) -> bool:
     """Fail-closed segment matcher for protected targets (True on POSIX classes or braces)."""
-    return True if ("[:" in user_seg or "{" in user_seg or "}" in user_seg) else fnmatch.fnmatchcase(literal_seg, user_seg)
+    return True if ("[:" in user_seg or "{" in user_seg or "}" in user_seg) else _safe_fnmatchcase(literal_seg, user_seg)
 
 
 def _path_matches_protected_segments(user_parts: Tuple[str, ...], protected_parts: Tuple[str, ...], allow_descendants: bool) -> bool:

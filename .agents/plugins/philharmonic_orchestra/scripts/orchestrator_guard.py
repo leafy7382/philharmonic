@@ -25,7 +25,7 @@ def _safe_entrypoint() -> None:
     try:
         main_fn = globals().get("main")
         if main_fn is None:
-            from guard import main as main_fn
+            from guard.cli import main as main_fn
         main_fn()
     except (MemoryError, RecursionError) as exc:
         mode = sys.argv[1].lower() if len(sys.argv) > 1 else "pre-tool"

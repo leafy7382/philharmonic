@@ -1,17 +1,15 @@
 """Shared test-runner argument validation and test command recognition."""
 from __future__ import annotations
 
+import posixpath
 from typing import Any, Dict, List, Optional, Tuple
 
 from guard.constants import TRIVIAL_TEST_FLAG_RE
 from guard.path_guards import _is_staging_or_tmp_path, _resolve_cmd_target
 from guard.shell_tokens import (
-    _OPAQUE_EXEC_VERBS, _PY_VERB_RE, _SHELL_WRAPPER_VERBS,
-    _fold_shell_line_continuations, _has_shell_masking_or_chaining,
-    _is_dangerous_env_assignment, _parse_leading_env_assignments,
-    _parse_python_cli, _split_shell_commands_with_delims,
-    _split_shell_tokens_raw_with_meta, _strip_redir_tokens_with_meta,
-    _unwrap_shell_command_tokens,
+    FlagSpec, ParsedCommand, ParsedSubcmd, _OPAQUE_EXEC_VERBS, _PY_VERB_RE, _SHELL_WRAPPER_VERBS,
+    _fold_shell_line_continuations, _has_unquoted_cmd_subst, _is_canonical_cmd_path, _is_dangerous_env_assignment,
+    _parse_python_cli, _payload_has_raw_cr, parse_shell_command, walk_cli_flags,
 )
 
 _PYTEST_PATH_OUTPUT_FLAGS = frozenset({"--junitxml", "--junit-xml", "--basetemp", "--resultlog", "--result-log", "--html", "--cov-report", "--log-file"})
@@ -21,7 +19,7 @@ _PYTEST_SKIP_VAL_FLAGS = frozenset({
     "-k", "-m", "-p", "-o", "--override-ini", "-W", "--maxfail", "--tb", "--capture", "--show-capture",
     "--durations", "--durations-min", "--log-level", "--log-format", "--log-date-format", "--import-mode",
     "--color", "--code-highlight", "--deselect", "--ignore", "--ignore-glob", "--resultlog", "--result-log",
-    "--html", "--cov", "--cov-report", "--log-file",
+    "--html", "--cov-report", "--log-file",
 })
 _JEST_BAD = frozenset({
     "-u", "--updateSnapshot", "--update-snapshot", "--init", "--clearCache", "--clear-cache", "--passWithNoTests",
@@ -43,44 +41,49 @@ _TEST_RUNNER_RULES: Dict[str, Tuple[Optional[str], frozenset[str], str, frozense
     "npm": ("test", _NPM_BAD, "crC", frozenset(), False, True),
     "pnpm": ("test", _NPM_BAD, "crC", frozenset(), False, True),
     "yarn": ("test", _NPM_BAD, "crC", frozenset(), False, True),
-    "tox": (None, frozenset({"-", "--", "--installpkg", "--force-dep"}), "", frozenset(), False, False),
-    "nox": (None, frozenset({"-", "--", "--installpkg", "--force-dep"}), "", frozenset(), False, False),
+    "tox": (None, frozenset({"-", "--", "-c", "--conf", "--root", "--installpkg", "--force-dep"}), "c", frozenset(), False, False),
+    "nox": (None, frozenset({"-", "--", "-f", "--noxfile", "--installpkg", "--force-dep"}), "f", frozenset(), False, False),
     "go": ("test", _GO_BAD, "", frozenset(), True, True),
-    "cargo": ("test", frozenset({"--target-dir", "--manifest-path", "--list"}), "", frozenset(), True, False),
+    "cargo": ("test", frozenset({"--target-dir", "--manifest-path", "--config", "--list"}), "", frozenset(), True, False),
 }
+
+
+_PYTEST_FLAG_SPEC = FlagSpec(
+    val_opts=_PYTEST_PATH_OUTPUT_FLAGS | _PYTEST_STAGING_VAL_FLAGS | _PYTEST_OTHER_MUT_FLAGS | _PYTEST_SKIP_VAL_FLAGS,
+    short_val_chars="ocpkmW", bad_opts=_PYTEST_PATH_OUTPUT_FLAGS | _PYTEST_OTHER_MUT_FLAGS, bad_short_chars="ocp", stop_at_dd=False, gnu_abbrev=True,
+)
+_UNITTEST_FLAG_SPEC = FlagSpec(
+    val_opts=frozenset({"-s", "--start-directory", "-t", "--top-level-directory", "-p", "--pattern", "-k"}),
+    short_val_chars="stpk", stop_at_dd=False, gnu_abbrev=True,
+)
+
+
+def _is_staging_test_path(val: str, cur_dir: str, safe_pl: Dict[str, Any]) -> bool:
+    if not val: return False
+    res = _resolve_cmd_target(val, cur_dir)
+    if _is_staging_or_tmp_path(res, safe_pl): return True
+    norm = posixpath.normpath(res.replace("\\", "/"))
+    if norm in {"/tmp", "/dev/shm"} or norm.startswith(("/tmp/", "/private/tmp/", "/var/tmp/", "/dev/shm/")): return True
+    parts = norm.split("/")
+    return (val.replace("\\", "/").startswith("/") and any(any(c in p for c in "*?[") for p in parts[1:3])) or any(c in (parts[1] if len(parts) > 1 else "") for c in "*?[")
+
+
+def _check_unittest_args(u_args: List[str], cur_dir: str, safe_pl: Dict[str, Any]) -> bool:
+    uw = walk_cli_flags(u_args, _UNITTEST_FLAG_SPEC)
+    cands: List[str] = [v for _, v in uw.opt_pairs] + [p for p in uw.positionals if p != "discover"]
+    for tok in u_args:
+        if tok in {"discover", "--", "-v", "--verbose"}: continue
+        if "=" in tok: cands.append(tok.split("=", 1)[1])
+        elif tok.startswith("-") and not tok.startswith("--") and len(tok) > 2 and tok[1] in "stp": cands.append(tok[2:])
+    return not any(_is_staging_test_path(c, cur_dir, safe_pl) for c in cands)
 
 
 def _extract_pytest_target_check(pytest_args: List[str], cur_dir: str = "", payload: Optional[Dict[str, Any]] = None) -> Tuple[List[str], bool]:
     """Check pytest args for mutating/config/staging flags and extract any output paths."""
-    targets, mut, after_dd, skip_next = [], False, False, False
     safe_pl = payload if isinstance(payload, dict) else {}
-    _staged = lambda v: bool(v) and _is_staging_or_tmp_path(_resolve_cmd_target(v, cur_dir), safe_pl)
-    for idx, tok in enumerate(pytest_args):
-        if skip_next:
-            skip_next = False
-        elif not after_dd and tok == "--":
-            after_dd = True
-        elif not after_dd and tok.startswith("-") and tok != "-":
-            opt, has_eq, eq_val = tok.partition("=")
-            val = eq_val if has_eq else (pytest_args[idx + 1] if idx + 1 < len(pytest_args) else "")
-            if opt in _PYTEST_PATH_OUTPUT_FLAGS:
-                mut = True
-                out_v = val.split(":", 1)[1] if opt == "--cov-report" and ":" in val else val
-                if out_v:
-                    targets.append(out_v)
-            if (opt in _PYTEST_STAGING_VAL_FLAGS and _staged(val)) or opt in _PYTEST_OTHER_MUT_FLAGS:
-                mut = True
-            if not has_eq and opt in _PYTEST_SKIP_VAL_FLAGS:
-                skip_next = True
-            elif not tok.startswith("--"):
-                for k, ch in enumerate(tok[1:]):
-                    if ch in "ocp" or (ch == "c" and _staged(tok[1:][k + 1 :] or (pytest_args[idx + 1] if idx + 1 < len(pytest_args) else ""))):
-                        mut = True
-                    if ch in "ocpkmW":
-                        skip_next = k == len(tok[1:]) - 1
-                        break
-        elif _staged(tok.split("::", 1)[0]):
-            mut = True
+    w = walk_cli_flags(pytest_args, _PYTEST_FLAG_SPEC)
+    targets = [out_v for opt, val in w.opt_pairs if opt in _PYTEST_PATH_OUTPUT_FLAGS and (out_v := (val.split(":", 1)[1] if opt == "--cov-report" and ":" in val else val))]
+    mut = w.bad_hit or any(opt in _PYTEST_STAGING_VAL_FLAGS and _is_staging_test_path(val, cur_dir, safe_pl) for opt, val in w.opt_pairs) or any(_is_staging_test_path(tok.split("::", 1)[0], cur_dir, safe_pl) for tok in w.positionals)
     return targets, mut
 
 
@@ -89,44 +92,54 @@ def _check_test_runner_args(verb: str, arg_tokens: List[str], cur_dir: str = "",
     safe_pl = payload if isinstance(payload, dict) else {}
     if verb in {"pytest", "py.test"}:
         return not _extract_pytest_target_check(arg_tokens, cur_dir, safe_pl)[1]
+    if verb == "unittest":
+        return _check_unittest_args(arg_tokens, cur_dir, safe_pl)
     if _PY_VERB_RE.match(verb):
         ok_py, mode, mod, mod_args = _parse_python_cli(arg_tokens)
         if not ok_py or mode != "m":
             return False
         if mod in {"pytest", "py.test"}:
             return not _extract_pytest_target_check(mod_args, cur_dir, safe_pl)[1]
-        return mod == "unittest" and not any(_is_staging_or_tmp_path(_resolve_cmd_target(a.split("=", 1)[-1], cur_dir), safe_pl) for a in mod_args if a not in {"discover", "-v", "--verbose"})
+        return mod == "unittest" and _check_unittest_args(mod_args, cur_dir, safe_pl)
     if (rule := _TEST_RUNNER_RULES.get(verb)) is None:
         return True
-    req_sub, bad_opts, bad_short, bad_words, stop_dd, chk_staging = rule
+    req_sub, bad_opts, bad_short, bad_words, _, chk_staging = rule
     if req_sub is not None:
         if not arg_tokens or arg_tokens[0] != req_sub:
             return False
         arg_tokens = arg_tokens[1:]
-    for t in arg_tokens:
-        if stop_dd and t == "--":
-            break
-        if t in bad_words or t.split("=", 1)[0] in bad_opts or (bad_short and t.startswith("-") and not t.startswith("--") and any(c in t[1:] for c in bad_short)):
-            return False
-        if chk_staging and (val := (t.split("=", 1)[1] if "=" in t else ("" if t.startswith("-") else t))) and _is_staging_or_tmp_path(_resolve_cmd_target(val, cur_dir), safe_pl):
-            return False
+    if walk_cli_flags(arg_tokens, FlagSpec(bad_opts=bad_opts, bad_short_chars=bad_short, stop_at_dd=False, gnu_abbrev=True)).bad_hit:
+        return False
+    if any(t in bad_words for t in arg_tokens):
+        return False
+    if chk_staging and any((val := (t.split("=", 1)[1] if "=" in t else ("" if t.startswith("-") else t))) and _is_staging_test_path(val, cur_dir, safe_pl) for t in arg_tokens if t != "--"):
+        return False
     return True
 
 
-def _is_test_command(cmd: str, *, cur_dir: str = "", payload: Optional[Dict[str, Any]] = None) -> bool:
+def _is_test_command(
+    cmd: str, *, cur_dir: str = "", payload: Optional[Dict[str, Any]] = None,
+    parsed: Optional[ParsedCommand] = None, parsed_sub: Optional[ParsedSubcmd] = None,
+) -> bool:
     """Return True if any sub-command invokes a recognized test runner without masking chaining or unsafe flags."""
-    if not cmd or _has_shell_masking_or_chaining(cmd) or not (parts := _split_shell_commands_with_delims(cmd)):
-        return False
-    found_test = False
-    for idx, (_, subcmd) in enumerate(parts):
-        if not subcmd:
-            continue
-        folded = _fold_shell_line_continuations(subcmd)
-        if any(_is_dangerous_env_assignment(f"{k}{'+=' if app else '='}{v}") for k, app, v in _parse_leading_env_assignments(folded)[0]):
+    if parsed_sub is not None:
+        if parsed_sub.subshell_opens or parsed_sub.subshell_closes or (("$(" in parsed_sub.raw or "`" in parsed_sub.raw or "<(" in parsed_sub.unquoted or ">(" in parsed_sub.unquoted) and _has_unquoted_cmd_subst(parsed_sub.raw)):
             return False
-        toks, uq = _strip_redir_tokens_with_meta(_split_shell_tokens_raw_with_meta(folded))
-        verb, args_t, unwrap_unv = _unwrap_shell_command_tokens(toks, uq)
-        if unwrap_unv or verb in (_SHELL_WRAPPER_VERBS | _OPAQUE_EXEC_VERBS | {"xargs"}) or (verb == "find" and any(t in {"-exec", "-execdir", "-ok", "-okdir", "-delete"} for t in args_t)):
+        subs: Tuple[ParsedSubcmd, ...] = (parsed_sub,)
+        check_next = False
+    else:
+        if not cmd:
+            return False
+        p = parsed if parsed is not None else parse_shell_command(cmd)
+        if p.has_nul_surr or p.has_ansi_c or p.has_subshell or p.has_cmd_subst or p.has_unclosed or p.has_masking or _payload_has_raw_cr(cmd, payload) or not p.subcmds:
+            return False
+        subs, check_next = p.subcmds, True
+    found_test = False
+    for sub in subs:
+        if any(_is_dangerous_env_assignment(f"{k}{'+=' if app else '='}{v}") for k, app, v in sub.env_assigns):
+            return False
+        verb, args_t = sub.verb, list(sub.args)
+        if sub.unwrap_unv or verb in (_SHELL_WRAPPER_VERBS | _OPAQUE_EXEC_VERBS | {"xargs", "pushd", "popd"}) or (verb == "find" and any(t in {"-exec", "-execdir", "-ok", "-okdir", "-delete"} for t in args_t)):
             return False
         if verb in {"export", "declare", "typeset", "local", "readonly"}:
             if any(_is_dangerous_env_assignment(t if "=" in t else f"{t}=") for t in args_t if t != "--" and not t.startswith("-")):
@@ -139,9 +152,9 @@ def _is_test_command(cmd: str, *, cur_dir: str = "", payload: Optional[Dict[str,
         )
         if not is_runner:
             continue
-        if TRIVIAL_TEST_FLAG_RE.search(folded) or TRIVIAL_TEST_FLAG_RE.search(" ".join([verb, *args_t])) or not _check_test_runner_args(verb, args_t, cur_dir, payload):
+        if not _is_canonical_cmd_path(verb, sub.raw_verb) or TRIVIAL_TEST_FLAG_RE.search(_fold_shell_line_continuations(sub.raw)) or TRIVIAL_TEST_FLAG_RE.search(" ".join([verb, *args_t])) or not _check_test_runner_args(verb, args_t, cur_dir, payload):
             return False
-        if (parts[idx + 1][0] if idx + 1 < len(parts) else None) in ("|", "|&", ";", "\n", "||", "&"):
+        if check_next and sub.next_delim in ("|", "|&", ";", "\n", "||", "&"):
             return False
         found_test = True
     return found_test

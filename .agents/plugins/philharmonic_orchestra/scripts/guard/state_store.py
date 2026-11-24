@@ -6,10 +6,9 @@ import fcntl
 import json
 import os
 from pathlib import Path
-import tempfile
 import threading
 import time
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 from guard.constants import (
     MAX_STATE_INVOCATION_HISTORY,
@@ -229,6 +228,8 @@ def _save_state(payload_or_path: Any, state: Dict[str, Any]) -> None:
     _prune_state(state)
     with state_transaction(path):
         try:
+            import tempfile
+
             path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp_path = tempfile.mkstemp(prefix=".orch_state_", suffix=".tmp", dir=str(path.parent))
             try:
@@ -245,3 +246,30 @@ def _save_state(payload_or_path: Any, state: Dict[str, Any]) -> None:
                         pass
         except OSError:
             pass
+
+
+def _get_circuit_breaker(state: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cb_root = state.get("circuit_breaker")
+    if not isinstance(cb_root, dict):
+        cb_root = {}
+        state["circuit_breaker"] = cb_root
+    if "failure_streak" not in cb_root:
+        cb_root.clear()
+        cb_root.update({"failure_streak": 0, "tripped": False, "seen_failures": [], "last_error": "", "replan_count": 0})
+    if not isinstance(cb_root.get("seen_failures"), list):
+        cb_root["seen_failures"] = []
+    cb_root.setdefault("replan_count", 0)
+    return cb_root
+
+
+def _get_test_receipt(state: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    receipt_root = state.get("test_receipt")
+    if not isinstance(receipt_root, dict):
+        receipt_root = {}
+        state["test_receipt"] = receipt_root
+    if "dirty" not in receipt_root:
+        prev_epoch = receipt_root.get("mutation_epoch", 0)
+        receipt_root.clear()
+        receipt_root.update({"dirty": False, "verified": False, "last_mutated_file": "", "last_test_cmd": "", "mutation_epoch": prev_epoch})
+    receipt_root.setdefault("mutation_epoch", 0)
+    return receipt_root

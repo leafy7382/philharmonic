@@ -5,10 +5,8 @@ import json
 import os
 from pathlib import Path
 import re
-import subprocess
 from typing import Any, Dict, List, Optional, Tuple
 
-from guard.ast_guard import _is_test_command
 from guard.constants import (
     ASSERTION_RE, DOC_EXTENSIONS, ISOLATED_WORKSPACES, MAX_CONSECUTIVE_FAILURES,
     MAX_REPORT_BULLET_LINES, MAX_SUBAGENT_REPORT_CHARS, PROJECT_ROOT,
@@ -25,20 +23,9 @@ from guard.identity import (
     _record_cohort_outcome_in_parent_brain, _sync_subagents_from_transcript,
     _workspaces_compatible,
 )
-from guard.path_guards import (
-    _extract_target_path, _is_artifact_path, _is_guard_plugin_cwd,
-    _is_staging_or_tmp_path, _resolve_cmd_target,
-)
-from guard.shell_tokens import (
-    _advance_effective_cwd, _is_declared_eval_command, _is_git_only_command, _split_shell_commands,
-    _unquoted_subshell_opens_closes,
-)
 from guard.state_store import (
-    _current_invocation_key, _has_other_locked_path, _load_state,
-    _save_state, _state_file_path, state_transaction,
-)
-from guard.subagent_policy import (
-    _compute_prompt_hash, _expand_swarm_worker_names, _parse_cohort_header, _parse_mode_header,
+    _current_invocation_key, _get_circuit_breaker, _get_test_receipt,
+    _has_other_locked_path, _load_state, _save_state, _state_file_path, state_transaction,
 )
 
 
@@ -101,6 +88,8 @@ def _validate_str_keys(d: Dict[str, Any], keys: Tuple[str, ...], ctx: str) -> Op
 
 def _check_test_tampering_in_edit(tool_name: str, args: Dict[str, Any], payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Block edits to test files that delete/comment-out tests/assertions or add skip markers."""
+    from guard.path_guards import _extract_target_path, _is_artifact_path
+
     target = _extract_target_path(tool_name, args)
     if not target or _is_artifact_path(target, payload) or not _is_test_file(target):
         return None
@@ -251,33 +240,6 @@ def audit_diff_text(diff_text: str) -> Optional[str]:
     return _check_accumulated(current_file, removed_lines, added_lines)
 
 
-def _get_circuit_breaker(state: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    cb_root = state.get("circuit_breaker")
-    if not isinstance(cb_root, dict):
-        cb_root = {}
-        state["circuit_breaker"] = cb_root
-    if "failure_streak" not in cb_root:
-        cb_root.clear()
-        cb_root.update({"failure_streak": 0, "tripped": False, "seen_failures": [], "last_error": "", "replan_count": 0})
-    if not isinstance(cb_root.get("seen_failures"), list):
-        cb_root["seen_failures"] = []
-    cb_root.setdefault("replan_count", 0)
-    return cb_root
-
-
-def _get_test_receipt(state: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    receipt_root = state.get("test_receipt")
-    if not isinstance(receipt_root, dict):
-        receipt_root = {}
-        state["test_receipt"] = receipt_root
-    if "dirty" not in receipt_root:
-        prev_epoch = receipt_root.get("mutation_epoch", 0)
-        receipt_root.clear()
-        receipt_root.update({"dirty": False, "verified": False, "last_mutated_file": "", "last_test_cmd": "", "mutation_epoch": prev_epoch})
-    receipt_root.setdefault("mutation_epoch", 0)
-    return receipt_root
-
-
 def _current_subagent_meta(payload: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
     """Return metadata dictionary for the active subagent caller, if any."""
     meta = state.get("self_subagent_meta")
@@ -327,6 +289,8 @@ def _invoke_entries(args: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _extract_expected_cohort_specs(args: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Tuple[Optional[str], Optional[str], str]]]:
     """Extract (entries, [(cohort_id_or_none, role_or_none, prompt_hash), ...]) from invoke_subagent args."""
+    from guard.subagent_policy import _compute_prompt_hash, _parse_cohort_header
+
     entries = _invoke_entries(args)
     specs: List[Tuple[Optional[str], Optional[str], str]] = []
     for item in entries:
@@ -475,6 +439,8 @@ def _collect_invoke_cohort_candidates(
     if pending_matches:
         return _cand_pairs(pending_matches)
 
+    from guard.subagent_policy import _parse_cohort_header, _parse_mode_header
+
     entries = _invoke_entries(args)
     inv_key = _current_invocation_key(payload, state)
     multi = len(entries) > 1
@@ -593,6 +559,8 @@ def _extract_tool_error(payload: Dict[str, Any], tool_call: Dict[str, Any], tool
 def _swarm_target_names(swarm_workers: Dict[str, Any], args: Dict[str, Any], call_id: str) -> List[str]:
     if call_id:
         return [w for w, meta in swarm_workers.items() if isinstance(meta, dict) and meta.get("call_id") == call_id]
+    from guard.subagent_policy import _expand_swarm_worker_names
+
     return [w for w in _expand_swarm_worker_names(args) if w in swarm_workers]
 
 
@@ -686,19 +654,20 @@ def _record_cb_failure(cb: Dict[str, Any], tool_name: str, call_id: str, error_t
         cb["tripped"] = True
 
 
-def _has_unsafe_test_cwd(cmd: str, cmd_cwd: str, payload: Dict[str, Any]) -> bool:
+def _has_unsafe_test_cwd(cmd: str, cmd_cwd: str, payload: Dict[str, Any], *, parsed: Optional[Any] = None) -> bool:
     """Return True if cmd_cwd or any cd target in cmd enters /tmp, staging, or guard plugin dirs."""
-    cur, stack, subshell_stack = cmd_cwd, [], []
+    from guard.path_guards import _is_guard_plugin_cwd, _is_staging_or_tmp_path, _resolve_cmd_target
+    from guard.shell_tokens import _advance_effective_cwd, parse_shell_command
+    cur = cmd_cwd
     if _is_guard_plugin_cwd(cur) or _is_staging_or_tmp_path(_resolve_cmd_target(".", cur), payload):
         return True
-    for sc in _split_shell_commands(cmd):
-        opens, closes = _unquoted_subshell_opens_closes(sc)
-        subshell_stack.extend((cur, list(stack)) for _ in range(opens))
-        cur, is_cd, cd_unv = _advance_effective_cwd(sc, cur, stack, payload)
+    p = parsed if parsed is not None else parse_shell_command(cmd)
+    if p.has_subshell:
+        return True
+    for sub in p.subcmds:
+        cur, is_cd, cd_unv = _advance_effective_cwd(sub.raw, cur, None, payload, parsed_sub=sub)
         if is_cd and (cd_unv or _is_guard_plugin_cwd(cur) or _is_staging_or_tmp_path(_resolve_cmd_target(".", cur), payload)):
             return True
-        for _ in range(min(closes, len(subshell_stack))):
-            cur, stack = subshell_stack.pop()
     return False
 
 
@@ -729,11 +698,15 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
             cmd = raw_cmd.strip() if isinstance(raw_cmd, str) else ""
             raw_cwd = args.get("Cwd")
             cmd_cwd = raw_cwd if isinstance(raw_cwd, str) and raw_cwd else str(PROJECT_ROOT)
-            is_verification_cmd = (
-                tool_name == "run_command"
-                and not _has_unsafe_test_cwd(cmd, cmd_cwd, payload)
-                and (_is_test_command(cmd, cur_dir=cmd_cwd, payload=payload) or _is_declared_eval_command(cmd, state, payload))
-            )
+            cmd_parsed = None
+            is_verification_cmd = False
+            if tool_name == "run_command":
+                from guard.shell_tokens import parse_shell_command
+                cmd_parsed = parse_shell_command(cmd)
+                if not _has_unsafe_test_cwd(cmd, cmd_cwd, payload, parsed=cmd_parsed):
+                    from guard.ast_guard import _is_test_command
+                    from guard.shell_tokens import _is_declared_eval_command
+                    is_verification_cmd = _is_test_command(cmd, cur_dir=cmd_cwd, payload=payload, parsed=cmd_parsed) or _is_declared_eval_command(cmd, state, payload, parsed=cmd_parsed)
             output_text = str(payload.get("output") or payload.get("result") or tool_call.get("result") or tool_call.get("output") or "")
             error_text = _extract_tool_error(payload, tool_call, tool_name, output_text)
             caller_mode = _current_subagent_meta(payload, state).get("mode")
@@ -765,6 +738,10 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                     and not re.search(r"(?m)^\s*STATUS:\s*COMPLETED\b", output_text)
                 )
                 cohort_cands = _collect_invoke_cohort_candidates(payload, state, args, call_id, output_text) if tool_name == "invoke_subagent" else []
+                is_non_git_cmd = False
+                if tool_name == "run_command" and not is_verification_cmd:
+                    from guard.shell_tokens import _is_git_only_command
+                    is_non_git_cmd = not _is_git_only_command(cmd, parsed=cmd_parsed)
                 if cohort_cands and subagent_failed_status:
                     _apply_cohort_invoke_outcome(state, cb, cohort_cands, "failed", error_summary="Best-of-N candidate reported STATUS: FAILED/BLOCKED")
                 elif cohort_cands and not subagent_non_final and not is_async_spawn_ack:
@@ -772,7 +749,7 @@ def handle_post_tool(payload: Dict[str, Any]) -> Dict[str, Any]:
                 elif (
                     (tool_name == "invoke_subagent" and not subagent_non_final and not is_async_spawn_ack)
                     or is_verification_cmd
-                    or (tool_name == "run_command" and not _is_git_only_command(cmd))
+                    or is_non_git_cmd
                     or tool_name == "run_workflow"
                     or swarm_action == "add"
                 ):
@@ -881,6 +858,8 @@ def _get_workspace_git_diff(payload: Dict[str, Any]) -> str:
     """Return unified git diff from payload or by running git diff HEAD in workspace."""
     if payload.get("gitDiff"):
         return str(payload["gitDiff"])
+    import subprocess
+
     for diff_cmd in (["git", "diff", "HEAD", "-U0"], ["git", "diff", "-U0"]):
         try:
             proc = subprocess.run(diff_cmd, cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=5, check=False)

@@ -3,18 +3,14 @@ from __future__ import annotations
 
 import json
 import os
-import select
 import sys
 from typing import Any, Callable, Dict, List
 
-from guard.constants import PROJECT_ROOT, get_model_tier_map, validate_model_config
-from guard.identity import handle_pre_invocation
-from guard.policies import handle_pre_tool
-from guard.state_store import _current_invocation_key, _default_state, _load_state, _save_state, _state_file_path, state_transaction
-from guard.verification import _get_circuit_breaker, _get_test_receipt, handle_post_tool, handle_stop
-
 
 def _cli_status(payload: Dict[str, Any]) -> Dict[str, Any]:
+    from guard.constants import PROJECT_ROOT
+    from guard.model_tiers import get_model_tier_map
+    from guard.state_store import _current_invocation_key, _get_circuit_breaker, _get_test_receipt, _load_state, _state_file_path
     state = _load_state(payload)
     inv_key = _current_invocation_key(payload, state)
     subagents_summary: Dict[str, Any] = {}
@@ -50,6 +46,8 @@ def _cli_status(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _cli_toggle_active(payload: Dict[str, Any], active: bool) -> Dict[str, Any]:
+    from guard.state_store import _load_state, _save_state, _state_file_path, state_transaction
+
     with state_transaction(payload):
         state = _load_state(payload)
         state_path = _state_file_path(payload)
@@ -68,12 +66,17 @@ def _cli_deactivate(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _cli_reset(payload: Dict[str, Any]) -> Dict[str, Any]:
+    from guard.state_store import _default_state, _save_state, _state_file_path, state_transaction
+
     with state_transaction(payload):
         _save_state(payload, _default_state())
         return {"status": "reset", "stateFile": str(_state_file_path(payload))}
 
 
 def _cli_doctor() -> Dict[str, Any]:
+    from guard.constants import PROJECT_ROOT
+    from guard.model_tiers import get_model_tier_map, validate_model_config
+
     plugin_dir = PROJECT_ROOT / ".agents" / "plugins" / "philharmonic_orchestra"
     plugin_hooks, workspace_hooks = plugin_dir / "hooks.json", PROJECT_ROOT / ".agents" / "hooks.json"
     skill_file = plugin_dir / "skills" / "philharmonic" / "SKILL.md"
@@ -109,11 +112,20 @@ _CLI_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "activate": _cli_activate,
     "deactivate": _cli_deactivate,
 }
-_HOOK_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
-    "pre-invocation": handle_pre_invocation,
-    "post-tool": handle_post_tool,
-    "stop": handle_stop,
-}
+
+
+def _dispatch_hook(mode: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if mode == "pre-invocation":
+        from guard.identity import handle_pre_invocation
+        return handle_pre_invocation(payload)
+    if mode == "post-tool":
+        from guard.verification import handle_post_tool
+        return handle_post_tool(payload)
+    if mode == "stop":
+        from guard.verification import handle_stop
+        return handle_stop(payload)
+    from guard.policies import handle_pre_tool
+    return handle_pre_tool(payload)
 
 
 def _read_stdin_payload(is_cli_mode: bool) -> Dict[str, Any]:
@@ -126,6 +138,8 @@ def _read_stdin_payload(is_cli_mode: bool) -> Dict[str, Any]:
         pass
     if is_cli_mode:
         try:
+            import select
+
             fd = sys.stdin.fileno()
             if isinstance(fd, int) and fd >= 0 and os.name != "nt" and not select.select([fd], [], [], 0.05)[0]:
                 return {}
@@ -149,4 +163,4 @@ def main() -> None:
         json.dump(_CLI_HANDLERS[mode](payload), sys.stdout, indent=2)
         sys.stdout.write("\n")
         return
-    json.dump(_HOOK_HANDLERS.get(mode, handle_pre_tool)(payload), sys.stdout)
+    json.dump(_dispatch_hook(mode, payload), sys.stdout)
