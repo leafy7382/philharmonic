@@ -30,6 +30,7 @@ from guard.constants import (
     MAX_DIRECT_READ_BYTES,
     MAX_DIRECT_READ_FILES,
     MAX_DIRECT_READ_LINES,
+    MAX_IMPLEMENTER_REUSE_TURNS,
     MODE_HEADER_RE,
     MUTATION_TOOLS,
     MUTATION_VERBS_RE,
@@ -735,6 +736,10 @@ def _sync_sibling_recipient_state(
     stage_match: Optional[re.Match[str]],
     reactivate_impl: bool,
     deferred_actions: Optional[List[Callable[[], None]]],
+    *,
+    spec_file: Optional[str] = None,
+    reuse_count: Optional[int] = None,
+    reuse_call_ids: Optional[List[str]] = None,
 ) -> None:
     artifact_dir = payload.get("artifactDirectoryPath")
     if not artifact_dir or not raw_recipient:
@@ -753,7 +758,9 @@ def _sync_sibling_recipient_state(
         def _sync() -> None:
             with state_transaction(sib_state_file):
                 sib_state = _load_state(sib_state_file)
-                meta = sib_state.setdefault("self_subagent_meta", {})
+                meta = sib_state.get("self_subagent_meta")
+                if not isinstance(meta, dict):
+                    meta = sib_state["self_subagent_meta"] = {}
                 if parsed_allowed is not None:
                     meta["allowed_files"] = parsed_allowed
                 if stage_val is not None:
@@ -761,6 +768,14 @@ def _sync_sibling_recipient_state(
                     meta.setdefault("stage_history", []).append(stage_val)
                 if reactivate_impl:
                     meta["status"] = "active"
+                    meta.setdefault("type", "implementer")
+                    meta.setdefault("type_name", "implementer")
+                if spec_file:
+                    meta["spec_file"] = spec_file
+                if reuse_count is not None:
+                    meta["reuse_count"] = reuse_count
+                if reuse_call_ids is not None:
+                    meta["reuse_call_ids"] = list(reuse_call_ids)[-MAX_IMPLEMENTER_REUSE_TURNS:]
                 _save_state(sib_state_file, sib_state)
 
         if deferred_actions is not None:
@@ -790,7 +805,8 @@ def _handle_send_message(
     _sync_subagents_from_transcript(payload, state)
     _save_state(payload, state)
 
-    if not _is_root_orchestrator(payload, state) and re.match(r"^\s*STATUS:", message):
+    is_root = _is_root_orchestrator(payload, state)
+    if not is_root and re.match(r"^\s*STATUS:", message):
         from guard.verification import validate_subagent_report
         sub_type = _get_subagent_type(payload, state)
         if err := validate_subagent_report(message, is_scout=_is_scout_subagent(payload, state), is_readonly_or_scratch=(sub_type in READONLY_NON_VERIFICATION_TYPES)):
@@ -834,19 +850,36 @@ def _handle_send_message(
     if spec_err:
         return _deny(spec_err)
 
-    local_dirty = False
-    if spec_file and subagent_info:
-        subagent_info["spec_file"] = spec_file
-        local_dirty = True
-    if (replan_if_match := REPLAN_IF_HEADER_RE.search(message)) and subagent_info:
-        subagent_info["replan_if"] = replan_if_match.group(1).strip()
-        local_dirty = True
-    stage_match = STAGE_HEADER_RE.search(message)
-    if stage_match and subagent_info:
-        stage_val = stage_match.group(1).strip()
-        subagent_info["stage"] = stage_val
-        subagent_info.setdefault("stage_history", []).append(stage_val)
-        local_dirty = True
+    is_root_impl_reuse = bool(is_root and recipient_type == "implementer" and recipient_meta)
+    reuse_count, reuse_call_ids, call_id, is_reuse_retry = 0, [], "", False
+    if is_root_impl_reuse:
+        raw_prev_spec = str(recipient_meta.get("spec_file") or "").strip()
+        prev_spec = raw_prev_spec
+        if raw_prev_spec:
+            try:
+                p = Path(os.path.expanduser(raw_prev_spec))
+                prev_spec = str((p if p.is_absolute() else (PROJECT_ROOT / p)).resolve())
+            except (OSError, ValueError):
+                pass
+        if spec_file and ((prev_spec and spec_file != prev_spec) or (not prev_spec and str(recipient_meta.get("status") or "").strip().lower() == "completed")):
+            return _deny(
+                f"[ORCHESTRATOR GUARD] Phase boundary violation: implementer '{recipient}' cannot be reused for a new SPEC_FILE ('{Path(spec_file).name}'). "
+                "Spawn a fresh 'implementer' via invoke_subagent for each distinct phase."
+            )
+        raw_reuse = recipient_meta.get("reuse_count", 0)
+        try:
+            reuse_count = 0 if isinstance(raw_reuse, bool) else int(raw_reuse or 0)
+        except (ValueError, TypeError):
+            reuse_count = 0
+        raw_ids = recipient_meta.get("reuse_call_ids")
+        reuse_call_ids = [str(x) for x in raw_ids if x] if isinstance(raw_ids, list) else []
+        call_id = _extract_call_id(payload)
+        is_reuse_retry = bool(call_id and call_id in reuse_call_ids)
+        if not is_reuse_retry and reuse_count >= MAX_IMPLEMENTER_REUSE_TURNS:
+            return _deny(
+                f"[ORCHESTRATOR GUARD] Implementer '{recipient}' reached max reuse limit ({MAX_IMPLEMENTER_REUSE_TURNS} send_message follow-ups). "
+                "Spawn a fresh 'implementer' via invoke_subagent to prevent context bloat and accuracy drift."
+            )
 
     target_meta = subagent_info if isinstance(subagent_info, dict) else (recipient_meta if recipient_type else None)
     if isinstance(target_meta, dict):
@@ -881,18 +914,45 @@ def _handle_send_message(
                         f"[ORCHESTRATOR GUARD] Overlapping ALLOWED_FILES when reactivating implementer '{recipient}' "
                         f"in 'inherit' workspace ('{overlap[0]}' vs '{overlap[1]}'). Wait for conflicting implementer to complete or assign disjoint ALLOWED_FILES."
                     )
-        if subagent_info is not None:
-            subagent_info["status"] = "active"
-            local_dirty = True
 
+    local_dirty = False
+    if spec_file and subagent_info:
+        subagent_info["spec_file"] = spec_file
+        local_dirty = True
+    if (replan_if_match := REPLAN_IF_HEADER_RE.search(message)) and subagent_info:
+        subagent_info["replan_if"] = replan_if_match.group(1).strip()
+        local_dirty = True
+    stage_match = STAGE_HEADER_RE.search(message)
+    if stage_match and subagent_info:
+        stage_val = stage_match.group(1).strip()
+        subagent_info["stage"] = stage_val
+        subagent_info.setdefault("stage_history", []).append(stage_val)
+        local_dirty = True
+    new_reuse_count: Optional[int] = None
+    new_reuse_call_ids: Optional[List[str]] = None
+    if is_root_impl_reuse and not is_reuse_retry:
+        new_reuse_count = reuse_count + 1
+        updated_ids = (reuse_call_ids + [call_id])[-MAX_IMPLEMENTER_REUSE_TURNS:] if call_id else None
+        new_reuse_call_ids = updated_ids
+        if isinstance(subagent_info, dict):
+            subagent_info["reuse_count"] = new_reuse_count
+            if updated_ids is not None:
+                subagent_info["reuse_call_ids"] = updated_ids
+            local_dirty = True
+    if recipient_type == "implementer" and recipient_meta and subagent_info is not None:
+        subagent_info["status"] = "active"
+        local_dirty = True
     if parsed_allowed is not None and subagent_info:
         subagent_info["allowed_files"] = parsed_allowed
         local_dirty = True
     if local_dirty:
         _save_state(payload, state)
 
-    if parsed_allowed is not None or stage_match is not None or (recipient_type == "implementer" and recipient_meta):
-        _sync_sibling_recipient_state(payload, raw_recipient or "", recipient, parsed_allowed, stage_match, recipient_type == "implementer", deferred_actions)
+    if parsed_allowed is not None or stage_match is not None or (is_root and spec_file and recipient_meta) or (recipient_type == "implementer" and recipient_meta):
+        _sync_sibling_recipient_state(
+            payload, raw_recipient or "", recipient, parsed_allowed, stage_match, recipient_type == "implementer", deferred_actions,
+            spec_file=spec_file if is_root else None, reuse_count=new_reuse_count, reuse_call_ids=new_reuse_call_ids,
+        )
     return {"decision": "allow"}
 
 

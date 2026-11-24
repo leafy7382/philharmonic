@@ -4387,6 +4387,161 @@ class TestOrchestratorGuard(unittest.TestCase):
             self.assertFalse(guard_ast._is_test_command(bad_test), f"_is_test_command must reject {bad_test!r}")
             self.assertEqual(self._pre("run_command", {"CommandLine": bad_test})["decision"], "deny", f"Root must deny {bad_test!r}")
 
+    def test_implementer_reuse_cap_and_spec_phase_boundary(self) -> None:
+        self.assertEqual(orchestrator_guard.MAX_IMPLEMENTER_REUSE_TURNS, 2)
+
+        scratch_dir = Path(self.artifact_dir) / "scratch"
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        spec1 = scratch_dir / "spec_phase1.md"
+        spec2 = scratch_dir / "spec_phase2.md"
+        spec1.write_text(
+            "# Phase 1\n\n## SIGNATURES\ndef f() -> None: ...\n\n## PITFALLS\nKeep f pure.\n\n## VERIFICATION\npytest\n",
+            encoding="utf-8",
+        )
+        spec2.write_text(
+            "# Phase 2\n\n## SIGNATURES\ndef g() -> None: ...\n\n## INVARIANTS\nKeep g fast.\n\n## VERIFICATION\npytest\n",
+            encoding="utf-8",
+        )
+
+        parent_p = self._brain_payload("parent-reuse-guard")
+        orchestrator_guard._cli_activate(parent_p)
+
+        # 1. Implementer spawned with spec_phase1.md + sibling brain state
+        impl1_cid = "sub-impl-reuse-1"
+        impl1_p = self._brain_payload(impl1_cid)
+        self._reg_sub(
+            "implementer", impl1_cid, "flash", payload=parent_p,
+            allowed_files=["src/a.py"], status="active", spec_file=str(spec1.resolve()),
+        )
+        self._pre_inv(base=impl1_p)  # populate sibling self_subagent_meta
+        self.assertEqual(self._load_st(parent_p)["subagents"][impl1_cid].get("spec_file"), str(spec1.resolve()))
+
+        # Denied ALLOWED_FILES overlap does NOT consume a reuse turn
+        self._reg_sub("implementer", "sub-impl-conflict", "flash", payload=parent_p, allowed_files=["src/conflict.py"], status="active")
+        res_overlap = self._pre(
+            "send_message",
+            {"Recipient": impl1_cid, "Message": "ALLOWED_FILES: src/conflict.py\nUpdate conflict file."},
+            call_id="msg_denied_overlap",
+            base=parent_p,
+        )
+        self.assertEqual(res_overlap["decision"], "deny")
+        self.assertIn("Overlapping ALLOWED_FILES", res_overlap["reason"])
+        self.assertEqual(self._load_st(parent_p)["subagents"][impl1_cid].get("reuse_count", 0), 0)
+
+        # Switching to a different SPEC_FILE is denied as a phase boundary violation and does not mutate spec_file or reuse_count
+        res_phase2 = self._pre(
+            "send_message",
+            {"Recipient": impl1_cid, "Message": f"SPEC_FILE: {spec2}\nBegin phase 2 work."},
+            call_id="msg_phase2_deny",
+            base=parent_p,
+        )
+        self.assertEqual(res_phase2["decision"], "deny")
+        self.assertIn("Phase boundary violation", res_phase2["reason"])
+        self.assertEqual(self._load_st(parent_p)["subagents"][impl1_cid].get("spec_file"), str(spec1.resolve()))
+        self.assertEqual(self._load_st(parent_p)["subagents"][impl1_cid].get("reuse_count", 0), 0)
+
+        # Follow-up 1 with SAME SPEC_FILE succeeds and syncs to sibling
+        res_f1 = self._pre(
+            "send_message",
+            {"Recipient": impl1_cid, "Message": f"SPEC_FILE: {spec1}\nFix edge case in src/a.py."},
+            call_id="msg_reuse_1",
+            base=parent_p,
+        )
+        self.assertEqual(res_f1["decision"], "allow")
+        self.assertEqual(self._load_st(parent_p)["subagents"][impl1_cid].get("reuse_count"), 1)
+        self.assertEqual(self._load_st(impl1_p).get("self_subagent_meta", {}).get("reuse_count"), 1)
+        self.assertEqual(self._load_st(impl1_p).get("self_subagent_meta", {}).get("spec_file"), str(spec1.resolve()))
+
+        # Idempotent retry of the same call_id does NOT double-count
+        res_f1_retry = self._pre(
+            "send_message",
+            {"Recipient": impl1_cid, "Message": f"SPEC_FILE: {spec1}\nFix edge case in src/a.py."},
+            call_id="msg_reuse_1",
+            base=parent_p,
+        )
+        self.assertEqual(res_f1_retry["decision"], "allow")
+        self.assertEqual(self._load_st(parent_p)["subagents"][impl1_cid].get("reuse_count"), 1)
+
+        # Follow-up 2 omitting SPEC_FILE succeeds
+        res_f2 = self._pre(
+            "send_message",
+            {"Recipient": impl1_cid, "Message": "STAGE: 2/2\nTighten assertion in src/a.py."},
+            call_id="msg_reuse_2",
+            base=parent_p,
+        )
+        self.assertEqual(res_f2["decision"], "allow")
+        self.assertEqual(self._load_st(parent_p)["subagents"][impl1_cid].get("reuse_count"), 2)
+        self.assertEqual(self._load_st(impl1_p).get("self_subagent_meta", {}).get("reuse_count"), 2)
+
+        # Idempotent retry of follow-up 2 at the cap still succeeds
+        self.assertEqual(
+            self._pre(
+                "send_message",
+                {"Recipient": impl1_cid, "Message": "STAGE: 2/2\nTighten assertion in src/a.py."},
+                call_id="msg_reuse_2",
+                base=parent_p,
+            )["decision"],
+            "allow",
+        )
+        self.assertEqual(self._load_st(parent_p)["subagents"][impl1_cid].get("reuse_count"), 2)
+
+        # Follow-up 3 exceeds MAX_IMPLEMENTER_REUSE_TURNS = 2 and is denied
+        res_f3 = self._pre(
+            "send_message",
+            {"Recipient": impl1_cid, "Message": "One more tweak in src/a.py."},
+            call_id="msg_reuse_3",
+            base=parent_p,
+        )
+        self.assertEqual(res_f3["decision"], "deny")
+        self.assertIn("max reuse limit", res_f3["reason"])
+        self.assertEqual(self._load_st(parent_p)["subagents"][impl1_cid].get("reuse_count"), 2)
+
+        # 2. Completed implementer (spawned without SPEC_FILE) denies brand-new SPEC_FILE, allows in-phase fix without SPEC_FILE
+        impl2_cid = "sub-impl-completed-nospec"
+        self._reg_sub("implementer", impl2_cid, "flash", payload=parent_p, allowed_files=["src/b.py"], status="completed")
+        res_new_spec = self._pre(
+            "send_message",
+            {"Recipient": impl2_cid, "Message": f"SPEC_FILE: {spec2}\nStart new phase."},
+            call_id="msg_completed_new_spec",
+            base=parent_p,
+        )
+        self.assertEqual(res_new_spec["decision"], "deny")
+        self.assertIn("Phase boundary violation", res_new_spec["reason"])
+        self.assertEqual(self._load_st(parent_p)["subagents"][impl2_cid].get("reuse_count", 0), 0)
+
+        res_nospec_fix = self._pre(
+            "send_message",
+            {"Recipient": impl2_cid, "Message": "Fix typo in src/b.py."},
+            call_id="msg_completed_fix",
+            base=parent_p,
+        )
+        self.assertEqual(res_nospec_fix["decision"], "allow")
+        self.assertEqual(self._load_st(parent_p)["subagents"][impl2_cid].get("reuse_count"), 1)
+
+        # 3. register_subagent supports pre-seeding reuse_count
+        impl3_cid = "sub-impl-preseeded-cap"
+        self._reg_sub("implementer", impl3_cid, "flash", payload=parent_p, status="active", reuse_count=2)
+        res_preseeded = self._pre(
+            "send_message",
+            {"Recipient": impl3_cid, "Message": "Follow-up beyond preseeded cap."},
+            call_id="msg_preseeded_3",
+            base=parent_p,
+        )
+        self.assertEqual(res_preseeded["decision"], "deny")
+        self.assertIn("max reuse limit", res_preseeded["reason"])
+
+        # 4. Subagent -> parent STATUS: reports via send_message are unaffected (even past 2 messages)
+        report = "STATUS: COMPLETED\nFILES_CHANGED: src/a.py\nVERIFICATION: pytest exited 0.\nNOTES: Completed in-phase fix."
+        for idx in range(1, 4):
+            res_rep = self._pre(
+                "send_message",
+                {"Recipient": "parent-reuse-guard", "Message": report},
+                call_id=f"sub_report_{idx}",
+                executionNum=idx,
+                base=impl1_p,
+            )
+            self.assertEqual(res_rep["decision"], "allow")
+
 
 if __name__ == "__main__":
     unittest.main()

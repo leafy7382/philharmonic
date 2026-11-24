@@ -722,7 +722,7 @@ def register_subagent(
     review_lens: Optional[str] = None, active_worktree: Optional[bool] = None,
     mode: Optional[str] = None, cohort: Optional[str] = None, eval_cmd: Optional[str] = None,
     candidate_id: Optional[str] = None, council_id: Optional[str] = None, council_role: Optional[str] = None,
-    model_tier: Optional[str] = None,
+    model_tier: Optional[str] = None, spec_file: Optional[str] = None, reuse_count: Optional[int] = None,
 ) -> None:
     """Helper for explicitly registering a subagent conversationId -> tier mapping."""
     with state_transaction(payload):
@@ -739,7 +739,7 @@ def register_subagent(
             ("review_lens", review_lens), ("mode", mode), ("cohort", cohort),
             ("eval_cmd", eval_cmd), ("candidate_id", candidate_id),
             ("council_id", council_id), ("council_role", council_role),
-            ("model_tier", model_tier),
+            ("model_tier", model_tier), ("spec_file", spec_file), ("reuse_count", reuse_count),
         ):
             if val is not None:
                 record[key] = val
